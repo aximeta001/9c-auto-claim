@@ -8,7 +8,7 @@ on:
   schedule:
     # UTC 时区，每 15 分钟。GitHub 用 5 位 cron（分 时 日 月 周），
     # 高峰期可能有数分钟调度延迟。脚本按链上区块判断，与墙上时间无关。
-    - cron: '*/15 * * * *'
+    - cron: '3,18,33,48 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
