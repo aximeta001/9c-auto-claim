@@ -1,0 +1,74 @@
+name: 9C 自动领奖 (Heimdall)
+
+# 每次触发都是一个全新 runner：代码由 checkout 提供，密钥由 Secrets 注入。
+# 这正好对症「云端定时任务每次是隔离新沙箱、看不到上次会话文件」的问题。
+# 私钥本身不进仓库、不进日志：只在 runner 内用加密 keystore 临时解密出 .env，
+# 运行结束 runner 销毁，无残留。
+on:
+  schedule:
+    # UTC 时区，每 15 分钟。GitHub 用 5 位 cron（分 时 日 月 周），
+    # 高峰期可能有数分钟调度延迟。脚本按链上区块判断，与墙上时间无关。
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '首次验证保持勾选：只检查、绝不领取'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 9c-auto-claim
+  cancel-in-progress: false   # 防止两次运行并发、抢同一个 nonce
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖（命中缓存时仅数秒）
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 检查并领取
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -e
+          # runner 全新，.state.json 不跨运行持久，故禁用窗口早退，
+          # 每次做完整链上检查（约 5~8 秒），到点才提交，最稳、不会漏领。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动验证模式：只检查，不提交任何交易"
+            node claim.mjs --dry-run --no-idle-skip
+          else
+            node claim.mjs --no-idle-skip
+          fi
