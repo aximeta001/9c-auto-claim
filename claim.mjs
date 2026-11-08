@@ -98,7 +98,8 @@ const SIM_DELTA = args.includes("--simulate-unblock-delta")
 // 与 --watch 的三点区别：
 //  · 永不秒退：远离解锁窗口也留在 job 内按区块数休眠，直到时间预算耗尽才交棒
 //  · 领完不退出：把「已处理的解锁块」锁住，链上刷新出更大的解锁块后自动进入下一周期
-//  · 幂等靠内存锁而非跨运行状态文件：交易上链/索引有延迟，锁可防止读到旧解锁块时重复提交
+//  · 幂等靠内存锁而非跨运行状态文件：交易上链/索引有延迟，锁可防止读到旧解锁块时
+//    重复提交；但锁带 TTL 兜底 —— 到期链上仍未刷新就主动解锁复核，绝不无限等待漏领
 // 接力由 workflow 的独立 step（if: always()）完成，脚本崩溃/超时也不会断链。
 const DAEMON = args.includes("--daemon");
 const MAX_RUN_MS = Math.max(10, numArg("--max-run-seconds", 330 * 60)) * 1000; // 5.5h < 单 job 6h 上限
@@ -281,13 +282,25 @@ async function submitTx({ account, pub, signer, nonce, actionValue }) {
   return d.data.stageTransaction; // txId
 }
 
+// 交易状态是否为「链上已定论」的终态。
+// Heimdall TxStatus 枚举：INVALID / STAGING / SUCCESS / FAILURE / INCLUDED
+//  · 终态：SUCCESS / FAILURE / INVALID —— 可作为领取结论
+//  · 中间态：STAGING（未打包）/ INCLUDED（已打包、执行结果未定）
+//    INCLUDED 后续可能变 SUCCESS 也可能变 FAILURE（冷却检查在执行阶段才抛
+//    RequiredBlockIndexException），绝不能据此判定「已领取」：误判会锁定解锁块，
+//    白白错失一整个周期，直到交棒才补领。
+function isTerminalTxStatus(s) {
+  return s === "SUCCESS" || s === "FAILURE" || s === "INVALID";
+}
+
+// 只返回终态；中间态继续轮询，超时返回 PENDING（结果未定，交给链上状态复核）。
 async function confirmTx(txId) {
   const q = "query($t:TxId!){ transaction { transactionResult(txId:$t){ txStatus blockIndex exceptionNames } } }";
   for (let i = 0; i < CFG.confirmTries; i++) {
     try {
       const d = await gqlRpc(q, { t: txId });
       const r = d.data?.transaction?.transactionResult;
-      if (r && r.txStatus && r.txStatus !== "STAGING") return r;
+      if (r && isTerminalTxStatus(r.txStatus)) return r;
     } catch (_) { /* 节点还没索引到 */ }
     if (i < CFG.confirmTries - 1) await new Promise((r) => setTimeout(r, CFG.confirmIntervalMs));
   }
@@ -298,7 +311,7 @@ async function confirmTx(txId) {
 //  · 不依赖 .state.json（云端 runner 每次全新），每轮直接读链上权威状态
 //  · 按剩余「区块数」而非墙上时间推进，区块变快/变慢都能自适应
 //  · 两个奖励各自独立判定；提交串行（同一个 signer 不能并发抢 nonce）
-//  · 领取成功（或已提交待确认）立即退出，不等另一个奖励的下一周期
+//  · 只有领取成功才标记完成；确认未出终态/失败则冷却后按链上状态复核重试
 //  · 全局硬超时，退出后由下一次心跳接力，不会永久占用 runner
 function planSleepSec(minRem, capSec = SLEEP_CAP_SEC) {
   if (minRem <= 0n) return 0;
@@ -313,14 +326,29 @@ function selfTest() {
     [40n, POLL_SEC], [5n, POLL_SEC], [0n, 0],
   ];
   let pass = 0;
+  let total = cases.length;
   for (const [rem, expect] of cases) {
     const got = planSleepSec(rem);
     const ok = got === expect;
     console.log(`  planSleepSec(${rem}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
-  console.log(`  self-test: ${pass}/${cases.length} 通过`);
-  process.exit(pass === cases.length ? 0 : 1);
+  // 终态判定：只有 SUCCESS/FAILURE/INVALID 能下结论，INCLUDED/STAGING 必须继续等。
+  // 这是本次修复的核心 —— 把 INCLUDED 当成功会锁定解锁块、错失整个领取周期。
+  const terminalCases = [
+    ["SUCCESS", true], ["FAILURE", true], ["INVALID", true],
+    ["INCLUDED", false], ["STAGING", false], ["PENDING", false],
+    [null, false], [undefined, false], ["", false],
+  ];
+  total += terminalCases.length;
+  for (const [s, expect] of terminalCases) {
+    const got = isTerminalTxStatus(s);
+    const ok = got === expect;
+    console.log(`  isTerminalTxStatus(${String(s)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  console.log(`  self-test: ${pass}/${total} 通过`);
+  process.exit(pass === total ? 0 : 1);
 }
 
 // 每轮快照：tip + 角色状态 + 巡逻解锁块，全部取链上/权威接口
@@ -341,7 +369,9 @@ async function readWatchSnapshot() {
   return { st, av, unblock, patrolSource };
 }
 
-// 提交单项奖励；done=true 表示本 job 不再处理它，stop=true 表示终止整个蹲守
+// 提交单项奖励；done=true 表示本 job 不再处理它。
+// 只有 SUCCESS（或演练的 would_claim）算 done；确认未出终态/超时/失败/异常一律
+// done=false，由调用方按链上状态复核重提（stop 保留兼容，恒为 false）。
 async function watchClaim(reward, ctx, ub) {
   const rec = { reward, typeId: TYPE_ID[reward], unblockBlock: Number(ub) };
   if (DRY) {
@@ -367,22 +397,25 @@ async function watchClaim(reward, ctx, ub) {
       return { rec, done: true };
     }
     if (r.txStatus === "PENDING") {
-      // 已广播但 60s 未确认：绝不重提（可能已上链），退出让下轮按链上状态复核
+      // 确认超时 / 始终停留中间态：不锁定、不判成功，也不终止。
+      // 下一轮直接重读链上解锁块：已刷新说明领到了，没刷新就重新提交。
+      // 链上有幂等保护，重复提交最多成功一笔，其余 FAILURE 无副作用。
       rec.status = "pending";
-      rec.msg = "已提交但确认超时，退出不重提（下轮按链上状态复核）";
+      rec.msg = "已提交但确认未出终态，本轮不锁定；下轮按链上解锁块复核，未刷新则重提";
       log({ level: "warn", reward, msg: rec.msg, txId });
-      return { rec, done: true };
+      return { rec, done: false, stop: false };
     }
     rec.status = "failed";
     rec.exceptionNames = r.exceptionNames;
     rec.msg = `交易 ${r.txStatus}` + (r.exceptionNames?.filter(Boolean).length
       ? `: ${r.exceptionNames.filter(Boolean).join(",")}` : "");
     log({ level: "error", reward, msg: rec.msg, txId });
-    return { rec, done: false, stop: true };
+    // 不 stop：一个奖励失败不该终止整个蹲守，继续按链上状态复核重提。
+    return { rec, done: false, stop: false };
   } catch (e) {
     rec.status = "error"; rec.msg = String(e.message);
     log({ level: "error", reward, msg: "提交异常", detail: String(e.message) });
-    return { rec, done: false, stop: true };
+    return { rec, done: false, stop: false };
   }
 }
 
@@ -490,11 +523,12 @@ async function watchMode() {
     // 到期项：串行提交
     const due = valid.filter((x) => x.rem <= 0n);
     if (due.length) {
-      let problem = false;
+      let problem = false, unsettled = false;
       for (const x of due) {
         const { rec, done: isDone, stop } = await watchClaim(x.r, ctx, x.ub);
         results.set(x.r, rec);
         if (isDone) done.add(x.r);
+        else unsettled = true;
         if (stop) problem = true;
       }
       if (problem) { out.status = "claim_problem"; out.ok = false; break; }
@@ -507,6 +541,9 @@ async function watchMode() {
         out.status = "claimed_and_stop";
         break;
       }
+      // 有未决项（结果未定/失败）：节流一个轮询间隔再按链上状态复核重提，
+      // 避免 0 秒空转刷 nonce。链上幂等保护，重复提交最多成功一笔。
+      if (unsettled) await sleepMs(POLL_SEC * 1000);
       continue;
     }
 
@@ -536,9 +573,11 @@ async function watchMode() {
 // 用 workflow_dispatch 触发下一个常驻 job（concurrency 组保证串行、无缝衔接）。
 //
 // 幂等：handled Map 记住「已成功领取过的解锁块」。链上/索引刷新有延迟，解锁块
-// 未变大前绝不重复提交；只有读到严格更大的解锁块（新周期）才解锁重来。
-// 绝不因 TTL 到期而强制重领 —— 重复提交只会被链上判 FAILURE，宁可等交棒后
-// 由全新 job 重新读权威状态，也不冒险重提。
+// 未变大前暂不重复提交；只有读到严格更大的解锁块（新周期）才解锁重来。
+// 判据只认链上，不认回执：confirmTx 只在 SUCCESS/FAILURE/INVALID 终态返回，
+// INCLUDED/STAGING 一律继续轮询；超时/失败都不锁定，冷却后按链上状态复核重提。
+// 锁带 TTL 兜底：到期链上仍未刷新就主动解锁，确实没领到则重新提交（链上幂等，
+// 重复提交最多成功一笔），绝不因「怕重提」而错失整个领取周期。
 async function daemonMode() {
   const started = Date.now();
   const out = {
@@ -640,16 +679,23 @@ async function daemonMode() {
       const ub = snap.unblock[r];
       if (ub === null || ub === undefined) continue;  // unknown：保守跳过
       const h = handled.get(r);
-      if (h && ub <= h.unblock) {
-        waitingRefresh++;
+      if (h && ub > h.unblock) {
+        handled.delete(r);                            // 链上刷新出下一周期：解锁重来
+      } else if (h) {
+        // 链上仍是「已处理过的那个解锁块」：先等索引刷新。
+        // 但超过 TTL 仍未刷新，说明此前那笔很可能没真正成功（或索引异常滞后）——
+        // 绝不无限等待错失领取：主动解锁，按链上权威状态复核，确实没领就重新提交。
+        // 链上有幂等保护，重复提交最多成功一笔，其余 FAILURE 无副作用。
         if (Date.now() - h.at > HANDLED_TTL_MS) {
+          handled.delete(r);
           log({ level: "warn", reward: r,
-                msg: "领取后解锁块超过 TTL 仍未刷新，继续等待（坚决不重提）",
-                unblockBlock: Number(ub) });
+                msg: "解锁块超过 TTL 仍未刷新，主动解锁并按链上状态复核/重提",
+                unblockBlock: Number(ub), tip: out.tip });
+        } else {
+          waitingRefresh++;
+          continue;                                 // 宽限期内：等链上刷新
         }
-        continue;                                    // 链上未刷新到下一周期
       }
-      if (h && ub > h.unblock) handled.delete(r);     // 新周期：解锁
       if ((retryAfter.get(r) || 0) > Date.now()) continue;
       const rem = ub > snap.st.tip ? ub - snap.st.tip : 0n;
       if (minRem === null || rem < minRem) minRem = rem;
@@ -657,7 +703,9 @@ async function daemonMode() {
       if (rem <= 0n) {
         const { rec } = await watchClaim(r, ctx, ub);
         results.set(r, rec);
-        const settled = ["claimed", "would_claim", "pending"].includes(rec.status);
+        // 只有「领取成功」才锁定解锁块。确认未出终态 / 超时 / 失败一律不锁，
+        // 冷却后按链上状态复核重提 —— 绝不错失一个周期。
+        const settled = ["claimed", "would_claim"].includes(rec.status);
         if (settled) {
           handled.set(r, { unblock: ub, at: Date.now() });
           cycles.set(r, (cycles.get(r) || 0) + 1);
