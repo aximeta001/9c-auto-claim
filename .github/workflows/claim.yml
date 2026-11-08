@@ -1,32 +1,54 @@
 name: 9C 自动领奖 (Heimdall)
 
-# 每次触发都是一个全新 runner：代码由 checkout 提供，密钥由 Secrets 注入。
-# 这正好对症「云端定时任务每次是隔离新沙箱、看不到上次会话文件」的问题。
-# 私钥本身不进仓库、不进日志：只在 runner 内用加密 keystore 临时解密出 .env，
-# 运行结束 runner 销毁，无残留。
+# ═══════════════════════════════════════════════════════════════════════════
+# 架构：纯 GitHub 自接力长链，完全不依赖 WorkBuddy / 任何外部闹钟
+# ───────────────────────────────────────────────────────────────────────────
+#  点火：手动 Run workflow 一次（取消勾选 dry_run），或等 schedule 偶尔命中。
+#  值守：job 内 `claim.mjs --daemon` 常驻 5.5h，按链上区块休眠/轮询，
+#        谁到期就领谁，跨越多个奖励周期，领完不退出。
+#  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
+#        下一个常驻 job。官方文档明确 workflow_dispatch / repository_dispatch
+#        是「GITHUB_TOKEN 防递归规则」的例外，会创建新 workflow run。
+#        concurrency 同组只保留 1 running + 1 pending → 无缝串行交接。
+#  重燃：schedule 每 10 分钟错峰，只作「接力链意外断裂时重新点火」的保险。
+#        GitHub schedule 高负载会延迟/丢弃，不可靠，但链正常时不需要它。
+#
+#  关键：领取精度由 job 内部的区块轮询保证（±1 分钟），与闹钟准时性无关。
+#  每次触发都是全新 runner：代码由 checkout 提供，密钥由 Secrets 注入，
+#  私钥只在 runner 内由加密 keystore 临时解密成 .env，job 结束即销毁。
+# ═══════════════════════════════════════════════════════════════════════════
 on:
   schedule:
-    # UTC 时区，每 15 分钟。GitHub 用 5 位 cron（分 时 日 月 周），
-    # 高峰期可能有数分钟调度延迟。脚本按链上区块判断，与墙上时间无关。
-    - cron: '3,18,33,48 * * * *'
+    # 重燃种子：刻意避开 :00 整点高峰。命中率低不影响——
+    # 它只需在接力链断掉后偶尔成功一次，把链重新点起来。
+    - cron: '4,14,24,34,44,54 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: '首次验证保持勾选：只检查、绝不领取'
+        description: '手动验证时勾选：只做一次链上检查，不值守、不提交、不接力'
         type: boolean
         default: true
+      max_run_seconds:
+        description: '仅用于实测接力链：常驻预算秒数，留空=默认 5.5h；填 60 可在一分钟内验证交棒'
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
 
 concurrency:
   group: 9c-auto-claim
-  cancel-in-progress: false   # 防止两次运行并发、抢同一个 nonce
+  cancel-in-progress: false   # 绝不能取消正在值守的 job
+  # 同组只保留 1 个 running + 1 个 pending。接力 dispatch 的新 run 排队，
+  # 当前 job 一结束就接上；schedule 触发的也进同一组排队，永不并发抢 nonce。
 
 jobs:
   claim:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # 单 job 上限 6h(360min)。脚本预算 330min，留 25min 给安装、收尾与接力 step，
+    # 避免被 timeout 强杀导致接力 step 来不及执行。
+    timeout-minutes: 355
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -58,17 +80,67 @@ jobs:
           if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
           node import-key.mjs $ARGS
 
-      - name: 检查并领取
+      - name: 常驻值守并领取（--daemon）
+        id: daemon
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           EVENT_NAME: ${{ github.event_name }}
+          MAX_RUN: ${{ inputs.max_run_seconds }}
         run: |
-          set -e
-          # runner 全新，.state.json 不跨运行持久，故禁用窗口早退，
-          # 每次做完整链上检查（约 5~8 秒），到点才提交，最稳、不会漏领。
+          set -o pipefail
+          # 仅调试用：允许把常驻预算临时改短，快速验证交棒；留空则走默认 5.5h。
+          EXTRA=""
+          case "$MAX_RUN" in
+            ''|*[!0-9]*) : ;;                 # 空或非数字 → 不加参数
+            *) EXTRA="--max-run-seconds $MAX_RUN" ;;
+          esac
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
-            echo "手动验证模式：只检查，不提交任何交易"
-            node claim.mjs --dry-run --no-idle-skip
+            echo "手动验证模式：只检查一次，不值守、不提交、不接力"
+            node claim.mjs --watch --dry-run 2>&1 | tee "$RUNNER_TEMP/daemon.log"
           else
-            node claim.mjs --no-idle-skip
+            # 真实常驻：守满预算，期间按链上区块自等待、到期即领、领完继续。
+            # 输出 tee 到文件，供接力 step 校验是否为「正常交棒」。
+            node claim.mjs --daemon $EXTRA 2>&1 | tee "$RUNNER_TEMP/daemon.log"
           fi
+          exit ${PIPESTATUS[0]}
+
+      - name: 接力（触发下一个常驻 job）
+        if: always()
+        env:
+          # 未配置 PAT 时用内置 GITHUB_TOKEN（零配置即可跑）；
+          # 若发现自接力被平台限制，可在网页手动加 Secret NC_DISPATCH_TOKEN 兜底。
+          DISPATCH_TOKEN: ${{ secrets.NC_DISPATCH_TOKEN || github.token }}
+          RELAY_REPO: ${{ github.repository }}
+          RELAY_REF: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # 只在「预算耗尽、正常交棒」时接力。演练、异常中止、安装失败等
+          # 绝不接力，避免高频空转循环刷爆 run 次数；此时由 schedule 重燃。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动验证模式：不接力"; exit 0
+          fi
+          LOG="$RUNNER_TEMP/daemon.log"
+          if ! grep -q '"handoff":"budget_exhausted"' "$LOG" 2>/dev/null; then
+            echo "未检测到正常交棒标记，不接力（由 schedule 兜底重燃）"; exit 0
+          fi
+          echo "检测到正常交棒，发起接力…"
+          CODE=""
+          for i in 1 2 3; do
+            CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\"}}" \
+              "https://api.github.com/repos/$RELAY_REPO/actions/workflows/claim.yml/dispatches") || CODE="000"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
+            echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"
+            sleep 5
+          done
+          echo "接力 dispatch HTTP=$CODE"
+          if [ "$CODE" != "204" ] && [ "$CODE" != "200" ]; then
+            echo "::warning::接力失败 HTTP=$CODE，链将依赖 schedule 重燃"
+            head -c 300 "$RUNNER_TEMP/relay_resp.txt" 2>/dev/null || true
+          fi
+          # 接力失败不算 job 失败：daemon 的领取工作已正常完成。
+          exit 0
