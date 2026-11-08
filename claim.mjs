@@ -12,9 +12,19 @@
  * 绝不写进本文件、不写日志、不落盘。
  *
  * 用法：
- *   NC_PRIVATE_KEY=xxxx node claim.mjs                 # 正常领取
+ *   NC_PRIVATE_KEY=xxxx node claim.mjs                 # 一次性检查+领取（兼容旧调用）
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --dry-run       # 只检查不提交
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --reward daily  # 只领某一种
+ *   NC_PRIVATE_KEY=xxxx node claim.mjs --watch         # 蹲守：远离窗口秒退、临近自等待、领完即止
+ *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon        # 自接力常驻：守满整个 job 预算，交棒给下一个 job
+ *   node claim.mjs --self-test                         # 离线自测调度纯逻辑（不联网）
+ *
+ * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
+ * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
+ *
+ * --daemon 是纯 GitHub 自维持链条的运行体：job 由 workflow 的接力 step 一个接一个
+ * 唤起，本循环在单个 job 内持续值守多个奖励周期（默认 5.5h，< GitHub 单 job 6h 上限），
+ * 领完不退出，靠「已处理解锁块锁定」实现幂等，直到预算耗尽正常交棒。
  *
  * 依赖：@planetarium/{account,tx,bencodex,lib9c}（见同目录 package.json）
  */
@@ -64,6 +74,40 @@ const DRY = args.includes("--dry-run");
 const onlyIdx = args.indexOf("--reward");
 const ONLY = onlyIdx >= 0 ? args[onlyIdx + 1] : null; // "daily" | "patrol" | null
 const REWARDS = ONLY ? [ONLY] : ["daily", "patrol"];
+
+// ---------------- 蹲守模式参数（--watch） ----------------
+// 全部可用命令行覆盖，便于演练与调参；默认值针对 15 分钟心跳 + 加密 schedule
+// 的双源闹钟，窗口取 900 块（≈2 小时）以保证「窗口内至少一次成功触发」。
+const WATCH = args.includes("--watch");
+const numArg = (flag, def) => {
+  const i = args.indexOf(flag);
+  return i >= 0 && Number.isFinite(Number(args[i + 1])) ? Number(args[i + 1]) : def;
+};
+const WATCH_WINDOW   = BigInt(Math.max(1, Math.trunc(numArg("--watch-window", 900))));
+const POLL_FROM      = 40n;                                        // 剩 40 块起进入密集轮询
+const POLL_SEC       = Math.max(1, Math.trunc(numArg("--poll-seconds", 60)));
+const SLEEP_CAP_SEC  = 300;                                       // 单次最长睡 5 分钟，醒后重算
+const BLOCK_SEC_EST  = 7;                                         // 保守估计（实际约 7~9s），宁可早醒
+const MAX_WATCH_MS   = Math.max(10, numArg("--max-watch-seconds", 140 * 60)) * 1000;
+// 仅 dry-run 生效的演练钩子：把解锁块伪装成「首轮 tip + N 块」，快速走完整个循环
+const SIM_DELTA = args.includes("--simulate-unblock-delta")
+  ? BigInt(Math.max(0, Math.trunc(numArg("--simulate-unblock-delta", 0))))
+  : null;
+
+// ---------------- 自接力常驻模式（--daemon） ----------------
+// 与 --watch 的三点区别：
+//  · 永不秒退：远离解锁窗口也留在 job 内按区块数休眠，直到时间预算耗尽才交棒
+//  · 领完不退出：把「已处理的解锁块」锁住，链上刷新出更大的解锁块后自动进入下一周期
+//  · 幂等靠内存锁而非跨运行状态文件：交易上链/索引有延迟，锁可防止读到旧解锁块时重复提交
+// 接力由 workflow 的独立 step（if: always()）完成，脚本崩溃/超时也不会断链。
+const DAEMON = args.includes("--daemon");
+const MAX_RUN_MS = Math.max(10, numArg("--max-run-seconds", 330 * 60)) * 1000; // 5.5h < 单 job 6h 上限
+const DAEMON_CAP_SEC = Math.max(30, Math.trunc(numArg("--daemon-sleep-cap", 900)));
+// 同一解锁块领取后的静默期：期间链上状态若尚未刷新，不重复判定，避免重复提交
+const HANDLED_TTL_MS = 30 * 60 * 1000;
+// 仅 dry-run 演练生效：模拟 tip 每轮前进块数、领取后解锁块前进块数（用于快速走多周期）
+const SIM_TIP_STEP = BigInt(Math.max(1, Math.trunc(numArg("--simulate-tip-step", 20))));
+const SIM_CYCLE_BLOCKS = BigInt(Math.max(1, Math.trunc(numArg("--simulate-cycle-blocks", 60))));
 
 // ---------------- 窗口早退（省流） ----------------
 // 定时任务是固定频率唤起，无法「平时不跑、临近才跑」。所以由脚本自己早退：
@@ -250,8 +294,427 @@ async function confirmTx(txId) {
   return { txStatus: "PENDING" };
 }
 
+// ---------------- 蹲守模式（--watch） ----------------
+//  · 不依赖 .state.json（云端 runner 每次全新），每轮直接读链上权威状态
+//  · 按剩余「区块数」而非墙上时间推进，区块变快/变慢都能自适应
+//  · 两个奖励各自独立判定；提交串行（同一个 signer 不能并发抢 nonce）
+//  · 领取成功（或已提交待确认）立即退出，不等另一个奖励的下一周期
+//  · 全局硬超时，退出后由下一次心跳接力，不会永久占用 runner
+function planSleepSec(minRem, capSec = SLEEP_CAP_SEC) {
+  if (minRem <= 0n) return 0;
+  if (minRem <= POLL_FROM) return POLL_SEC;
+  return Math.max(1, Math.min(capSec, Number(minRem - POLL_FROM) * BLOCK_SEC_EST));
+}
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function selfTest() {
+  const cases = [
+    [1000n, SLEEP_CAP_SEC], [100n, 300], [45n, 35],
+    [40n, POLL_SEC], [5n, POLL_SEC], [0n, 0],
+  ];
+  let pass = 0;
+  for (const [rem, expect] of cases) {
+    const got = planSleepSec(rem);
+    const ok = got === expect;
+    console.log(`  planSleepSec(${rem}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  console.log(`  self-test: ${pass}/${cases.length} 通过`);
+  process.exit(pass === cases.length ? 0 : 1);
+}
+
+// 每轮快照：tip + 角色状态 + 巡逻解锁块，全部取链上/权威接口
+async function readWatchSnapshot() {
+  const st = await getTip();
+  let av;
+  try { av = await getAvatarState(); }
+  catch (_) { av = { dailyReceivedIndex: null, agentAddress: null }; }
+  const unblock = {
+    daily: av.dailyReceivedIndex === null ? null : av.dailyReceivedIndex + CFG.dailyInterval,
+  };
+  let patrolSource = "unknown";
+  try {
+    const p = await getPatrolUnblock();
+    if (p.unblock > 0n) { unblock.patrol = p.unblock; patrolSource = p.source; }
+    else unblock.patrol = null;
+  } catch (_) { unblock.patrol = null; }
+  return { st, av, unblock, patrolSource };
+}
+
+// 提交单项奖励；done=true 表示本 job 不再处理它，stop=true 表示终止整个蹲守
+async function watchClaim(reward, ctx, ub) {
+  const rec = { reward, typeId: TYPE_ID[reward], unblockBlock: Number(ub) };
+  if (DRY) {
+    rec.status = "would_claim";
+    rec.msg = "演练模式：已到期，本应提交交易（未提交）";
+    log({ level: "info", reward, msg: rec.msg });
+    return { rec, done: true };
+  }
+  try {
+    const nonce = await getNonce(ctx.signer.toString());
+    const actionValue = buildActionValue(reward, Address.fromHex(CFG.avatarAddress));
+    const txId = await submitTx({
+      account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue,
+    });
+    rec.txId = txId;
+    log({ level: "info", reward, msg: "交易已提交", txId, nonce: Number(nonce) });
+    const r = await confirmTx(txId);
+    rec.txStatus = r.txStatus;
+    rec.blockIndex = r.blockIndex ?? null;
+    if (r.txStatus === "SUCCESS") {
+      rec.status = "claimed"; rec.msg = "领取成功";
+      log({ level: "info", reward, msg: rec.msg, txId });
+      return { rec, done: true };
+    }
+    if (r.txStatus === "PENDING") {
+      // 已广播但 60s 未确认：绝不重提（可能已上链），退出让下轮按链上状态复核
+      rec.status = "pending";
+      rec.msg = "已提交但确认超时，退出不重提（下轮按链上状态复核）";
+      log({ level: "warn", reward, msg: rec.msg, txId });
+      return { rec, done: true };
+    }
+    rec.status = "failed";
+    rec.exceptionNames = r.exceptionNames;
+    rec.msg = `交易 ${r.txStatus}` + (r.exceptionNames?.filter(Boolean).length
+      ? `: ${r.exceptionNames.filter(Boolean).join(",")}` : "");
+    log({ level: "error", reward, msg: rec.msg, txId });
+    return { rec, done: false, stop: true };
+  } catch (e) {
+    rec.status = "error"; rec.msg = String(e.message);
+    log({ level: "error", reward, msg: "提交异常", detail: String(e.message) });
+    return { rec, done: false, stop: true };
+  }
+}
+
+async function watchMode() {
+  const started = Date.now();
+  const out = {
+    network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, mode: "watch",
+    rewards: [], ok: true,
+    config: {
+      windowBlocks: Number(WATCH_WINDOW), pollFromBlocks: Number(POLL_FROM),
+      pollSeconds: POLL_SEC, maxWatchSeconds: MAX_WATCH_MS / 1000,
+      simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
+    },
+  };
+
+  // 私钥与归属校验：与一次性模式同样严格的前置
+  if (!CFG.privateKey && !DRY) {
+    log({ level: "error", msg: "缺少私钥：请设置环境变量 NC_PRIVATE_KEY" });
+    out.ok = false; out.error = "缺少 NC_PRIVATE_KEY";
+    console.log(JSON.stringify(out)); process.exit(1);
+  }
+  let ctx = null;
+  if (!DRY) {
+    const hex = CFG.privateKey.trim().replace(/^0x/i, "");
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      out.ok = false; out.error = "私钥格式错误";
+      console.log(JSON.stringify(out)); process.exit(1);
+    }
+    const account = RawPrivateKey.fromHex(hex);
+    const pub = await account.getPublicKey();
+    const signer = Address.deriveFrom(pub);
+    ctx = { account, pub, signer };
+    out.signer = signer.toString();
+  }
+
+  const results = new Map();
+  const done = new Set();
+  let first = true, simUnblock = null;
+
+  while (true) {
+    if (Date.now() - started > MAX_WATCH_MS) {
+      out.status = "watch_timeout"; out.timedOut = true;
+      out.msg = "达到本次 job 硬超时，退出由下一轮接力";
+      log({ level: "warn", msg: out.msg });
+      break;
+    }
+
+    let snap;
+    try { snap = await readWatchSnapshot(); }
+    catch (e) {
+      log({ level: "warn", msg: "快照读取失败，稍后重试", detail: String(e.message) });
+      if (DRY && SIM_DELTA === null) { out.status = "snapshot_error"; out.ok = false; break; }
+      await sleepMs(Math.min(POLL_SEC, 15) * 1000);
+      continue;
+    }
+    out.tip = Number(snap.st.tip); out.rpc = snap.st.rpc;
+    out.patrolSource = snap.patrolSource;
+    out.agentAddress = snap.av.agentAddress;
+    if (!DRY && ctx && snap.av.agentAddress
+        && ctx.signer.toString().toLowerCase() !== snap.av.agentAddress.toLowerCase()) {
+      out.status = "aborted"; out.ok = false;
+      out.error = "私钥与角色不匹配：已阻止提交";
+      log({ level: "error", msg: out.error });
+      break;
+    }
+
+    // 演练：解锁块固定在首轮 tip + N，之后每轮只读真实 tip，快速走完整循环
+    if (DRY && SIM_DELTA !== null) {
+      if (simUnblock === null) simUnblock = snap.st.tip + SIM_DELTA;
+      for (const r of REWARDS) snap.unblock[r] = simUnblock;
+    }
+
+    const pending = REWARDS.filter((r) => !done.has(r));
+    if (pending.length === 0) { out.status = "all_claimed"; break; }
+
+    const info = pending.map((r) => {
+      const ub = snap.unblock[r];
+      const rem = ub === null ? null : (ub > snap.st.tip ? ub - snap.st.tip : 0n);
+      return { r, ub, rem };
+    });
+    const valid = info.filter((x) => x.rem !== null);
+    if (valid.length === 0) {
+      out.status = "unknown";
+      out.msg = "两个解锁块都读不到，保守不提交，退出等下一轮";
+      log({ level: "warn", msg: out.msg });
+      break;
+    }
+    const nearest = valid.reduce((a, x) => (x.ub < a.ub ? x : a));
+    const minRem = valid.reduce((m, x) => (x.rem < m ? x.rem : m), valid[0].rem);
+    out.nearestUnblockBlock = Number(nearest.ub);
+    out.blocksRemaining = Number(minRem);
+
+    if (first) {
+      first = false;
+      log({ level: "info", msg: "蹲守启动", tip: out.tip,
+            nearestUnblockBlock: out.nearestUnblockBlock,
+            blocksRemaining: Number(minRem), windowBlocks: Number(WATCH_WINDOW) });
+    }
+    if (minRem > WATCH_WINDOW) {
+      out.status = "idle_skip";
+      out.msg = `远离解锁窗口（最近还需 ${Number(minRem)} 块 ≈ ${(Number(minRem) * 8 / 3600).toFixed(1)} 小时），秒退`;
+      break;
+    }
+
+    // 到期项：串行提交
+    const due = valid.filter((x) => x.rem <= 0n);
+    if (due.length) {
+      let problem = false;
+      for (const x of due) {
+        const { rec, done: isDone, stop } = await watchClaim(x.r, ctx, x.ub);
+        results.set(x.r, rec);
+        if (isDone) done.add(x.r);
+        if (stop) problem = true;
+      }
+      if (problem) { out.status = "claim_problem"; out.ok = false; break; }
+      // 领完即止：若另一项也已进入轮询区/到期则继续，否则退出等下一周期
+      const rest = REWARDS.filter((r) => !done.has(r)).map((r) => {
+        const ub = snap.unblock[r];
+        return ub === null ? null : Number(ub > snap.st.tip ? ub - snap.st.tip : 0n);
+      }).filter((x) => x !== null);
+      if (rest.length === 0 || Math.min(...rest) > Number(POLL_FROM)) {
+        out.status = "claimed_and_stop";
+        break;
+      }
+      continue;
+    }
+
+    const sec = planSleepSec(minRem);
+    const phase = minRem <= POLL_FROM ? "poll" : "sleep";
+    log({ level: "watch", phase, remaining: Number(minRem), sleepSec: sec,
+          msg: phase === "poll" ? "进入密集轮询区" : "按剩余区块数休眠等待" });
+    if (DRY && SIM_DELTA === null) {
+      out.status = "dry_plan";
+      out.msg = `窗口内，本应 sleep ${sec}s 后重读链上（演练不真睡、不提交）`;
+      break;
+    }
+    await sleepMs(sec * 1000);
+  }
+
+  out.rewards = REWARDS.map((r) => results.get(r) || {
+    reward: r, typeId: TYPE_ID[r], status: done.has(r) ? "done" : "not_reached",
+  });
+  out.elapsedMs = Date.now() - started;
+  console.log(JSON.stringify(out));
+  process.exit(out.ok ? 0 : 1);
+}
+
+// ---------------- 自接力常驻模式（--daemon） ----------------
+// 纯 GitHub 自维持链条的运行体：单个 job 守满时间预算（默认 5.5h，< 6h 上限），
+// 期间跨越多个奖励周期，领完不退出；预算耗尽后正常交棒，由 workflow 接力 step
+// 用 workflow_dispatch 触发下一个常驻 job（concurrency 组保证串行、无缝衔接）。
+//
+// 幂等：handled Map 记住「已成功领取过的解锁块」。链上/索引刷新有延迟，解锁块
+// 未变大前绝不重复提交；只有读到严格更大的解锁块（新周期）才解锁重来。
+// 绝不因 TTL 到期而强制重领 —— 重复提交只会被链上判 FAILURE，宁可等交棒后
+// 由全新 job 重新读权威状态，也不冒险重提。
+async function daemonMode() {
+  const started = Date.now();
+  const out = {
+    network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, mode: "daemon",
+    rewards: [], ok: true, transientErrors: 0,
+    config: {
+      maxRunSeconds: MAX_RUN_MS / 1000,
+      pollFromBlocks: Number(POLL_FROM), pollSeconds: POLL_SEC,
+      daemonSleepCapSec: DAEMON_CAP_SEC, handledTtlMs: HANDLED_TTL_MS,
+      simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
+      simulateTipStep: SIM_DELTA === null ? null : Number(SIM_TIP_STEP),
+      simulateCycleBlocks: SIM_DELTA === null ? null : Number(SIM_CYCLE_BLOCKS),
+    },
+  };
+
+  // 私钥与归属前置校验（与一次性 / watch 同样严格）
+  if (!CFG.privateKey && !DRY) {
+    log({ level: "error", msg: "缺少私钥：请设置环境变量 NC_PRIVATE_KEY" });
+    out.ok = false; out.error = "缺少 NC_PRIVATE_KEY";
+    console.log(JSON.stringify(out)); process.exit(1);
+  }
+  let ctx = null;
+  if (!DRY) {
+    const hex = CFG.privateKey.trim().replace(/^0x/i, "");
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      out.ok = false; out.error = "私钥格式错误";
+      console.log(JSON.stringify(out)); process.exit(1);
+    }
+    const account = RawPrivateKey.fromHex(hex);
+    const pub = await account.getPublicKey();
+    ctx = { account, pub, signer: Address.deriveFrom(pub) };
+    out.signer = ctx.signer.toString();
+  }
+
+  const handled = new Map();    // reward -> { unblock: bigint, at: ms }
+  const retryAfter = new Map(); // reward -> ms（提交失败冷却）
+  const results = new Map();    // reward -> 最后一次 rec
+  const cycles = new Map();     // reward -> 本 job 内领取次数
+  let simTip = null;
+  const simUb = {};             // 演练用解锁块
+  let first = true, round = 0, handoff = "budget_exhausted";
+
+  while (true) {
+    if (Date.now() - started >= MAX_RUN_MS) { handoff = "budget_exhausted"; break; }
+
+    let snap;
+    if (DRY && SIM_DELTA !== null) {
+      // 演练：纯离线模拟快照，不依赖链上连通性，结果确定且快
+      snap = {
+        st: { tip: simTip ?? 1000000n, rpc: "simulated" },
+        av: { dailyReceivedIndex: null, agentAddress: null },
+        unblock: {}, patrolSource: "simulated",
+      };
+    } else {
+      try {
+        snap = await readWatchSnapshot();
+      } catch (e) {
+        if (DRY) {
+          out.status = "snapshot_error"; out.ok = false; handoff = "snapshot_error"; break;
+        }
+        log({ level: "warn", msg: "快照读取失败，稍后重试", detail: String(e.message) });
+        await sleepMs(Math.min(POLL_SEC, 15) * 1000);
+        continue;
+      }
+    }
+    round++;
+
+    // 归属校验：每轮都做，快照里读得到 agentAddress 就校验
+    if (!DRY && ctx && snap.av.agentAddress &&
+        ctx.signer.toString().toLowerCase() !== snap.av.agentAddress.toLowerCase()) {
+      out.status = "aborted"; out.ok = false; handoff = "aborted";
+      out.error = "私钥与角色不匹配：已阻止提交";
+      log({ level: "error", msg: out.error });
+      break;
+    }
+
+    // 演练：伪造 tip 每轮前进、解锁块在领取后跳到下一周期，快速走多周期闭环
+    if (DRY && SIM_DELTA !== null) {
+      if (simTip === null) {
+        simTip = snap.st.tip;
+        for (const r of REWARDS) simUb[r] = simTip + SIM_DELTA;
+      } else {
+        simTip += SIM_TIP_STEP;
+      }
+      snap.st.tip = simTip;
+      for (const r of REWARDS) snap.unblock[r] = simUb[r];
+    }
+    out.tip = Number(snap.st.tip);
+    out.rpc = snap.st.rpc; out.patrolSource = snap.patrolSource;
+    out.agentAddress = snap.av.agentAddress;
+    if (first) {
+      first = false;
+      log({ level: "info", msg: "自接力常驻启动", tip: out.tip,
+            maxRunSeconds: MAX_RUN_MS / 1000, windowBlocks: Number(WATCH_WINDOW) });
+    }
+
+    let minRem = null, waitingRefresh = 0;
+    for (const r of REWARDS) {
+      const ub = snap.unblock[r];
+      if (ub === null || ub === undefined) continue;  // unknown：保守跳过
+      const h = handled.get(r);
+      if (h && ub <= h.unblock) {
+        waitingRefresh++;
+        if (Date.now() - h.at > HANDLED_TTL_MS) {
+          log({ level: "warn", reward: r,
+                msg: "领取后解锁块超过 TTL 仍未刷新，继续等待（坚决不重提）",
+                unblockBlock: Number(ub) });
+        }
+        continue;                                    // 链上未刷新到下一周期
+      }
+      if (h && ub > h.unblock) handled.delete(r);     // 新周期：解锁
+      if ((retryAfter.get(r) || 0) > Date.now()) continue;
+      const rem = ub > snap.st.tip ? ub - snap.st.tip : 0n;
+      if (minRem === null || rem < minRem) minRem = rem;
+
+      if (rem <= 0n) {
+        const { rec } = await watchClaim(r, ctx, ub);
+        results.set(r, rec);
+        const settled = ["claimed", "would_claim", "pending"].includes(rec.status);
+        if (settled) {
+          handled.set(r, { unblock: ub, at: Date.now() });
+          cycles.set(r, (cycles.get(r) || 0) + 1);
+          if (DRY && SIM_DELTA !== null) simUb[r] = simTip + SIM_CYCLE_BLOCKS;
+          log({ level: "daemon", phase: "claimed", reward: r, status: rec.status,
+                cycle: cycles.get(r), unblockBlock: Number(ub), tip: out.tip });
+        } else {
+          retryAfter.set(r, Date.now() + 60000);
+          out.transientErrors++;
+          log({ level: "warn", phase: "claim_retry", reward: r, status: rec.status,
+                msg: "提交未成功，冷却 60s 后重试" });
+        }
+      }
+    }
+
+    let sec, phase;
+    if (minRem === null) {
+      sec = Math.min(POLL_SEC, 60);
+      phase = "wait_refresh";
+      out.waitingRefresh = waitingRefresh;
+    } else {
+      sec = planSleepSec(minRem, DAEMON_CAP_SEC);
+      phase = minRem <= POLL_FROM ? "poll" : "sleep";
+    }
+    log({ level: "daemon", phase, round, remaining: minRem === null ? null : Number(minRem),
+          sleepSec: sec, cycles: Object.fromEntries(cycles),
+          elapsedSec: Math.round((Date.now() - started) / 1000) });
+
+    if (DRY && SIM_DELTA === null) {
+      out.status = "dry_plan"; handoff = "dry_plan";
+      out.msg = `演练（无模拟）：本应 sleep ${sec}s 并持续值守到 ${MAX_RUN_MS / 1000}s 预算耗尽后交棒；不真睡、不提交`;
+      break;
+    }
+    const leftMs = MAX_RUN_MS - (Date.now() - started);
+    await sleepMs(Math.max(0, Math.min(sec * 1000, leftMs)));
+  }
+
+  out.status = out.status || handoff;
+  out.handoff = handoff;
+  out.rounds = round;
+  out.rewards = REWARDS.map((r) => ({
+    reward: r, typeId: TYPE_ID[r], cycles: cycles.get(r) || 0,
+    ...(results.get(r) || { status: "watching", msg: "本 job 未触及领取点" }),
+  }));
+  out.elapsedMs = Date.now() - started;
+  out.msg = out.msg || (handoff === "budget_exhausted"
+    ? "时间预算耗尽，正常交棒：由 workflow 接力 step 触发下一个常驻 job"
+    : `退出：${handoff}`);
+  console.log(JSON.stringify(out));
+  process.exit(out.ok ? 0 : 1);
+}
+
 // ---------------- 主流程 ----------------
 async function main() {
+  if (args.includes("--self-test")) return selfTest();
+  if (DAEMON) return daemonMode();
+  if (WATCH) return watchMode();
   const started = Date.now();
   const out = { network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, rewards: [], ok: true };
 
