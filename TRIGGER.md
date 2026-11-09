@@ -414,3 +414,30 @@ GitHub 官方明确：**`GITHUB_TOKEN` 触发的事件不会创建新的 workflo
   未命中时每 60s 只有 `rawCount / candidateCount=0` 的 daemon 心跳。
 - 万一领奖链与扫货链极偶发撞 nonce：其中一笔 FAILURE 无资金损失，下轮自动重提
   （沿用「重复提交没事、失败无所谓、只认链上」既定策略）。
+
+### 上线实录（2026-11-09 已完成）
+
+提交 `269a50a9`（当前 HEAD），GitHub 已把 `.github/workflows/market.yml` 识别为
+active（workflow id `411841247`）。点火按「先只读验证、再真实常驻」两步完成，均为
+`workflow_dispatch`：
+
+| run | UTC 时间 | `dry_run` | 结果 |
+|---|---|---|---|
+| `#1` 线上只读验证 | 08:36 | `true` | **success**：检出 / Node / `npm ci` / **keystore 解密成功**（角色 `bnb`）/ 单轮真实联网扫描 / 接力 step 正确跳过，全部 7 个 step 成功 |
+| `#2` 真实常驻点火 | 08:38 | `false` | **in_progress**：sha `269a50a9`，前置 5 步全部 success，`常驻市场扫货（--daemon）` step 持续运行；跨 2 个轮询周期（约 2 分钟）复查仍 `in_progress`，未崩溃退出 |
+
+- `#1` 扫描日志：`tip=11756022`、`rawCount=73`、`rejectedByTicker=0`、
+  `candidateCount=0`、`ok=true`。
+- 点火后本地真实联网只读复核：`tip=11756082`、73 条挂单、
+  **全部 ticker 均为 `RUNESTONE_STUN_ADVENTURE`（零串货）**、
+  最低单价 **0.7 NCG/件**（21 NCG / 30 件）、**当前无 ≤0.2 的挂单**；
+  因此上线至今未产生任何真实购买交易，属预期空跑。
+- 领奖链 `#46` 仍 `in_progress`；两条链 `concurrency` 组分别为
+  `9c-market-buy` 与 `9c-auto-claim`，互不排队、互不干扰。
+- **首次自动交棒**预计在 `#2` 跑满 5.5h 预算后：脚本输出
+  `"handoff":"budget_exhausted"`，接力 step 用 `GITHUB_TOKEN` POST
+  `actions/workflows/market.yml/dispatches`（`dry_run=false`）自动产生 `#3`
+  继续值守；`schedule`（`9,19,29,39,49,59` 错峰）仅作断链重燃保险。
+- 复查方法：GitHub `Actions → 9C 市场扫货` 看是否持续有新的 `in_progress` run；
+  一旦出现 ≤0.2 的单，日志会依次出现 `已提交 buy_product3（N 单）` →
+  `购买成功（N 单）`；失败 / PENDING 一律下轮重扫，不锁死。
