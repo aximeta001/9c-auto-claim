@@ -25,6 +25,30 @@
   - 巡逻：9CAPI `/PatrolUnblockIndexHeimdall` 返回的 `patrolClaimBlock`；该接口故障时回退到 Mimir 最近领取记录 + 5400
 - **归属校验**：私钥派生的地址必须等于角色链上的 `agentAddress`，否则提交前直接拦截，避免白烧 gas/nonce。导入工具 `import-key.mjs` 与运行时的 `claim.mjs` 都会校验。
 
+### AP 满时先 Sweep 消耗（仅日常奖励）
+
+日常奖励 `daily_reward7` 领的是 **Action Point（AP，上限 120）**。查 `Lib9c/Action/DailyReward.cs` 源码可知链上**并没有「AP 满不能领」的检查**，它只做
+`SetActionPoint(avatar, ActionPointMax = 120)`（把 AP **补满**）。所以 AP 已满时领取照样 `SUCCESS`，只是补满 120 等于**零收益**，还白刷一次 `dailyRewardReceivedIndex`、白等一个 2550 块冷却。游戏 App 里「AP 满点不动领取」是客户端为防浪费做的 UI 限制，链上不设卡。
+
+因此脚本在提交 `daily_reward7` 前先读链上 `stateQuery.avatar.actionPoint`：
+
+- **AP 未满**（< 120）→ 直接领，正常拿到补满的 AP。
+- **AP 已满**（≥ 120）→ 先发一笔 `hack_and_slash_sweep10`，把 120 AP 消耗掉（每次 4 AP × 30 次），**成功后再领日常**，才能吃到整整 120 AP，并顺带获得 30 次 sweep 掉落。
+- **巡逻奖励与 AP 无关，不触发 sweep。**
+
+Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
+
+| 要点 | 做法 |
+|---|---|
+| 关卡选择 | 复用「本角色最近一笔 `SUCCESS` 的 sweep」原始 action，从 Mimir 动态取；客户端实际用的是 `world 9 / stage 446`（已通关且 CP 达标），不是 `lastClearedStage` 的 495 —— 495 的 `SweepRequiredCPSheet` CP 要求更高，硬造会 `NotEnoughCombatPointException` |
+| 参数构造 | 直接复用链上已成功的 action **字节**，只把 `GameAction.Id` 换成新的 16 字节；装备 / 符文 / 关卡 / `actionPoint` / 入场材料一字不改，保证 CP、`playCount`、`EntryCostItemCount` 全部校验与那笔成功交易一致。实测已与链上真实 action **逐字节比对通过** |
+| 装备变更 | 每轮动态取最近成功 sweep，用户手动换装后再 sweep 过一次即自动跟随；Mimir 故障回退到内置模板（block `11749808`，同样已 SUCCESS） |
+| 失败降级 | sweep 未确认成功 / 模板异常 / 超时，**一律降级照常领日常**——链上本就无 AP 门槛，绝不让可选的收益优化阻塞领取、错失冷却窗口 |
+| 提交顺序 | sweep 先 `confirmTx` 等到终态、nonce 推进后，再 `getNonce` 提交日常，两笔串行不撞 nonce（实测 `sweep #7 → daily #8`） |
+| 幂等 | 触发判据只看链上 AP：sweep 成功扣掉 AP 后 `shouldSweep` 自动变 false，交棒后新 job 也不会重复 sweep |
+
+> 开关：`--no-sweep` 可整体关闭（默认开启）。演练钩子 `--simulate-ap-full` 仅 `--dry-run` 生效，用来走一遍 `would_sweep` 路径，绝不联网、不提交。
+
 ---
 
 ## 二、部署方式（选一种）
@@ -84,6 +108,11 @@
 `pending`（已提交但确认未出终态，**不锁定、冷却后按链上状态复核重提**）/
 `failed` / `error` / `unknown` / `would_claim`（dry-run）/ `not_reached`（本轮未处理）。
 
+`rewards[].sweep`（仅日常、AP 满时出现）：`{triggered, ap, status, template?, txId?, txStatus?}`，
+`status` 取值 `swept`（成功，AP 已消耗）/ `sweep_unconfirmed`（未确认成功，已降级照常领）/
+`sweep_error`（模板/提交异常，已降级照常领）/ `none`（未触发）/ `would_sweep`（dry-run）。
+日志里对应 `AP 已满：已提交 sweep 消耗 AP` 与 `sweep 成功，AP 已消耗，继续领日常`。
+
 > **只认链上、不认回执**：`confirmTx` 只在 `SUCCESS` / `FAILURE` / `INVALID` 终态下结论；
 > `INCLUDED` / `STAGING` 是中间态（后续可能变成功也可能变失败），一律继续轮询，
 > 超时返回 `PENDING`。除「领取成功」外的任何结果都不锁定解锁块，链上没刷新就重提；
@@ -139,9 +168,10 @@ node claim.mjs --watch --watch-window 1200 # 自定义蹲守窗口（块，默�
 
 # ---- 自接力常驻模式（--daemon，GitHub Actions 正式使用）----
 node claim.mjs --daemon                    # 真实：常驻 5.5h、跨多周期、预算耗尽交棒
+node claim.mjs --daemon --no-sweep         # 关闭「AP 满时先 sweep」（默认开启）
 node claim.mjs --daemon --dry-run          # 演练：只规划一轮，不真睡、不提交
 node claim.mjs --daemon --max-run-seconds 19800   # 自定义预算（秒，须 < 6h）
-node claim.mjs --self-test                 # 离线自测休眠策略纯逻辑
+node claim.mjs --self-test                 # 离线自测（含 sweep 判定 + 模板重建）
 
 # ---- 本地 cron 入口 ----
 bash run.sh --dry-run
@@ -152,6 +182,7 @@ tail -f claim.log
 > - `--simulate-unblock-delta N` 把解锁块伪装成「当前 tip + N 块」；
 > - `--simulate-tip-step N` 每轮让 tip 前进 N 块、`--simulate-cycle-blocks N` 领取后跳到下一周期，
 >   配合 `--poll-seconds 1 --max-run-seconds 18` 可在十几秒内走完**多个完整周期 + 正常交棒**；
+> - `--simulate-ap-full` 模拟 AP=120 满，走一遍 `would_sweep` 前置路径（验证 sweep 触发判定）；
 > - 纯离线、不联网、不提交任何交易。
 
 ---
