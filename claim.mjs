@@ -156,6 +156,18 @@ const AP_MAX = 120;                    // DailyReward.ActionPointMax
 const SWEEP_TYPE_ID = "hack_and_slash_sweep10";
 const SWEEP_AP_THRESHOLD = 120;        // 当前 AP >= 此值视为「满」，需要提前消耗
 const SWEEP_ENABLED = !args.includes("--no-sweep");   // 默认开启
+// 每次 sweep 固定消耗多少 AP（目标：把 120AP 全部用掉 = 30 次 sweep，不浪费）。
+// 模板里的 actionPoint 会跟着「最近一次手动 sweep」漂移（实测出现过 80/120），
+// 若沿用 80 只消耗 80AP，剩 40AP 被 daily 补回，等于白丢 40AP 的 sweep 收益。
+// 依据 Lib9c/Action/HackAndSlashSweep.cs Execute：
+//   · 对 actionPoint 的唯一硬校验是 actionPoint <= 当前 AP（没有 120 上限）
+//   · playCount = actionPoint / CostAP，CostAP 由 StageSheet+质押系数决定
+//   · CP 校验 (cp >= SweepRequiredCPSheet[stageId].RequiredCP) 与 playCount 无关
+//   · stage446 的 EntryCostItemId = 0（无入场材料），playCount 变大无需改材料字段
+// 且 shouldSweep 只在链上 AP >= 120 时才触发，故覆盖成 120 必然满足链上校验。
+// 上限钳到 120：绝不能提交超过当前 AP 的值（否则 NotEnoughActionPointException）。
+const SWEEP_AP_TARGET = Math.max(1, Math.min(SWEEP_AP_THRESHOLD,
+  Math.trunc(numArg("--sweep-ap", SWEEP_AP_THRESHOLD))));
 // ---- sweep 失败重试（失败/超时/异常都不要一次就降级）----
 // 连续最多 SWEEP_MAX_ATTEMPTS 次提交尝试（含首次）。每轮重试前先读链上
 // actionPoint 复核：若 AP 已被消耗，说明上一笔其实成功了（典型的「confirmTx
@@ -385,10 +397,19 @@ async function fetchSweepTemplate() {
   return { raw: FALLBACK_SWEEP_RAW, source: "fallback@11749808" };
 }
 
-// 复用已验证成功的 sweep action 字节：只把 GameAction.Id 换成新的 16 字节，
-// 其余字段（关卡/装备/符文/actionPoint/apStoneCount/入场材料声明）一字不改。
-// 这样 CP、playCount、EntryCostItemCount 等链上校验与那笔 SUCCESS 交易完全一致，
-// 不重新推导任何表格/装备，最不容易出错。
+// 复用已验证成功的 sweep action 字节：只强制改写三个字段——
+//   1) GameAction.Id 换成新的 16 字节（每笔必须不同）；
+//   2) actionPoint 覆盖为 SWEEP_AP_TARGET(120)，确保把 AP 全部用掉；
+//   3) apStoneCount 覆盖为 0，确保不消耗背包 AP 药水、playCount 恒为 30。
+// 之所以要锁死 2)3)：模板来源是「本角色最近一笔 SUCCESS sweep」，用户随时可能
+// 手动做一次 80AP 的 sweep、或勾了 AP 药水，那两个值就会被带进模板。
+//   · Lib9c HackAndSlashSweep.cs: playCount = (120/costAp)*apStoneCount + actionPoint/costAp
+//     → apStoneCount=N 会让次数变 30+30N，且 Execute 会 RemoveFungibleItem 真扣药水；
+//     药水不足则 NotEnoughMaterialException → FAILURE → 白丢一轮 sweep 收益。
+// 其余字段（关卡/装备/符文/入场材料声明）一字不改：这样 CP、装备列表等链上校验
+// 与那笔「最近 SUCCESS」交易完全一致，自动跟随角色养成，不冻结旧模板。
+// 覆盖时保持模板原值类型（HackAndSlashSweep10 用 Unicode Text，如 "80"/"0"），
+// 编码类型不变、字段集合不变，字节级零类型风险。
 function buildSweepAction(rawHex) {
   const action = decode(Buffer.from(rawHex, "hex"));
   if (!(action instanceof BencodexDictionary) || String(action.get("type_id")) !== SWEEP_TYPE_ID) {
@@ -406,7 +427,18 @@ function buildSweepAction(rawHex) {
   }
   const entries = [];
   for (const k of values.keys()) {
-    entries.push([k, String(k) === "id" ? randomBytes(16) : values.get(k)]);
+    const key = String(k);
+    if (key === "id") {
+      entries.push([k, randomBytes(16)]);       // 每笔换新，避免被判重复交易
+      continue;
+    }
+    if (key === "actionPoint" || key === "apStoneCount") {
+      const orig = values.get(k);
+      const target = key === "actionPoint" ? SWEEP_AP_TARGET : 0;
+      entries.push([k, typeof orig === "bigint" ? BigInt(target) : String(target)]);
+      continue;
+    }
+    entries.push([k, values.get(k)]);
   }
   return new BencodexDictionary([
     ["type_id", action.get("type_id")],
@@ -429,12 +461,12 @@ async function spendApBySweep(ctx, ap) {
   const started = Date.now();
   const MAX = SWEEP_MAX_ATTEMPTS;
   const info = {
-    triggered: true, ap, status: "skipped",
+    triggered: true, ap, targetAp: SWEEP_AP_TARGET, status: "skipped",
     maxAttempts: MAX, attempts: 0, attemptLog: [],
   };
   if (DRY) {
     info.status = "would_sweep";
-    info.msg = `演练：AP 已满，本应最多 ${MAX} 次尝试 sweep 消耗 AP 后再领日常（未提交任何交易）`;
+    info.msg = `演练：AP 已满，本应最多 ${MAX} 次尝试 sweep 消耗 ${SWEEP_AP_TARGET} AP 后再领日常（未提交任何交易）`;
     log({ level: "info", reward: "daily", msg: info.msg, ap, maxAttempts: MAX });
     return info;
   }
@@ -481,8 +513,8 @@ async function spendApBySweep(ctx, ap) {
       one.txId = txId;
       info.txId = txId;
       log({ level: "info", reward: "daily",
-            msg: `AP 已满：提交 sweep 消耗 AP（第 ${attempt}/${MAX} 次尝试）`,
-            txId, ap, attempt, maxAttempts: MAX, template: tpl.source });
+            msg: `AP 已满：提交 sweep 消耗 ${SWEEP_AP_TARGET} AP（第 ${attempt}/${MAX} 次尝试）`,
+            txId, ap, targetAp: SWEEP_AP_TARGET, attempt, maxAttempts: MAX, template: tpl.source });
       const r = await confirmTx(txId, SWEEP_CONFIRM_TRIES);
       one.txStatus = r.txStatus;
       one.exceptionNames = r.exceptionNames ?? null;
@@ -640,6 +672,63 @@ function selfTest() {
   } catch (e) {
     console.log(`  buildSweepAction 重建 FAIL ${e.message}`);
   }
+  // 核心修复：模板里 actionPoint=80 时必须覆盖成 120，否则只消耗 80AP、
+  // 剩 40AP 被 daily 补回 = 白丢 40AP 的 sweep 收益。验证覆盖后字段集合、
+  // 值类型全部不变（只有数值变化），杜绝编码类型漂移。
+  total++;
+  try {
+    const base = decode(Buffer.from(FALLBACK_SWEEP_RAW, "hex"));
+    const bv = base.get("values");
+    const es = [];
+    for (const k of bv.keys()) {
+      es.push([k, String(k) === "actionPoint" ? "80" : bv.get(k)]);
+    }
+    const raw80 = Buffer.from(encode(new BencodexDictionary([
+      ["type_id", base.get("type_id")], ["values", new BencodexDictionary(es)],
+    ]))).toString("hex");
+    const a = buildSweepAction(raw80);
+    const v = a.get("values");
+    const keySet = (d) => [...d.keys()].map(String).sort().join(",");
+    const typeSeq = (d) => [...d.keys()].map((k) => typeof d.get(k)).join(",");
+    const ok = String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) &&
+      typeof v.get("actionPoint") === "string" &&
+      String(v.get("stageId")) === "446" &&
+      String(v.get("apStoneCount")) === "0" &&
+      keySet(v) === keySet(bv) && typeSeq(v) === typeSeq(bv) &&
+      Buffer.isBuffer(v.get("id")) && v.get("id").length === 16;
+    console.log(`  buildSweepAction 80→${SWEEP_AP_TARGET} 覆盖(类型/字段不变) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  buildSweepAction 80→120 覆盖 FAIL ${e.message}`);
+  }
+  // 手动 sweep 污染场景：模板同时带 80AP 和 apStoneCount=2（手动勾了 AP 药水）
+  // 时，脚本必须把两者都锁死为 120 / 0，否则会真扣药水且次数变 30+60。
+  total++;
+  try {
+    const base = decode(Buffer.from(FALLBACK_SWEEP_RAW, "hex"));
+    const bv = base.get("values");
+    const es = [];
+    for (const k of bv.keys()) {
+      const key = String(k);
+      es.push([k, key === "actionPoint" ? "80" : key === "apStoneCount" ? "2" : bv.get(k)]);
+    }
+    const dirty = Buffer.from(encode(new BencodexDictionary([
+      ["type_id", base.get("type_id")], ["values", new BencodexDictionary(es)],
+    ]))).toString("hex");
+    const a = buildSweepAction(dirty);
+    const v = a.get("values");
+    const keySet = (d) => [...d.keys()].map(String).sort().join(",");
+    const typeSeq = (d) => [...d.keys()].map((k) => typeof d.get(k)).join(",");
+    const ok = String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) &&
+      String(v.get("apStoneCount")) === "0" &&
+      typeof v.get("actionPoint") === "string" &&
+      typeof v.get("apStoneCount") === "string" &&
+      keySet(v) === keySet(bv) && typeSeq(v) === typeSeq(bv);
+    console.log(`  手动 sweep 污染(80AP+2药水)仍锁死 ${SWEEP_AP_TARGET}AP/0药水 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  手动 sweep 污染用例 FAIL ${e.message}`);
+  }
   // sweep 重试决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
   // 次数未满 retry，次数用尽 degrade（降级照常领日常）。只认链上 + 有界重试。
   const M = 6;
@@ -779,7 +868,7 @@ async function watchMode() {
       pollSeconds: POLL_SEC, maxWatchSeconds: MAX_WATCH_MS / 1000,
       simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
       sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
-      sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
+      sweepApTarget: SWEEP_AP_TARGET, sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
       sweepConfirmTries: SWEEP_CONFIRM_TRIES, sweepBudgetSec: SWEEP_BUDGET_MS / 1000,
     },
   };
@@ -945,7 +1034,7 @@ async function daemonMode() {
       simulateCycleBlocks: SIM_DELTA === null ? null : Number(SIM_CYCLE_BLOCKS),
       simulateApFull: SIM_AP_FULL,
       sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
-      sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
+      sweepApTarget: SWEEP_AP_TARGET, sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
       sweepConfirmTries: SWEEP_CONFIRM_TRIES, sweepBudgetSec: SWEEP_BUDGET_MS / 1000,
     },
   };

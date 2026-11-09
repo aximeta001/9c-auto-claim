@@ -50,7 +50,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 要点 | 做法 |
 |---|---|
 | 关卡选择 | 复用「本角色最近一笔 `SUCCESS` 的 sweep」原始 action，从 Mimir 动态取；客户端实际用的是 `world 9 / stage 446`（已通关且 CP 达标），不是 `lastClearedStage` 的 495 —— 495 的 `SweepRequiredCPSheet` CP 要求更高，硬造会 `NotEnoughCombatPointException` |
-| 参数构造 | 直接复用链上已成功的 action **字节**，只把 `GameAction.Id` 换成新的 16 字节；装备 / 符文 / 关卡 / `actionPoint` / 入场材料一字不改，保证 CP、`playCount`、`EntryCostItemCount` 全部校验与那笔成功交易一致。实测已与链上真实 action **逐字节比对通过** |
+| 参数构造 | 复用链上已成功 action 的**字节**，但强制改写 3 个字段：`GameAction.Id`（换新 16 字节）、`actionPoint → "120"`、`apStoneCount → "0"`；装备 / 符文 / 关卡 / 入场材料声明一字不改，自动跟随最新养成。这样无论用户手动做过 80AP 的 sweep、还是勾过 AP 药水，脚本都恒定为 **120AP / 30 次 / 不消耗药水**。覆盖时保持模板原值类型（Unicode Text），字段集合与编码类型零漂移 |
 | 装备变更 | 每轮动态取最近成功 sweep，用户手动换装后再 sweep 过一次即自动跟随；Mimir 故障回退到内置模板（block `11749808`，同样已 SUCCESS） |
 | **失败重试** | sweep 失败 / 超时(`PENDING`) / 提交异常，**最多重试 5 次**（连同首次共 6 笔，默认），尽量把 AP 消耗掉；每笔换新的 `GameAction.Id` 与重新取 `nonce`。**6 笔都未确认成功才降级照常领日常** |
 | **重试前只认链上** | 每次重试前先复核链上 `actionPoint`：**AP 已降下来就说明此前某笔其实成功了**（典型是 `confirmTx` 超时但其实 `SUCCESS`），立即收手判成功，绝不重复提交 sweep，也不会出现「AP 已扣却判失败去领日常」的错配 |
@@ -60,7 +60,9 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 提交顺序 | 每笔 sweep 先 `confirmTx` 等到终态、nonce 推进后，下一笔重新 `getNonce`；最后再 `getNonce` 提交日常，全程串行不撞 nonce |
 | 幂等 | 触发判据只看链上 AP：sweep 成功扣掉 AP 后 `shouldSweep` 自动变 false，交棒后新 job 也不会重复 sweep |
 
-> 开关：`--no-sweep` 整体关闭（默认开启）。重试次数 `--sweep-attempts N`（默认 6 = 首次 + 5 次重试，`--sweep-attempts 1` 退回旧版单次行为）；重试间隔 `--sweep-retry-gap-ms`（默认 4000）；每笔确认轮数 `--sweep-confirm-tries`；整体预算 `--sweep-budget-seconds`（默认 480）。演练钩子 `--simulate-ap-full` 仅 `--dry-run` 生效，走一遍 `would_sweep` 路径，绝不联网、不提交。
+> 开关：`--no-sweep` 整体关闭（默认开启）。**单笔 sweep 固定消耗 AP：`--sweep-ap N`（默认 120，钳制 1~120）**；重试次数 `--sweep-attempts N`（默认 6 = 首次 + 5 次重试，`--sweep-attempts 1` 退回旧版单次行为）；重试间隔 `--sweep-retry-gap-ms`（默认 4000）；每笔确认轮数 `--sweep-confirm-tries`；整体预算 `--sweep-budget-seconds`（默认 480）。演练钩子 `--simulate-ap-full` 仅 `--dry-run` 生效，走一遍 `would_sweep` 路径，绝不联网、不提交。
+>
+> **为什么锁定 `actionPoint` / `apStoneCount`**：模板来自「最近一笔 SUCCESS sweep」，会跟着手动 sweep 漂移（实测出现过 80AP 与 120AP）。若沿用 80，只消耗 80AP、剩 40AP 被日常补满 = 白丢 40AP；若模板带 `apStoneCount=N`，链上 `playCount = 30×N + actionPoint/costAp` 且会真扣背包药水，不足即 `FAILURE`。两者都由脚本写死，手动操作不会再影响脚本行为。
 
 ---
 
