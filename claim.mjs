@@ -18,12 +18,18 @@
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --watch         # 蹲守：远离窗口秒退、临近自等待、领完即止
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon        # 自接力常驻：守满整个 job 预算，交棒给下一个 job
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon --no-sweep  # 关闭「AP 满时先 sweep」前置
- *   node claim.mjs --self-test                         # 离线自测调度纯逻辑（不联网）
+ *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon --sweep-attempts 3  # sweep 最多试 3 笔
+ *   node claim.mjs --self-test                         # 离线自测纯逻辑（含重试决策，不联网）
  *
  * AP 满时先 Sweep：链上 daily_reward7 并无「AP 满不能领」检查，AP 满时领取照样
  * SUCCESS，但它只把 AP 补满到 120（ActionPointMax），等于零收益且白耗一个冷却周期。
  * 故提交日常奖励前，若链上 actionPoint 已满，先复用一笔已验证成功的
  * hack_and_slash_sweep10 消耗掉 AP，再领，才能真正拿到 120 AP。巡逻奖励不涉 AP，不触发。
+ *
+ * Sweep 失败重试：sweep 提交后若失败 / 超时(PENDING) / 异常，最多再重试 5 次
+ * （共 6 笔），每笔换新 action id + 重新取 nonce。每次重试前先复核链上 AP：
+ * 已消耗就说明此前某笔其实成功了，立即收手，绝不重复提交。6 次都未确认成功
+ * 才降级照常领日常 —— 链上本无 AP 门槛，绝不因可选步骤阻塞领取、错失冷却窗口。
  *
  * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
  * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
@@ -150,6 +156,25 @@ const AP_MAX = 120;                    // DailyReward.ActionPointMax
 const SWEEP_TYPE_ID = "hack_and_slash_sweep10";
 const SWEEP_AP_THRESHOLD = 120;        // 当前 AP >= 此值视为「满」，需要提前消耗
 const SWEEP_ENABLED = !args.includes("--no-sweep");   // 默认开启
+// ---- sweep 失败重试（失败/超时/异常都不要一次就降级）----
+// 连续最多 SWEEP_MAX_ATTEMPTS 次提交尝试（含首次）。每轮重试前先读链上
+// actionPoint 复核：若 AP 已被消耗，说明上一笔其实成功了（典型的「confirmTx
+// 超时但其实 SUCCESS」），立即收敛去领日常，绝不重复提交。这同时保证「AP 已
+// 被扣」一定接着领日常，避免出现扣了 120AP 却没补满的错配。
+// 链上幂等：多笔 sweep 同时上链时最多只有一笔能扣 120 AP，其余 FAILURE 无
+// 副作用 —— 重试提高成功率，但不会重复消耗 AP。全部失败才降级照常领日常。
+// 默认 6 = 首次提交 + 失败后最多重试 5 次，正好对应「重试 5 次」。
+// 想少试几笔可 --sweep-attempts 3；--sweep-attempts 1 等于退回旧版单次行为。
+const SWEEP_MAX_ATTEMPTS = Math.max(1, Math.min(20, Math.trunc(numArg("--sweep-attempts", 6))));
+const SWEEP_RETRY_GAP_MS = Math.max(0, numArg("--sweep-retry-gap-ms", 4000));
+// 每笔 sweep 给足确认时间（与日常相同），让每次尝试尽量落到确定的终态，
+// 而不是半途 PENDING 就又提一笔、把多笔 sweep 堆在链上。
+const SWEEP_CONFIRM_TRIES = Math.max(1, Math.min(CFG.confirmTries,
+  Math.trunc(numArg("--sweep-confirm-tries", CFG.confirmTries))));
+// sweep 整体硬预算：6 轮 ×(确认最多 60s + 间隔 4s) 约 6~7 分钟，留足余量，
+// 到点无论结果如何都降级照常领日常，绝不因可选步骤拖过领取窗口。
+// 注：每轮 confirmTx 最多 12×5s=60s，实际只在交易迟迟不出终态时才会跑满。
+const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 480)) * 1000;
 // 兜底模板：block 11749808（已 SUCCESS）的 sweep action 原始 Bencodex hex，
 // world9/stage446、actionPoint=120、apStoneCount=0，无入场材料字段。
 // 正常运行时不用它 —— 每轮都从 Mimir 取「本角色最近一笔 SUCCESS 的 sweep」
@@ -312,6 +337,30 @@ function shouldSweep(reward, ap) {
     ap >= SWEEP_AP_THRESHOLD;
 }
 
+// 纯决策（不联网，供 --self-test 覆盖）：一轮 sweep 之后下一步怎么走。
+//   success — 已确认 AP 被消耗：交易回执 SUCCESS，或重试前复核链上 AP 已低于满值
+//   retry   — 本轮未成功（FAILURE/INVALID/PENDING/异常），且还有剩余次数
+//   degrade — 次数用尽，降级照常领日常（绝不阻塞领取、错失冷却窗口）
+// 关键点：confirmTx 超时(PENDING) 或回执 FAILURE 时，只要链上 AP 已掉下来，
+// 就说明那笔其实生效了 —— 只认链上，不认回执；否则会重复提交、白耗 nonce，
+// 甚至出现「sweep 已扣 AP、脚本却判失败去领日常」的错配。
+function sweepDecision({ txStatus, chainAp, attempt, maxAttempts }) {
+  if (txStatus === "SUCCESS") return "success";
+  if (chainAp !== null && chainAp !== undefined && Number.isFinite(chainAp) &&
+      chainAp < SWEEP_AP_THRESHOLD) return "success";
+  if (attempt >= maxAttempts) return "degrade";
+  return "retry";
+}
+
+// 重试前复核链上 AP（只认链上权威值）。读不到返回 null —— 不臆测为成功，
+// 让重试/降级兜底，绝不因为一次 RPC 抖动就误判。
+async function readChainApQuiet() {
+  try {
+    const av = await getAvatarState();
+    return av.actionPoint === null || av.actionPoint === undefined ? null : av.actionPoint;
+  } catch (_) { return null; }
+}
+
 // 取「本角色最近一笔 SUCCESS 的 sweep」原始 action hex 作模板，自动跟随装备/
 // 符文/关卡变化。Mimir 不可用时回退到内置模板（同样是一笔已成功的交易）。
 async function fetchSweepTemplate() {
@@ -365,42 +414,109 @@ function buildSweepAction(rawHex) {
   ]);
 }
 
-// 提交 sweep 消耗 AP。这是「收益优化」而非领取前置条件：链上 daily_reward7
-// 本就没有 AP 门槛，所以 sweep 失败/未确认/异常时一律降级照常领日常，
-// 绝不因为可选步骤而阻塞领取、错失整个冷却窗口。重复提交由链上幂等兜底。
+// 提交 sweep 消耗 AP，失败/超时/异常时最多重试 SWEEP_MAX_ATTEMPTS 次，
+// 全部失败才降级照常领日常。这是「收益优化」而非领取前置条件：链上
+// daily_reward7 本就没有 AP 门槛，所以无论 sweep 结果如何都绝不阻塞领取。
+//
+// 每一轮都贯彻「只认链上」：
+//  · 每笔都换新的 GameAction.Id（randomBytes(16)）、重新 getNonce，避免撞 id/nonce
+//  · 重试前先复核链上 actionPoint：AP 已降说明此前某笔其实成功了（典型是
+//    confirmTx 超时但其实 SUCCESS），立即收手，绝不重复提交、绝不误判失败
+//  · 链上幂等兜底：即便多笔 sweep 先后上链，最多一笔能扣掉 120 AP，其余
+//    因 AP 不足 FAILURE，不会重复消耗 AP
+//  · 总耗时有硬上限，sweep 绝不拖过领取窗口
 async function spendApBySweep(ctx, ap) {
-  const info = { triggered: true, ap, status: "skipped" };
+  const started = Date.now();
+  const MAX = SWEEP_MAX_ATTEMPTS;
+  const info = {
+    triggered: true, ap, status: "skipped",
+    maxAttempts: MAX, attempts: 0, attemptLog: [],
+  };
   if (DRY) {
     info.status = "would_sweep";
-    info.msg = "演练：AP 已满，本应先提交 sweep 消耗再领日常（未提交任何交易）";
-    log({ level: "info", reward: "daily", msg: info.msg, ap });
+    info.msg = `演练：AP 已满，本应最多 ${MAX} 次尝试 sweep 消耗 AP 后再领日常（未提交任何交易）`;
+    log({ level: "info", reward: "daily", msg: info.msg, ap, maxAttempts: MAX });
     return info;
   }
-  try {
-    const tpl = await fetchSweepTemplate();
-    info.template = tpl.source;
-    const actionValue = buildSweepAction(tpl.raw);
-    const nonce = await getNonce(ctx.signer.toString());
-    const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
-    info.txId = txId;
-    log({ level: "info", reward: "daily", msg: "AP 已满：已提交 sweep 消耗 AP", txId, ap, template: tpl.source });
-    const r = await confirmTx(txId);
-    info.txStatus = r.txStatus;
-    info.exceptionNames = r.exceptionNames;
-    if (r.txStatus === "SUCCESS") {
-      info.status = "swept";
-      info.msg = "sweep 成功，AP 已消耗，继续领日常";
-      log({ level: "info", reward: "daily", msg: info.msg, txId, ap });
-    } else {
-      info.status = "sweep_unconfirmed";
-      info.msg = "sweep 未确认成功，降级照常领日常（不阻塞冷却）";
-      log({ level: "warn", reward: "daily", msg: info.msg, txId, txStatus: r.txStatus, ap });
+
+  let tpl = null;          // 模板只拉一次；每次 build 都换新 id
+  let lastStatus = null;   // 上一笔的 txStatus（供下一轮决策）
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    // 预算保护：sweep 可有可无，绝不因它拖过领取窗口
+    if (Date.now() - started > SWEEP_BUDGET_MS) {
+      log({ level: "warn", reward: "daily",
+            msg: "sweep 重试累计耗时达到上限，降级照常领日常（不阻塞冷却）",
+            elapsedMs: Date.now() - started, attempts: info.attempts });
+      break;
     }
-  } catch (e) {
-    info.status = "sweep_error";
-    info.msg = String(e.message);
-    log({ level: "warn", reward: "daily", msg: "sweep 前置异常，降级照常领日常（不阻塞冷却）", detail: info.msg });
+
+    // 非首轮：先只认链上复核 AP。已消耗 = 此前某笔其实成功了，立刻收手。
+    let chainAp = null;
+    if (attempt > 1) {
+      if (SWEEP_RETRY_GAP_MS > 0) {
+        await new Promise((r) => setTimeout(r, SWEEP_RETRY_GAP_MS));
+      }
+      chainAp = await readChainApQuiet();
+      info.chainAp = chainAp;
+    }
+    const pre = sweepDecision({ txStatus: lastStatus, chainAp, attempt: attempt - 1, maxAttempts: MAX });
+    if (pre === "success") {
+      info.status = "swept";
+      info.confirmedBy = "chain_ap";
+      info.msg = `重试前复核链上 AP=${chainAp} 已被消耗，此前 sweep 已生效，继续领日常`;
+      log({ level: "info", reward: "daily", msg: info.msg, attempts: info.attempts, chainAp });
+      return info;
+    }
+
+    info.attempts = attempt;
+    const one = { attempt };
+    info.attemptLog.push(one);
+    try {
+      if (!tpl) tpl = await fetchSweepTemplate();
+      one.template = tpl.source;
+      const actionValue = buildSweepAction(tpl.raw);      // 每轮换新 id
+      const nonce = await getNonce(ctx.signer.toString()); // 每轮重新取 nonce
+      one.nonce = Number(nonce);
+      const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
+      one.txId = txId;
+      info.txId = txId;
+      log({ level: "info", reward: "daily",
+            msg: `AP 已满：提交 sweep 消耗 AP（第 ${attempt}/${MAX} 次尝试）`,
+            txId, ap, attempt, maxAttempts: MAX, template: tpl.source });
+      const r = await confirmTx(txId, SWEEP_CONFIRM_TRIES);
+      one.txStatus = r.txStatus;
+      one.exceptionNames = r.exceptionNames ?? null;
+      info.txStatus = r.txStatus;
+      info.exceptionNames = r.exceptionNames;
+      lastStatus = r.txStatus;
+
+      const post = sweepDecision({ txStatus: r.txStatus, chainAp: null, attempt, maxAttempts: MAX });
+      if (post === "success") {
+        info.status = "swept";
+        info.confirmedBy = "tx_status";
+        info.msg = `sweep 成功（第 ${attempt} 次尝试），AP 已消耗，继续领日常`;
+        log({ level: "info", reward: "daily", msg: info.msg, txId, attempts: info.attempts, ap });
+        return info;
+      }
+      log({ level: "warn", reward: "daily",
+            msg: `sweep 第 ${attempt}/${MAX} 次未确认成功（${r.txStatus}），复查链上状态后重试`,
+            txId, txStatus: r.txStatus, attempt, ap });
+      if (post === "degrade") break;                     // 次数用尽
+    } catch (e) {
+      one.error = String(e.message);
+      lastStatus = null;
+      log({ level: "warn", reward: "daily",
+            msg: `sweep 第 ${attempt}/${MAX} 次异常，准备重试`,
+            detail: String(e.message), attempt, ap });
+      if (attempt >= MAX) break;
+    }
   }
+
+  // 次数用尽 / 预算耗尽 / 全部异常：一律降级照常领日常
+  info.status = "sweep_unconfirmed";
+  info.msg = `sweep 连续 ${info.attempts} 次尝试均未确认成功，降级照常领日常（不阻塞冷却）`;
+  log({ level: "warn", reward: "daily", msg: info.msg,
+        attempts: info.attempts, lastTxStatus: info.txStatus ?? null, ap });
   return info;
 }
 
@@ -439,15 +555,16 @@ function isTerminalTxStatus(s) {
 }
 
 // 只返回终态；中间态继续轮询，超时返回 PENDING（结果未定，交给链上状态复核）。
-async function confirmTx(txId) {
+// tries 可覆盖：sweep 重试时每笔给足确认时间，尽量落到确定终态再决定是否重提。
+async function confirmTx(txId, tries = CFG.confirmTries) {
   const q = "query($t:TxId!){ transaction { transactionResult(txId:$t){ txStatus blockIndex exceptionNames } } }";
-  for (let i = 0; i < CFG.confirmTries; i++) {
+  for (let i = 0; i < tries; i++) {
     try {
       const d = await gqlRpc(q, { t: txId });
       const r = d.data?.transaction?.transactionResult;
       if (r && isTerminalTxStatus(r.txStatus)) return r;
     } catch (_) { /* 节点还没索引到 */ }
-    if (i < CFG.confirmTries - 1) await new Promise((r) => setTimeout(r, CFG.confirmIntervalMs));
+    if (i < tries - 1) await new Promise((r) => setTimeout(r, CFG.confirmIntervalMs));
   }
   return { txStatus: "PENDING" };
 }
@@ -522,6 +639,57 @@ function selfTest() {
     if (ok) pass++;
   } catch (e) {
     console.log(`  buildSweepAction 重建 FAIL ${e.message}`);
+  }
+  // sweep 重试决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
+  // 次数未满 retry，次数用尽 degrade（降级照常领日常）。只认链上 + 有界重试。
+  const M = 6;
+  const decisionCases = [
+    [{ txStatus: "SUCCESS", chainAp: 120, attempt: 1, maxAttempts: M }, "success"],
+    [{ txStatus: "SUCCESS", chainAp: null, attempt: 6, maxAttempts: M }, "success"],
+    [{ txStatus: "FAILURE", chainAp: 0,   attempt: 2, maxAttempts: M }, "success"],
+    [{ txStatus: "PENDING", chainAp: 119, attempt: 3, maxAttempts: M }, "success"],
+    [{ txStatus: "INVALID", chainAp: 12,  attempt: 5, maxAttempts: M }, "success"],
+    [{ txStatus: "FAILURE", chainAp: 120, attempt: 1, maxAttempts: M }, "retry"],
+    [{ txStatus: "PENDING", chainAp: 120, attempt: 3, maxAttempts: M }, "retry"],
+    [{ txStatus: "INVALID", chainAp: null,attempt: 2, maxAttempts: M }, "retry"],
+    [{ txStatus: null,      chainAp: null,attempt: 1, maxAttempts: M }, "retry"], // 异常
+    [{ txStatus: "FAILURE", chainAp: 120, attempt: 6, maxAttempts: M }, "degrade"],
+    [{ txStatus: "PENDING", chainAp: null,attempt: 6, maxAttempts: M }, "degrade"],
+    [{ txStatus: null,      chainAp: null,attempt: 6, maxAttempts: M }, "degrade"],
+    [{ txStatus: "PENDING", chainAp: NaN, attempt: 6, maxAttempts: M }, "degrade"],
+    [{ txStatus: "PENDING", chainAp: NaN, attempt: 2, maxAttempts: M }, "retry"],
+  ];
+  total += decisionCases.length;
+  for (const [inp, expect] of decisionCases) {
+    const got = sweepDecision(inp);
+    const ok = got === expect;
+    const tag = `sD(${inp.txStatus},ap=${String(inp.chainAp)},#${inp.attempt})`;
+    console.log(`  ${tag} = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 每笔 sweep 必须换新 action id，否则重试会被链上判重复交易；其余字段保持一致
+  total++;
+  try {
+    const a1 = buildSweepAction(FALLBACK_SWEEP_RAW);
+    const a2 = buildSweepAction(FALLBACK_SWEEP_RAW);
+    const id1 = Buffer.from(a1.get("values").get("id")).toString("hex");
+    const id2 = Buffer.from(a2.get("values").get("id")).toString("hex");
+    const ok = id1 !== id2 && id1.length === 32 && id2.length === 32 &&
+      String(a1.get("values").get("stageId")) === String(a2.get("values").get("stageId")) &&
+      String(a1.get("values").get("actionPoint")) === "120";
+    console.log(`  buildSweepAction 两次重建 id 不同 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  buildSweepAction 两次重建 FAIL ${e.message}`);
+  }
+  // 语义校验：默认 6 笔 = 首次 + 重试 5 次；带 --sweep-attempts 时按传入值校验
+  total++;
+  {
+    const expected = args.includes("--sweep-attempts")
+      ? Math.max(1, Math.min(20, Math.trunc(numArg("--sweep-attempts", 6)))) : 6;
+    const ok = SWEEP_MAX_ATTEMPTS === expected;
+    console.log(`  sweep 最多 ${SWEEP_MAX_ATTEMPTS} 笔=首次+${SWEEP_MAX_ATTEMPTS - 1} 次重试（期望 ${expected}）  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
   }
   console.log(`  self-test: ${pass}/${total} 通过`);
   process.exit(pass === total ? 0 : 1);
@@ -611,6 +779,8 @@ async function watchMode() {
       pollSeconds: POLL_SEC, maxWatchSeconds: MAX_WATCH_MS / 1000,
       simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
       sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
+      sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
+      sweepConfirmTries: SWEEP_CONFIRM_TRIES, sweepBudgetSec: SWEEP_BUDGET_MS / 1000,
     },
   };
 
@@ -775,6 +945,8 @@ async function daemonMode() {
       simulateCycleBlocks: SIM_DELTA === null ? null : Number(SIM_CYCLE_BLOCKS),
       simulateApFull: SIM_AP_FULL,
       sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
+      sweepMaxAttempts: SWEEP_MAX_ATTEMPTS, sweepRetryGapMs: SWEEP_RETRY_GAP_MS,
+      sweepConfirmTries: SWEEP_CONFIRM_TRIES, sweepBudgetSec: SWEEP_BUDGET_MS / 1000,
     },
   };
 

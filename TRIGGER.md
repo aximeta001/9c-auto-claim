@@ -229,9 +229,11 @@ GitHub 官方明确：**`GITHUB_TOKEN` 触发的事件不会创建新的 workflo
 - `getAvatarState` 增读 `actionPoint`；`shouldSweep` 仅当「日常 + AP ≥ 120 + 开关开启」为真。
 - `fetchSweepTemplate`：从 Mimir 取**本角色最近一笔 `SUCCESS` 的 sweep** 原始字节，自动跟随装备/关卡变化；故障回退内置模板（block `11749808`）。
 - `buildSweepAction`：复用字节，只把 `GameAction.Id` 换成新的 16 字节，其余一字不改（保证 CP、`playCount`、`EntryCostItemCount` 全部与成功交易一致）。
-- `spendApBySweep`：提交 sweep → `confirmTx` 等终态 → 再提交日常（nonce 自动递增）。**失败/超时/模板异常一律降级照常领日常**，绝不因可选优化阻塞领取。
+- `spendApBySweep`：提交 sweep → `confirmTx` 等终态 → 再提交日常（nonce 自动递增）。初版「失败/超时/异常一律降级照常领日常」，第九节已升级为**失败重试 5 次**。
 - 触发判据只看链上 AP：sweep 成功扣完 AP 后 `shouldSweep` 自动变 false，交棒后新 job 不会重复 sweep。
 - 开关 `--no-sweep`（默认开）；演练钩子 `--simulate-ap-full`。
+
+> 第八节描述的是初版单次 sweep 行为；**当前以第九节的重试版为准**。
 
 ### 验证（全部通过）
 
@@ -253,3 +255,74 @@ GitHub 官方明确：**`GITHUB_TOKEN` 触发的事件不会创建新的 workflo
 - 观察点：下次日常到期（约 tip `11753626`）时，日志应出现
   `AP 已满：已提交 sweep 消耗 AP` → `sweep 成功，AP 已消耗，继续领日常` → `领取成功`，
   随后 Mimir 可查到 `hack_and_slash_sweep10` 与 `daily_reward7` 两笔 `SUCCESS`。
+
+---
+
+## 九、Sweep 失败重试 5 次（2026-11-09 加固）
+
+### 起因
+
+用户指出：「**如果 sweep 失败超时或异常，就会浪费 120AP，可不可以 sweep 先重试 5 次，如果再失败，再照常领取**」。
+
+初版 `spendApBySweep` 只提交**一笔** sweep，只要回执是 `FAILURE` / `INVALID` / `PENDING`（确认超时）
+或提交异常，就立即降级「照常领日常」。这里的隐患比「少一次 sweep 掉落」更微妙：
+
+1. **超时错配**：`confirmTx` 超时返回 `PENDING` 时，那笔 sweep 交易可能还在飞、nonce 被占着，
+   甚至稍后就 `SUCCESS` 了。脚本却马上 `getNonce` 提交 `daily_reward7`，可能出现
+   「sweep 后来成功扣了 120AP，但日常已经领过（AP 满时补满=零收益）」的错配 —— 白等一个冷却周期。
+2. **偶发抖动**：一次 RPC / Mimir 抖动就放弃整个 sweep，太脆弱，尤其 AP 已满时等于这次领取白费。
+
+### 实现（只动 `claim.mjs`，workflow 不变）
+
+- 新增 `SWEEP_MAX_ATTEMPTS`（默认 **6** = 首次 + 重试 5 次）、`SWEEP_RETRY_GAP_MS`（默认 4000）、
+  `SWEEP_CONFIRM_TRIES`（每笔给足确认时间）、`SWEEP_BUDGET_MS`（整体 480s 硬上限）。
+  全部可用命令行覆盖：`--sweep-attempts` / `--sweep-retry-gap-ms` /
+  `--sweep-confirm-tries` / `--sweep-budget-seconds`。
+- `spendApBySweep` 改为重试循环：失败 / `PENDING` / 异常都继续尝试；
+  **每笔换新的 `GameAction.Id`（16 随机字节）+ 重新 `getNonce`**，不撞 id、不撞 nonce。
+- 新增纯函数 `sweepDecision({txStatus, chainAp, attempt, maxAttempts})` → `success` / `retry` / `degrade`，
+  便于离线自测；新增 `readChainApQuiet()` 在**每次重试前复核链上 `actionPoint`**。
+- **只认链上**：重试前若链上 AP 已 < 120，说明此前某笔其实成功了（典型的「超时但其实 SUCCESS」），
+  立即判 `swept`、`confirmedBy=chain_ap` 并收手，**绝不重复提交 sweep**。这既避免了多扣 AP，
+  也消除了上面第 1 条的错配。
+- `confirmTx(txId, tries)` 增加可选轮询次数参数，日常领取行为完全不变。
+- 次数用尽 / 预算耗尽 / 全异常 → `sweep_unconfirmed`，**一律降级照常领日常**，
+  绝不因可选优化阻塞领取、错失冷却窗口。
+- 结构化输出 `rewards[].sweep` 增加 `maxAttempts` / `attempts` / `attemptLog[]` /
+  `confirmedBy` / `chainAp`，逐笔可追溯。
+
+### 链上安全性
+
+- **不会重复消耗 AP**：`hack_and_slash_sweep10` 执行时会扣 120 AP；多笔先后上链时，
+  第一笔成功后 AP 归零，后续笔因 AP 不足 `FAILURE`，无副作用。链上幂等天然兜底。
+- 每笔都重新取 `nonce`，与前一笔（哪怕还 `STAGING`）串行不冲突；`daily_reward7` 始终在
+  sweep 循环彻底结束后才提交。
+- 重试只在「AP 满 + 日常奖励」时发生，巡逻奖励、AP 未满、`--no-sweep` 均不受影响。
+
+### 验证（全部通过，未提交任何真实链上交易）
+
+- `node --check` + `self-test` **40/40**（新增 `sweepDecision` 14 例、两次重建 id 不同、默认 6 笔语义）。
+- 离线 mock 副本（真实 `signTx`/`encodeSignedTx` 签名编码链路，仅替换网络层）**30/30**：
+  | 场景 | 结果 |
+  |---|---|
+  | A 首次 SUCCESS | sweep 1 笔 + daily 1 笔，nonce 7→8，`swept` |
+  | B 前 2 次 FAILURE 第 3 次 SUCCESS | sweep 3 笔，attempts=3，nonce 7,8,9,10 连续 |
+  | C 第 1 笔 PENDING 但链上 AP 已扣 | **只提交 1 笔**，`confirmedBy=chain_ap`，不重复提交 |
+  | D 6 次全 FAILURE | 恰好 6 笔后 `sweep_unconfirmed`，降级照常领日常且成功 |
+  | E 第 1 笔提交异常 | 重试第 2 笔成功，attempts=2 |
+  | F AP 未满 / 巡逻 | 完全不触发 sweep |
+  | G sweep 全失败 + daily 也失败 | 不抛异常，daily 交调用方按链上复核重提 |
+- 真实链上 `--dry-run --watch --simulate-ap-full` 演练：日志正确显示
+  `本应最多 6 次尝试 sweep 消耗 AP 后再领日常`，`would_sweep`，未提交任何交易。
+- 每笔 sweep 的 payload 均真实可解码为 `hack_and_slash_sweep10`，日常为 `daily_reward7`。
+
+### 上线与观察
+
+- 改动时链上 tip `11754456`，日常解锁块 `11756185`（剩 1729 块 ≈ 3.8h）、
+  巡逻 `11759335`（剩 4879 块），两个奖励都远离解锁，是安全切换窗口。
+- 上线后在下一轮冷却窗口触发新 run / 取消锁定旧 commit 的 run，链条无缝接管。
+- 观察点：AP 满时日志应出现
+  `AP 已满：提交 sweep 消耗 AP（第 1/6 次尝试）`；
+  若首笔失败则有 `sweep 第 N/6 次未确认成功（…），复查链上状态后重试`；
+  成功为 `sweep 成功（第 N 次尝试），AP 已消耗，继续领日常 → 领取成功`；
+  全失败为 `sweep 连续 6 次尝试均未确认成功，降级照常领日常`。

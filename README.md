@@ -33,7 +33,7 @@
 因此脚本在提交 `daily_reward7` 前先读链上 `stateQuery.avatar.actionPoint`：
 
 - **AP 未满**（< 120）→ 直接领，正常拿到补满的 AP。
-- **AP 已满**（≥ 120）→ 先发一笔 `hack_and_slash_sweep10`，把 120 AP 消耗掉（每次 4 AP × 30 次），**成功后再领日常**，才能吃到整整 120 AP，并顺带获得 30 次 sweep 掉落。
+- **AP 已满**（≥ 120）→ 先发 `hack_and_slash_sweep10`，把 120 AP 消耗掉（每次 4 AP × 30 次），**确认成功后再领日常**，才能吃到整整 120 AP，并顺带获得 30 次 sweep 掉落。
 - **巡逻奖励与 AP 无关，不触发 sweep。**
 
 Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
@@ -43,11 +43,15 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 关卡选择 | 复用「本角色最近一笔 `SUCCESS` 的 sweep」原始 action，从 Mimir 动态取；客户端实际用的是 `world 9 / stage 446`（已通关且 CP 达标），不是 `lastClearedStage` 的 495 —— 495 的 `SweepRequiredCPSheet` CP 要求更高，硬造会 `NotEnoughCombatPointException` |
 | 参数构造 | 直接复用链上已成功的 action **字节**，只把 `GameAction.Id` 换成新的 16 字节；装备 / 符文 / 关卡 / `actionPoint` / 入场材料一字不改，保证 CP、`playCount`、`EntryCostItemCount` 全部校验与那笔成功交易一致。实测已与链上真实 action **逐字节比对通过** |
 | 装备变更 | 每轮动态取最近成功 sweep，用户手动换装后再 sweep 过一次即自动跟随；Mimir 故障回退到内置模板（block `11749808`，同样已 SUCCESS） |
-| 失败降级 | sweep 未确认成功 / 模板异常 / 超时，**一律降级照常领日常**——链上本就无 AP 门槛，绝不让可选的收益优化阻塞领取、错失冷却窗口 |
-| 提交顺序 | sweep 先 `confirmTx` 等到终态、nonce 推进后，再 `getNonce` 提交日常，两笔串行不撞 nonce（实测 `sweep #7 → daily #8`） |
+| **失败重试** | sweep 失败 / 超时(`PENDING`) / 提交异常，**最多重试 5 次**（连同首次共 6 笔，默认），尽量把 AP 消耗掉；每笔换新的 `GameAction.Id` 与重新取 `nonce`。**6 笔都未确认成功才降级照常领日常** |
+| **重试前只认链上** | 每次重试前先复核链上 `actionPoint`：**AP 已降下来就说明此前某笔其实成功了**（典型是 `confirmTx` 超时但其实 `SUCCESS`），立即收手判成功，绝不重复提交 sweep，也不会出现「AP 已扣却判失败去领日常」的错配 |
+| **不重复扣 AP** | 链上幂等：多笔 sweep 先后上链最多一笔能扣掉 120 AP，其余因 AP 不足 `FAILURE` 无副作用；重试只提高成功率，不会多消耗 AP |
+| **总预算** | sweep 整体 480s 硬上限，到点无论结果都降级领日常，绝不拖过领取窗口 |
+| 最终降级 | 次数用尽 / 预算耗尽 / 全异常：**一律照常领日常**——链上本就无 AP 门槛，绝不让可选的收益优化阻塞领取、错失冷却窗口 |
+| 提交顺序 | 每笔 sweep 先 `confirmTx` 等到终态、nonce 推进后，下一笔重新 `getNonce`；最后再 `getNonce` 提交日常，全程串行不撞 nonce |
 | 幂等 | 触发判据只看链上 AP：sweep 成功扣掉 AP 后 `shouldSweep` 自动变 false，交棒后新 job 也不会重复 sweep |
 
-> 开关：`--no-sweep` 可整体关闭（默认开启）。演练钩子 `--simulate-ap-full` 仅 `--dry-run` 生效，用来走一遍 `would_sweep` 路径，绝不联网、不提交。
+> 开关：`--no-sweep` 整体关闭（默认开启）。重试次数 `--sweep-attempts N`（默认 6 = 首次 + 5 次重试，`--sweep-attempts 1` 退回旧版单次行为）；重试间隔 `--sweep-retry-gap-ms`（默认 4000）；每笔确认轮数 `--sweep-confirm-tries`；整体预算 `--sweep-budget-seconds`（默认 480）。演练钩子 `--simulate-ap-full` 仅 `--dry-run` 生效，走一遍 `would_sweep` 路径，绝不联网、不提交。
 
 ---
 
@@ -108,10 +112,18 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 `pending`（已提交但确认未出终态，**不锁定、冷却后按链上状态复核重提**）/
 `failed` / `error` / `unknown` / `would_claim`（dry-run）/ `not_reached`（本轮未处理）。
 
-`rewards[].sweep`（仅日常、AP 满时出现）：`{triggered, ap, status, template?, txId?, txStatus?}`，
-`status` 取值 `swept`（成功，AP 已消耗）/ `sweep_unconfirmed`（未确认成功，已降级照常领）/
-`sweep_error`（模板/提交异常，已降级照常领）/ `none`（未触发）/ `would_sweep`（dry-run）。
-日志里对应 `AP 已满：已提交 sweep 消耗 AP` 与 `sweep 成功，AP 已消耗，继续领日常`。
+`rewards[].sweep`（仅日常、AP 满时出现）：`{triggered, ap, status, maxAttempts, attempts, attemptLog[], confirmedBy?, chainAp?, template?, txId?, txStatus?}`。
+`status` 取值：
+
+| status | 含义 |
+|---|---|
+| `swept` | 已确认 AP 被消耗。`confirmedBy=tx_status` 表示交易回执 `SUCCESS`；`confirmedBy=chain_ap` 表示重试前复核链上 AP 已下降（此前那笔其实成功了） |
+| `sweep_unconfirmed` | 6 笔尝试（或预算）用尽仍未确认成功，已降级照常领日常 |
+| `would_sweep` | dry-run 演练，未提交任何交易 |
+
+`attempts` 是实际提交的 sweep 笔数（默认上限 6），`attemptLog[]` 逐笔记录 `{attempt, txId?, txStatus?, nonce?, template?, error?}`。
+日志里可见 `AP 已满：提交 sweep 消耗 AP（第 N/6 次尝试）`、`sweep 第 N/6 次未确认成功（…），复查链上状态后重试`、
+`sweep 成功（第 N 次尝试），AP 已消耗，继续领日常` 与 `sweep 连续 N 次尝试均未确认成功，降级照常领日常`。
 
 > **只认链上、不认回执**：`confirmTx` 只在 `SUCCESS` / `FAILURE` / `INVALID` 终态下结论；
 > `INCLUDED` / `STAGING` 是中间态（后续可能变成功也可能变失败），一律继续轮询，
@@ -169,9 +181,10 @@ node claim.mjs --watch --watch-window 1200 # 自定义蹲守窗口（块，默�
 # ---- 自接力常驻模式（--daemon，GitHub Actions 正式使用）----
 node claim.mjs --daemon                    # 真实：常驻 5.5h、跨多周期、预算耗尽交棒
 node claim.mjs --daemon --no-sweep         # 关闭「AP 满时先 sweep」（默认开启）
+node claim.mjs --daemon --sweep-attempts 6 # sweep 最多 6 笔（默认，= 首次 + 重试 5 次）
 node claim.mjs --daemon --dry-run          # 演练：只规划一轮，不真睡、不提交
 node claim.mjs --daemon --max-run-seconds 19800   # 自定义预算（秒，须 < 6h）
-node claim.mjs --self-test                 # 离线自测（含 sweep 判定 + 模板重建）
+node claim.mjs --self-test                 # 离线自测（含 sweep 判定 + 重试决策 + 模板重建）
 
 # ---- 本地 cron 入口 ----
 bash run.sh --dry-run
