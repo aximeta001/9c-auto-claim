@@ -17,7 +17,13 @@
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --reward daily  # 只领某一种
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --watch         # 蹲守：远离窗口秒退、临近自等待、领完即止
  *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon        # 自接力常驻：守满整个 job 预算，交棒给下一个 job
+ *   NC_PRIVATE_KEY=xxxx node claim.mjs --daemon --no-sweep  # 关闭「AP 满时先 sweep」前置
  *   node claim.mjs --self-test                         # 离线自测调度纯逻辑（不联网）
+ *
+ * AP 满时先 Sweep：链上 daily_reward7 并无「AP 满不能领」检查，AP 满时领取照样
+ * SUCCESS，但它只把 AP 补满到 120（ActionPointMax），等于零收益且白耗一个冷却周期。
+ * 故提交日常奖励前，若链上 actionPoint 已满，先复用一笔已验证成功的
+ * hack_and_slash_sweep10 消耗掉 AP，再领，才能真正拿到 120 AP。巡逻奖励不涉 AP，不触发。
  *
  * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
  * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
@@ -34,7 +40,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RawPrivateKey, Address } from "@planetarium/account";
 import { signTx, encodeSignedTx } from "@planetarium/tx";
-import { encode, BencodexDictionary } from "@planetarium/bencodex";
+import { randomBytes } from "node:crypto";
+import { encode, decode, BencodexDictionary } from "@planetarium/bencodex";
 import { DailyReward, MEAD, fav, HEIMDALL_GENESIS_HASH } from "@planetarium/lib9c";
 
 // ---------------- 配置 ----------------
@@ -109,6 +116,8 @@ const HANDLED_TTL_MS = 30 * 60 * 1000;
 // 仅 dry-run 演练生效：模拟 tip 每轮前进块数、领取后解锁块前进块数（用于快速走多周期）
 const SIM_TIP_STEP = BigInt(Math.max(1, Math.trunc(numArg("--simulate-tip-step", 20))));
 const SIM_CYCLE_BLOCKS = BigInt(Math.max(1, Math.trunc(numArg("--simulate-cycle-blocks", 60))));
+// 仅 dry-run 演练生效：模拟 AP 满（让 watchClaim 走一遍 would_sweep 路径，绝不联网/提交）
+const SIM_AP_FULL = args.includes("--simulate-ap-full");
 
 // ---------------- 窗口早退（省流） ----------------
 // 定时任务是固定频率唤起，无法「平时不跑、临近才跑」。所以由脚本自己早退：
@@ -129,6 +138,38 @@ const MAX_CACHE_AGE_MS = 14 * 3600 * 1000;
 
 const TYPE_ID = { daily: "daily_reward7", patrol: "claim_patrol_reward" };
 const INTERVAL = { daily: CFG.dailyInterval, patrol: CFG.patrolInterval };
+
+// ---------------- AP 满时先 Sweep 消耗（仅日常奖励） ----------------
+// 依据 Lib9c/Action/DailyReward.cs：Execute 里没有任何 AP 检查，只做
+//   SetActionPoint(avatarAddress, ActionPointMax = 120)  ← 「补满」而非「加 120」
+// 于是 AP 已满时领取照样 SUCCESS，但收益为 0，却把 dailyRewardReceivedIndex
+// 刷到当前块、白等一个 2550 块冷却。所以在提交 daily_reward7 之前，先发一笔
+// hack_and_slash_sweep10 把 AP 消耗掉，再领，才能真正拿到 120 AP。
+// 巡逻奖励 claim_patrol_reward 与 AP 无关，不触发。
+const AP_MAX = 120;                    // DailyReward.ActionPointMax
+const SWEEP_TYPE_ID = "hack_and_slash_sweep10";
+const SWEEP_AP_THRESHOLD = 120;        // 当前 AP >= 此值视为「满」，需要提前消耗
+const SWEEP_ENABLED = !args.includes("--no-sweep");   // 默认开启
+// 兜底模板：block 11749808（已 SUCCESS）的 sweep action 原始 Bencodex hex，
+// world9/stage446、actionPoint=120、apStoneCount=0，无入场材料字段。
+// 正常运行时不用它 —— 每轮都从 Mimir 取「本角色最近一笔 SUCCESS 的 sweep」
+// 原始字节，自动跟随装备/符文/关卡变化；仅当 Mimir 拉取失败时回退到这里。
+const FALLBACK_SWEEP_RAW =
+  "6475373a747970655f69647532323a6861636b5f616e645f736c6173685f7377656570" +
+  "313075363a76616c756573647531313a616374696f6e506f696e7475333a3132307531" +
+  "323a617053746f6e65436f756e7475313a307531333a61766174617241646472657373" +
+  "32303aac9d450c69df27ee290c90ec61c4b76154b0a21c75383a636f7374756d65736c" +
+  "31363a3c07374778009e42bfa10a16854b5b3431363a6619635e7b72d3479fda8675f64" +
+  "a366e657531303a65717569706d656e74736c31363a656ba3105d2d53419c2709151d1877" +
+  "c131363a84afc54e6d44d840948afc3089a2479931363acf5f2258713bc94e943078cfa8" +
+  "4e8cbc31363a78cc60679f7f1b49992732ed5b090eb731363a2a9b1888b279d449a88649" +
+  "52c340571431363aa44d5b8d516e95418c834092994f833631363aeba24ec67f4e5c44acf" +
+  "718c40594835b31363a10279dce80a38b4390bbc01ab03ba7146575323a696431363ab4db" +
+  "042fe813b34da2424b51fa230c5075393a72756e65496e666f736c6c75313a3075353a3130" +
+  "303536656c75313a3175353a3130303437656c75313a3375353a3130303531656c75313a" +
+  "3475353a3130303133656c75313a3675353a3330303031656c75313a3775353a31303032" +
+  "31656c75313a3875353a3130303532656c75313a3975353a3130303535656575373a7374" +
+  "616765496475333a34343675373a776f726c64496475313a396565";
 
 // ---------------- 工具 ----------------
 async function gql(url, query, variables = {}, timeoutMs = 45000) {
@@ -208,13 +249,16 @@ async function getTip() {
   return { tip: BigInt(ns.tip.index), genesis: ns.genesis.hash, rpc: d._url };
 }
 
-// 读角色链上状态：日常领取区块 + 所属 agent 地址（用于私钥归属校验）
+// 读角色链上状态：日常领取区块 + 当前 AP + 所属 agent 地址（用于私钥归属校验）
+// actionPoint 是链上权威值（DailyReward 会把它补满到 120）；读不到就返回 null，
+// shouldSweep 会据此保守跳过 sweep，绝不臆测。
 async function getAvatarState() {
-  const q = "query($a:Address!){ stateQuery { avatar(avatarAddress:$a){ dailyRewardReceivedIndex agentAddress } } }";
+  const q = "query($a:Address!){ stateQuery { avatar(avatarAddress:$a){ actionPoint dailyRewardReceivedIndex agentAddress } } }";
   const d = await gqlRpc(q, { a: CFG.avatarAddress });
   const av = d.data?.stateQuery?.avatar;
   return {
     dailyReceivedIndex: av?.dailyRewardReceivedIndex == null ? 0n : BigInt(av.dailyRewardReceivedIndex),
+    actionPoint: av?.actionPoint == null ? null : Number(av.actionPoint),
     agentAddress: av?.agentAddress || null,
   };
 }
@@ -257,6 +301,107 @@ function buildActionValue(reward, avatarAddr) {
     ["type_id", "claim_patrol_reward"],
     ["values", avatarAddr.toBytes()],
   ]);
+}
+
+// ---------------- AP 满时先 Sweep 消耗（详见文件头说明） ----------------
+// 只在「日常奖励 + 链上 actionPoint 已达上限」时才需要提前消耗 AP。
+// ap 读不到（null）/ 开关关闭 / 巡逻奖励：一律返回 false，绝不臆测。
+function shouldSweep(reward, ap) {
+  return SWEEP_ENABLED && reward === "daily" &&
+    ap !== null && ap !== undefined && Number.isFinite(ap) &&
+    ap >= SWEEP_AP_THRESHOLD;
+}
+
+// 取「本角色最近一笔 SUCCESS 的 sweep」原始 action hex 作模板，自动跟随装备/
+// 符文/关卡变化。Mimir 不可用时回退到内置模板（同样是一笔已成功的交易）。
+async function fetchSweepTemplate() {
+  const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:40){
+    items { blockIndex object { txStatus actions { typeId raw } } } } }`;
+  try {
+    const d = await gql(CFG.mimir, q, { a: CFG.avatarAddress });
+    const items = d.data?.transactions?.items || [];
+    for (const it of items) {
+      const o = it.object || {};
+      if (o.txStatus !== "SUCCESS") continue;               // 只认成功的
+      for (const a of o.actions || []) {
+        if (a.typeId === SWEEP_TYPE_ID && a.raw &&
+            /^[0-9a-fA-F]+$/.test(a.raw) && a.raw.length % 2 === 0) {
+          return { raw: a.raw, source: `mimir@${it.blockIndex}` };
+        }
+      }
+    }
+  } catch (e) {
+    log({ level: "warn", msg: "拉取历史 sweep 模板失败，回退内置模板", detail: String(e.message) });
+  }
+  return { raw: FALLBACK_SWEEP_RAW, source: "fallback@11749808" };
+}
+
+// 复用已验证成功的 sweep action 字节：只把 GameAction.Id 换成新的 16 字节，
+// 其余字段（关卡/装备/符文/actionPoint/apStoneCount/入场材料声明）一字不改。
+// 这样 CP、playCount、EntryCostItemCount 等链上校验与那笔 SUCCESS 交易完全一致，
+// 不重新推导任何表格/装备，最不容易出错。
+function buildSweepAction(rawHex) {
+  const action = decode(Buffer.from(rawHex, "hex"));
+  if (!(action instanceof BencodexDictionary) || String(action.get("type_id")) !== SWEEP_TYPE_ID) {
+    throw new Error("sweep 模板 type_id 校验失败");
+  }
+  const values = action.get("values");
+  if (!(values instanceof BencodexDictionary)) {
+    throw new Error("sweep 模板 values 结构校验失败");
+  }
+  // 归属校验：模板里的 avatarAddress 必须就是本角色，防止误用他人参数
+  const mine = Buffer.from(Address.fromHex(CFG.avatarAddress).toBytes());
+  const tmpl = values.get("avatarAddress");
+  if (!tmpl || !Buffer.isBuffer(tmpl) || !tmpl.equals(mine)) {
+    throw new Error("sweep 模板 avatarAddress 与本角色不符");
+  }
+  const entries = [];
+  for (const k of values.keys()) {
+    entries.push([k, String(k) === "id" ? randomBytes(16) : values.get(k)]);
+  }
+  return new BencodexDictionary([
+    ["type_id", action.get("type_id")],
+    ["values", new BencodexDictionary(entries)],
+  ]);
+}
+
+// 提交 sweep 消耗 AP。这是「收益优化」而非领取前置条件：链上 daily_reward7
+// 本就没有 AP 门槛，所以 sweep 失败/未确认/异常时一律降级照常领日常，
+// 绝不因为可选步骤而阻塞领取、错失整个冷却窗口。重复提交由链上幂等兜底。
+async function spendApBySweep(ctx, ap) {
+  const info = { triggered: true, ap, status: "skipped" };
+  if (DRY) {
+    info.status = "would_sweep";
+    info.msg = "演练：AP 已满，本应先提交 sweep 消耗再领日常（未提交任何交易）";
+    log({ level: "info", reward: "daily", msg: info.msg, ap });
+    return info;
+  }
+  try {
+    const tpl = await fetchSweepTemplate();
+    info.template = tpl.source;
+    const actionValue = buildSweepAction(tpl.raw);
+    const nonce = await getNonce(ctx.signer.toString());
+    const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
+    info.txId = txId;
+    log({ level: "info", reward: "daily", msg: "AP 已满：已提交 sweep 消耗 AP", txId, ap, template: tpl.source });
+    const r = await confirmTx(txId);
+    info.txStatus = r.txStatus;
+    info.exceptionNames = r.exceptionNames;
+    if (r.txStatus === "SUCCESS") {
+      info.status = "swept";
+      info.msg = "sweep 成功，AP 已消耗，继续领日常";
+      log({ level: "info", reward: "daily", msg: info.msg, txId, ap });
+    } else {
+      info.status = "sweep_unconfirmed";
+      info.msg = "sweep 未确认成功，降级照常领日常（不阻塞冷却）";
+      log({ level: "warn", reward: "daily", msg: info.msg, txId, txStatus: r.txStatus, ap });
+    }
+  } catch (e) {
+    info.status = "sweep_error";
+    info.msg = String(e.message);
+    log({ level: "warn", reward: "daily", msg: "sweep 前置异常，降级照常领日常（不阻塞冷却）", detail: info.msg });
+  }
+  return info;
 }
 
 async function getNonce(signerStr) {
@@ -347,6 +492,37 @@ function selfTest() {
     console.log(`  isTerminalTxStatus(${String(s)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
+  // AP 满才 sweep：仅日常 + 链上 AP 已满；AP 未满/读不到/巡逻一律不触发
+  const sweepCases = [
+    ["daily", 120, true], ["daily", 130, true],
+    ["daily", 119, false], ["daily", 0, false],
+    ["daily", null, false], ["daily", undefined, false], ["daily", NaN, false],
+    ["patrol", 120, false],
+  ];
+  total += sweepCases.length;
+  for (const [rw, apv, expect] of sweepCases) {
+    const got = shouldSweep(rw, apv);
+    const ok = got === expect;
+    console.log(`  shouldSweep(${rw}, ${String(apv)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // sweep 模板重建：只换 id，其余字段与已 SUCCESS 的交易逐字节保持
+  total++;
+  try {
+    const a = buildSweepAction(FALLBACK_SWEEP_RAW);
+    const hex = Buffer.from(encode(a)).toString("hex");
+    const v = a.get("values");
+    const idOk = Buffer.isBuffer(v.get("id")) && v.get("id").length === 16;
+    const ok = hex.length === FALLBACK_SWEEP_RAW.length &&
+      String(a.get("type_id")) === SWEEP_TYPE_ID &&
+      String(v.get("stageId")) === "446" &&
+      String(v.get("actionPoint")) === "120" &&
+      String(v.get("apStoneCount")) === "0" && idOk;
+    console.log(`  buildSweepAction 重建(type=446,ap=120,只换id) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  buildSweepAction 重建 FAIL ${e.message}`);
+  }
   console.log(`  self-test: ${pass}/${total} 通过`);
   process.exit(pass === total ? 0 : 1);
 }
@@ -356,7 +532,7 @@ async function readWatchSnapshot() {
   const st = await getTip();
   let av;
   try { av = await getAvatarState(); }
-  catch (_) { av = { dailyReceivedIndex: null, agentAddress: null }; }
+  catch (_) { av = { dailyReceivedIndex: null, actionPoint: null, agentAddress: null }; }
   const unblock = {
     daily: av.dailyReceivedIndex === null ? null : av.dailyReceivedIndex + CFG.dailyInterval,
   };
@@ -372,8 +548,14 @@ async function readWatchSnapshot() {
 // 提交单项奖励；done=true 表示本 job 不再处理它。
 // 只有 SUCCESS（或演练的 would_claim）算 done；确认未出终态/超时/失败/异常一律
 // done=false，由调用方按链上状态复核重提（stop 保留兼容，恒为 false）。
-async function watchClaim(reward, ctx, ub) {
+async function watchClaim(reward, ctx, ub, snap) {
   const rec = { reward, typeId: TYPE_ID[reward], unblockBlock: Number(ub) };
+  // AP 满时先 sweep 消耗，仅日常奖励。放在 DRY 分支之前，演练也能显示意图。
+  // sweep 内部会 confirmTx 等到终态，随后这里重新 getNonce，避免与 sweep 撞 nonce。
+  const ap = snap?.av?.actionPoint ?? null;
+  if (shouldSweep(reward, ap)) {
+    rec.sweep = await spendApBySweep(ctx, ap);
+  }
   if (DRY) {
     rec.status = "would_claim";
     rec.msg = "演练模式：已到期，本应提交交易（未提交）";
@@ -428,6 +610,7 @@ async function watchMode() {
       windowBlocks: Number(WATCH_WINDOW), pollFromBlocks: Number(POLL_FROM),
       pollSeconds: POLL_SEC, maxWatchSeconds: MAX_WATCH_MS / 1000,
       simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
+      sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
     },
   };
 
@@ -525,7 +708,7 @@ async function watchMode() {
     if (due.length) {
       let problem = false, unsettled = false;
       for (const x of due) {
-        const { rec, done: isDone, stop } = await watchClaim(x.r, ctx, x.ub);
+        const { rec, done: isDone, stop } = await watchClaim(x.r, ctx, x.ub, snap);
         results.set(x.r, rec);
         if (isDone) done.add(x.r);
         else unsettled = true;
@@ -590,6 +773,8 @@ async function daemonMode() {
       simulateDelta: SIM_DELTA === null ? null : Number(SIM_DELTA),
       simulateTipStep: SIM_DELTA === null ? null : Number(SIM_TIP_STEP),
       simulateCycleBlocks: SIM_DELTA === null ? null : Number(SIM_CYCLE_BLOCKS),
+      simulateApFull: SIM_AP_FULL,
+      sweepEnabled: SWEEP_ENABLED, apMax: AP_MAX, sweepApThreshold: SWEEP_AP_THRESHOLD,
     },
   };
 
@@ -628,7 +813,8 @@ async function daemonMode() {
       // 演练：纯离线模拟快照，不依赖链上连通性，结果确定且快
       snap = {
         st: { tip: simTip ?? 1000000n, rpc: "simulated" },
-        av: { dailyReceivedIndex: null, agentAddress: null },
+        av: { dailyReceivedIndex: null, agentAddress: null,
+              actionPoint: SIM_AP_FULL ? AP_MAX : null },
         unblock: {}, patrolSource: "simulated",
       };
     } else {
@@ -701,7 +887,7 @@ async function daemonMode() {
       if (minRem === null || rem < minRem) minRem = rem;
 
       if (rem <= 0n) {
-        const { rec } = await watchClaim(r, ctx, ub);
+        const { rec } = await watchClaim(r, ctx, ub, snap);
         results.set(r, rec);
         // 只有「领取成功」才锁定解锁块。确认未出终态 / 超时 / 失败一律不锁，
         // 冷却后按链上状态复核重提 —— 绝不错失一个周期。
@@ -859,6 +1045,11 @@ async function main() {
     out.rewards.push(rec);
 
     if (DRY) continue;
+
+    // AP 满时先 sweep 消耗（仅日常奖励）；sweep 内部等到终态，随后重新 getNonce
+    if (shouldSweep(reward, avatarState.actionPoint)) {
+      rec.sweep = await spendApBySweep({ account, pub, signer }, avatarState.actionPoint);
+    }
 
     // 提交（单笔单 action）
     try {
