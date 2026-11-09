@@ -441,3 +441,101 @@ active（workflow id `411841247`）。点火按「先只读验证、再真实常
 - 复查方法：GitHub `Actions → 9C 市场扫货` 看是否持续有新的 `in_progress` run；
   一旦出现 ≤0.2 的单，日志会依次出现 `已提交 buy_product3（N 单）` →
   `购买成功（N 单）`；失败 / PENDING 一律下轮重扫，不锁死。
+
+---
+
+## 十一、Sweep 固定 120AP / 30 次（消除 40AP 浪费）
+
+### 起因
+
+用户领取日常奖励后看到剩余 40AP，追问「领完按理说是满的，刚才到底进行了什么操作」。
+链上复盘（UTC 14:42 / 北京 22:42）显示该角色连续两笔 `SUCCESS`：
+
+| 区块 | action | 关键字段 | AP 变化 |
+|---|---|---|---|
+| `11758751` | `hack_and_slash_sweep10` | `actionPoint=80`、`apStoneCount=0`、stage446 | 120 → 40 |
+| `11758752` | `daily_reward7` | 补满 | 40 → 120 |
+
+根因：sweep 复用「本角色最近一笔 `SUCCESS` sweep」字节模板，而模板的
+`actionPoint` 会跟着**手动 sweep** 漂移（该角色历史上出现过 80 与 120 两种值）。
+沿用 80 就只消耗 80AP，剩 40AP 被日常补满 = 白丢 40AP 的 sweep 收益。
+用户随即明确要求：「有没有没有风险的方案，最终是不浪费 AP，执行 30 次 Sweep」。
+
+### 为什么「冻结某个 120 模板」有风险
+
+模板里打包了 `costumes / equipments / runeInfos / stageId / worldId`，链上执行时
+用它们算 CP 并校验 `cp >= SweepRequiredCPSheet[446].RequiredCP`。冻结旧快照后，
+用户一换装备/符文/通关更高关卡，旧参数就可能不匹配 → `NotEnoughCombatPointException`。
+反之链上已有 3 笔 `actionPoint=120` 的 stage446 sweep 全部 `SUCCESS`
+（block `11746256` / `11749808` / `11753634`），证明 **120 这个数值本身完全合法**。
+
+### 方案：不冻结模板，只锁死 3 个字段
+
+`buildSweepAction()` 仍从 Mimir 动态取最近一笔 `SUCCESS` sweep（装备/符文/关卡永远最新），
+但强制改写：
+
+| 字段 | 覆盖为 | 目的 |
+|---|---|---|
+| `id` | 新 16 字节 | 每笔必须不同（沿用原逻辑） |
+| `actionPoint` | `SWEEP_AP_TARGET = "120"` | 恒消耗 120AP → `playCount = 120/4 = 30` 次，不浪费 |
+| `apStoneCount` | `"0"` | 不消耗背包 AP 药水、不让 `playCount` 变成 `30+30N` |
+
+覆盖时**保持模板原值类型**（`HackAndSlashSweep10` 用 Unicode Text，如 `"80"` / `"0"`），
+字段集合、值类型、字节结构完全不变，零编码类型漂移。
+
+`apStoneCount` 是查 `Lib9c/Action/HackAndSlashSweep.cs` 源码时新发现的同源隐患：
+369–377 行 `apStoneCount > 0` 会 `RemoveFungibleItem` **真扣背包药水**，库存不足即
+`NotEnoughMaterialException` → `FAILURE`；413–415 行
+`playCount = (120/costAp)×apStoneCount + actionPoint/costAp`，带药水会让次数变 `30+30N`。
+原实现把 `apStoneCount` 原样复用，用户手动 sweep 若勾了 AP 药水就会污染脚本那一轮。
+链上历史 3 笔 sweep 均为 `apStoneCount=0`，属提前堵洞。
+
+### 链上校验逐条核对（`HackAndSlashSweep.cs` Execute）
+
+| 校验 | 结论 |
+|---|---|
+| `actionPoint > 当前 AP` → `NotEnoughActionPointException` | `shouldSweep` 只在链上 AP ≥ 120 时触发，必然满足；`--sweep-ap` 钳制在 1~120 |
+| 是否存在 120 上限 | **没有**，源码只有 `>= 0` 与 `<= 当前 AP` 两条 |
+| `playCount = actionPoint / CostAP` | 120 / 4 = **30 次**（stage446 基础 `cost_ap=5`，质押系数 80% → 4） |
+| CP 校验 `cp >= RequiredCP` | 与 `playCount` **无关**，20→30 次不提高 CP 门槛；且校验在扣 AP 之前 |
+| 入场材料 | stage446 `EntryCostItemId = 0`，次数变多无需改 `EntryCostItemCount` 声明 |
+| 装备 / 符文 / 关卡 | 沿用最近成功模板，零漂移、自动跟随养成 |
+| 万一仍失败 | 现有「6 笔有界重试 + 降级照常领日常」兜底，不浪费领取机会 |
+
+### 用户疑问澄清
+
+> 「如果我以后手动 sweep 了，是不是模板又会换到最近一次成功 sweep 但是会消耗 120AP，
+> 即使我做的是 80AP 的 sweep」
+
+**是，且正是期望行为**。模板确实会换源到手动那笔（这是设计意图：让装备/关卡跟随最新），
+但 `actionPoint` 与 `apStoneCount` 已由脚本写死，模板里的 80 读进来立即被覆盖。
+所以手动做 80 / 40 / 120 AP 的 sweep 都无所谓，脚本恒为 **120AP / 30 次 / 不消耗药水**。
+这与「手动做一次 30 次 sweep 让模板自然变 120」的备选不同：后者用户再手动做一次 20 次
+就会漂回 80，前者永久免疫。
+
+### 验证
+
+| 项目 | 结果 |
+|---|---|
+| `node --check` | 通过 |
+| `--self-test` | **42/42**（新增「80→120 覆盖且类型/字段不变」「80AP+2 药水污染仍锁死」用例） |
+| 线上真实模板端到端 | 取 block `11758751`（原值 80/0）注入 80AP+2 药水污染 → 重建后 `actionPoint="120"` / `apStoneCount="0"`，字段集合、值类型全一致，编码后可正常解码 |
+| 与链上 120 成功交易对比 | 字段集合、值类型逐项一致 |
+| 真实联网只读 dry-run | 通过，`ok=true` |
+
+### 上线实录（2026-11-09 完成）
+
+| 项 | 值 |
+|---|---|
+| 基线 HEAD | `d6ef35ac`（保活空提交） |
+| 代码提交 | **`68ca5515`** — `fix(claim): sweep 锁定 120AP/30次 且不消耗 AP 药水`，含 `claim.mjs` + `README.md` 同步 |
+| 切换方式 | 先 dispatch 新 run 在同 `concurrency` 组排队占位，再 cancel 旧 run，消除交接空窗 |
+| 旧 run | `#48`（sha `fbd9eef0`）→ `completed/cancelled` |
+| 新 run | **`#49`**（sha `68ca5515`）→ `in_progress`，前置 5 步全 success（检出 / Node / `npm ci` / keystore 解密 / 常驻启动），`--daemon` 持续运行，跨 2 个轮询周期复查未退出 |
+| 扫货链 | `#3` 仍 `in_progress`，两条链 `concurrency` 组分别为 `9c-auto-claim` / `9c-market-buy`，互不干扰；扫货链 `#2` 已完成首次自动交棒（`completed/success`），证明接力机制正常 |
+| 上线时链上 | `tip=11759313`、`AP=120`、日常还差约 1989 块（约 4.4h）；巡逻窗口临近，交接中断 < 1 分钟，未错过 |
+
+- 文档提交（本节）不改动 `claim.mjs`，已锁定的 `#49` 不受影响。
+- 观察点：下次日常领取（约 4.4h 后）应看到 sweep 一笔扣 **120AP**、随后 daily 补满 120，
+  即「先 sweep 30 次、再领满 120AP」；若日志出现 `sweep 消耗 120 AP` 且链上
+  `actionPoint=120`，即确认新逻辑生效。
