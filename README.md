@@ -1,8 +1,17 @@
-# 9C 巡逻奖励 / 日常奖励 自动领取（Heimdall）
+# 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货
 
-自动代替你打开 App 点「Get Reward」和「Daily Reward」。
-链上所有东西都是交易，领取 = 用角色所属 agent 的私钥签名并提交一笔交易。
-本项目已在真实 Heimdall 网络上端到端验证：构造 → 签名 → `stageTransaction` → 上链确认。
+本仓库含**两条相互独立的纯 GitHub 自接力链**：
+
+| 链 | workflow | 脚本 | 作用 |
+|---|---|---|---|
+| 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 监控并自动低价购买 **Stun Rune (Adventure)**（单价 ≤ 0.2 NCG/件） |
+
+两条链各有独立 `concurrency` 组、独立接力、共用同一 keystore Secrets，互不干扰。
+
+**领奖链**：自动代替你打开 App 点「Get Reward」和「Daily Reward」。链上所有东西都是交易，领取 = 用角色所属 agent 的私钥签名并提交一笔交易。本项目已在真实 Heimdall 网络上端到端验证：构造 → 签名 → `stageTransaction` → 上链确认。
+
+> **市场扫货功能详见第七节 [「七、市场扫货：Stun Rune (Adventure) 低价自动购买」](#七市场扫货stun-rune-adventure-低价自动购买)。**
 
 > **部署看 [`DEPLOY.md`](DEPLOY.md)（全新安装）；最终架构与上线实录看 [`TRIGGER.md`](TRIGGER.md)。**
 > **已于 2026-11-08 15:00 上线并端到端实测通过**（点火 → 第一跳自接力成功，WorkBuddy 任务已停用）。
@@ -76,10 +85,12 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 
 | 文件 | 作用 |
 |---|---|
-| `claim.mjs` | 主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属 |
+| `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)、单价判定、`buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（两条链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
 | `.github/workflows/claim.yml` | GitHub Actions 领奖任务（`--daemon` 常驻 + 接力 step + schedule 重燃 + 手动验证） |
+| `.github/workflows/market.yml` | **GitHub Actions 扫货任务**（独立 `concurrency` 组 `9c-market-buy`，与领奖链隔离；接力指向 `market.yml` 自身） |
 | `.github/workflows/keepalive.yml` | 每周空提交，防止 GitHub 60 天无活动自动停用定时任务 |
 | `run.sh` | 本地 cron 入口：加锁防重、日志轮转 |
 | `DEPLOY.md` | 全新部署指南（零基础逐步操作） |
@@ -212,3 +223,115 @@ tail -f claim.log
 8. 接力 step 需要 `permissions: actions: write`（已在 `claim.yml` 声明）；可选 Secret `NC_DISPATCH_TOKEN` 可加固接力，详见 `TRIGGER.md`。
 8. 自动领取属个人便利工具，请自行确认是否符合游戏服务条款。
 9. 想停止：GitHub 里禁用 workflow（或删 `claim.yml`）；本地方案删掉 crontab 行即可。
+
+---
+
+## 七、市场扫货：Stun Rune (Adventure) 低价自动购买
+
+独立的一条自接力链（`market.yml` + `market-buy.mjs`），与领奖链完全隔离。
+需求：**监控市场里 Stun Rune (Adventure) 的单价，出现 ≤ 0.2 NCG/件 就整单买下**；
+绝不能和相似的 **Stun Rune (Arena)** 或名字近似物品搞混。
+
+### 7.1 为什么不会搞错（用 id，不用名字）
+
+市场里符文是 `FungibleAssetValue` 挂单，每件资产带**唯一 ticker**。查 Mimir 的
+`RuneSheet`（链上表格）得到权威映射：
+
+| 符文 | RuneSheet id | ticker（唯一标识） | 处理 |
+|---|---|---|---|
+| **Stun Rune (Adventure)** | `10021` | `RUNESTONE_STUN_ADVENTURE` | ✅ 目标 |
+| Stun Rune (Arena) | `10022` | `RUNESTONE_STUN_ARENA` | ❌ 明确排除 |
+
+- **数据源头就分开**：请求 9CAPI 时直接用 `tickers=RUNESTONE_STUN_ADVENTURE` 精确参数，
+  服务端只返回该资产；Adventure / Arena 是两个不同 ticker，永不交叉。
+- **三重校验**：① 逐条本地复核 `ticker === "RUNESTONE_STUN_ADVENTURE"`（严格相等，非 `includes`、
+  非模糊匹配），大小写不同 / 名字含相似串 / 其它符文一律拒绝；② `productType` 必须是
+  `FUNGIBLE_ASSET_VALUE`；③ 提交前 Mimir 链上二次确认 `asset.ticker` 正确、价格/卖家未变。
+- **链上最终兜底**：`BuyProduct` 执行时会校验 `productId / price / seller`，任何不符即
+  `FAILURE`，不会买错物品、不会付错钱。这延续了你定的「只认链上、失败无所谓」原则。
+
+### 7.2 单价判定（unit price，不是总价）
+
+9CAPI 的 `fav` 挂单自带 `price`（**整数 NCG 总价**）、`quantity`（件数）、`unitPrice`
+（= price ÷ quantity，NCG/件）。NCG 有 2 位小数，0.2 NCG/件 = 20 minor/件。判定用**纯整数
+BigInt 运算**，避开浮点误差与总价陷阱：
+
+```
+price(NCG) × 100  <=  20 × quantity     // 等价 unitPrice <= 0.2
+```
+
+- 恰好 0.2（如 2 NCG / 10 件）**命中**（`<=`）。
+- 略超（如 21 NCG / 100 件 = 0.21）**不买**。
+- 高价单（如 9 NCG / 10 件 = 0.9）**不买**。
+- `price` 实测恒为整数 NCG，非整数/负数/`quantity<=0` 一律拒绝，防止浮点抹平边界。
+
+### 7.3 购买交易 `buy_product3`（FAV 版）
+
+链上购买 action 是 `buy_product3`。复用一笔**链上真实 SUCCESS 交易**（block `11755327`）
+的字节作模板，只替换动态字段，与 sweep 复用已验证 action 的思路一致，零字段/类型风险：
+
+```
+values = {
+  a : 买家 avatarAddress (20B),
+  id: 随机 16B action id（每笔换新，防重复交易）,
+  p : [ [ productId(16B, UUID→bytes_le),
+          [ NCG currency dict, price×100 (BigInt minor) ],
+          sellerAgentAddress(20B), sellerAvatarAddress(20B),
+          "FungibleAssetValue" ], ... ]   // 最多 20 单/笔（Lib9c Capacity）
+}
+```
+
+**字节级验证**（全部通过）：
+- 用 9CAPI `mobileBuyHeimdall` 返回的合法 action 交叉确认 `a/id/p` 骨架、NCG currency
+  dict 编码、`price 9 → i900e`（9 NCG ×100）完全一致；
+- `productId` 的 UUID → 16 字节用 `.NET Guid.ToByteArray()`（`bytes_le`）编码，与链上真实
+  交易、`mobileBuy` 返回值逐字节对齐：`0fe1ae99-...` → `99aee10f88051a41...`；
+- 用模板自身动态字段重建的 action 与链上模板 **逐字节一致（240B）**；
+- 真实 `signTx` + `encodeSignedTx` 编码出的 1 单 / 2 单 payload 均可解码、字段正确。
+
+### 7.4 只认链上 / 不锁死 / 不阻塞
+
+- **提交前**：读链上 tip + 归属校验（signer = agentAddress）+ 可选 NCG 余额预检（买不起就跳过，
+  不白提交）；Mimir 复核挂单，仅在查到「明确不符」（串货 / 变价 / 卖家变）时拦截，
+  **未索引在售挂单（not_found）或网络异常一律放行**，交给链上执行兜底 —— 绝不因二级索引
+  滞后误杀候选单、错失低价机会。
+- **提交后**：`confirmTx` 只认终态 `SUCCESS / FAILURE / INVALID`；只有 `SUCCESS` 记为买到。
+  `FAILURE / PENDING / INCLUDED / 异常` 一律不锁死，下一轮重新拉链上最新挂单再试
+  （重复提交最多成功一笔，其余 `FAILURE` 无资金损失）。
+- **扫光策略**：命中的单按单价升序（先买最便宜）打包，每笔最多 20 单、逐笔串行提交
+  （同一 signer 不并发抢 nonce）；不设预算上限、不设总量上限，一轮没扫完下一轮继续。
+- **轮询**：默认每 60s 扫一次（`--poll-seconds` 可调），远离命中时只是一次轻量 HTTP 请求。
+
+### 7.5 命令速查与参数
+
+```
+node market-buy.mjs --self-test                  # 离线自测（35/35，含字节级比对，不联网）
+node market-buy.mjs --dry-run                   # 联网只读扫描一轮，绝不提交
+node market-buy.mjs                            # 真实扫描并购买命中的便宜单
+node market-buy.mjs --daemon                   # 自接力常驻 5.5h（线上 workflow 用这个）
+node market-buy.mjs --daemon --dry-run --simulate-listings-file sim.json  # 注入挂单演练多轮+交棒
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--max-unit-price-minor N` | `20` | 单价阈值（minor/件）；20 = 0.2 NCG/件 |
+| `--poll-seconds N` | `60` | 每轮扫描间隔 |
+| `--max-items-per-tx N` | `20` | 单笔 `buy_product3` 最多打包几单（≤ Lib9c Capacity 20） |
+| `--max-tx-per-round N` | `20` | 每轮最多提交几笔交易（未扫完下轮继续） |
+| `--max-run-seconds N` | `19800` | daemon 常驻预算（5.5h < 单 job 6h 上限） |
+| `--no-verify` | 关闭 | 跳过提交前 Mimir 链上复核（默认开启） |
+| `--simulate-listings-file F` | — | 仅 dry-run：从 JSON 文件注入挂单，离线演练完整链路 |
+
+### 7.6 线上上线要点
+
+- `market.yml` 用**独立** `concurrency` 组 `9c-market-buy`，绝不与 `claim.yml` 的
+  `9c-auto-claim` 共用（两条常驻 daemon 共组会互相排队饿死）。
+- schedule 与领奖链错峰（`9,19,29,...` vs `4,14,24,...`），接力 dispatch 指向
+  `market.yml` 自身。
+- 两条链共用同一 keystore Secrets（同一角色/私钥）。都动态取 `nextTxNonce`；领奖几小时
+  才提交一次、扫货只在出现便宜单时提交，撞 nonce 概率极低；万一撞上一笔 `FAILURE`
+  无资金损失，下轮重提即可。
+- 手动点火：`Actions → 9C 市场扫货 → Run workflow`，**取消勾选 `dry_run`** 即进入真实常驻；
+  勾选则只扫描一轮验证、不提交、不接力。
+- 观察到便宜单时日志依次为 `已提交 buy_product3（N 单）` → `购买成功（N 单）`；
+  未命中时每轮只有 `rawCount / candidateCount=0` 的 daemon 心跳。

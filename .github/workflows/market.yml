@@ -1,0 +1,135 @@
+name: 9C 市场扫货 (Heimdall / Stun Rune Adventure)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 独立链：与 claim.yml 领奖链完全隔离、互不干扰（各自独立 concurrency 组）。
+# 架构同为「纯 GitHub 自接力长链」，不依赖 WorkBuddy / 任何外部闹钟。
+#
+#  监控：job 内 `market-buy.mjs --daemon` 常驻 5.5h，每 ~60s 扫一次市场：
+#        · 按 ticker 精确拉取 RUNESTONE_STUN_ADVENTURE 的全部在售挂单
+#          （用资产唯一 ticker，绝不名字搜索；Stun Rune (Arena) 永不混入）
+#        · 单价 unitPrice <= 0.2 NCG/件 才买（整数比较，避开总价陷阱）
+#        · 命中即提交 buy_product3，提交前链上复核、提交后只认链上终态
+#        · 无命中/失败/异常一律进入下一轮重扫，绝不锁死、绝不误买
+#  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
+#        下一个常驻 job（GITHUB_TOKEN 是防递归规则的例外）。
+#  重燃：schedule 每 10 分钟错峰（与领奖链 4,14,24... 错开到 9,19,29...），
+#        只作断链重燃保险。
+#
+#  私钥：两条链共用同一 keystore Secrets（同一角色/私钥）。两条链都动态取
+#  nextTxNonce，领奖提交是几小时一次、扫货只在出现便宜单时提交，同时提交
+#  撞 nonce 的概率极低；万一撞上，其中一笔 FAILURE 无资金损失，下轮重提即可
+#  （沿用「重复提交没事、失败无所谓、只认链上」的既定策略）。
+# ═══════════════════════════════════════════════════════════════════════════
+on:
+  schedule:
+    - cron: '9,19,29,39,49,59 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '手动验证时勾选：只扫描一轮、不值守、不提交、不接力'
+        type: boolean
+        default: true
+      max_run_seconds:
+        description: '仅用于实测接力：常驻预算秒数，留空=默认 5.5h；填 60 可一分钟内验证交棒'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
+
+concurrency:
+  group: 9c-market-buy          # 独立组：绝不与 claim.yml 的 9c-auto-claim 共用
+  cancel-in-progress: false      # 绝不能取消正在值守的 job
+
+jobs:
+  market:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖（命中缓存时仅数秒）
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 常驻市场扫货（--daemon）
+        id: daemon
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          MAX_RUN: ${{ inputs.max_run_seconds }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          case "$MAX_RUN" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="--max-run-seconds $MAX_RUN" ;;
+          esac
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动验证模式：只扫描一轮，不值守、不提交、不接力"
+            node market-buy.mjs --dry-run 2>&1 | tee "$RUNNER_TEMP/daemon.log"
+          else
+            node market-buy.mjs --daemon $EXTRA 2>&1 | tee "$RUNNER_TEMP/daemon.log"
+          fi
+          exit ${PIPESTATUS[0]}
+
+      - name: 接力（触发下一个常驻 job）
+        if: always()
+        env:
+          DISPATCH_TOKEN: ${{ secrets.NC_DISPATCH_TOKEN || github.token }}
+          RELAY_REPO: ${{ github.repository }}
+          RELAY_REF: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动验证模式：不接力"; exit 0
+          fi
+          LOG="$RUNNER_TEMP/daemon.log"
+          if ! grep -q '"handoff":"budget_exhausted"' "$LOG" 2>/dev/null; then
+            echo "未检测到正常交棒标记，不接力（由 schedule 兜底重燃）"; exit 0
+          fi
+          echo "检测到正常交棒，发起接力…"
+          CODE=""
+          for i in 1 2 3; do
+            CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\"}}" \
+              "https://api.github.com/repos/$RELAY_REPO/actions/workflows/market.yml/dispatches") || CODE="000"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
+            echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"
+            sleep 5
+          done
+          echo "接力 dispatch HTTP=$CODE"
+          if [ "$CODE" != "204" ] && [ "$CODE" != "200" ]; then
+            echo "::warning::接力失败 HTTP=$CODE，链将依赖 schedule 重燃"
+            head -c 300 "$RUNNER_TEMP/relay_resp.txt" 2>/dev/null || true
+          fi
+          exit 0

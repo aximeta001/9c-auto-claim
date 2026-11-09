@@ -326,3 +326,91 @@ GitHub 官方明确：**`GITHUB_TOKEN` 触发的事件不会创建新的 workflo
   若首笔失败则有 `sweep 第 N/6 次未确认成功（…），复查链上状态后重试`；
   成功为 `sweep 成功（第 N 次尝试），AP 已消耗，继续领日常 → 领取成功`；
   全失败为 `sweep 连续 6 次尝试均未确认成功，降级照常领日常`。
+
+---
+
+## 十、市场扫货链：Stun Rune (Adventure) 低价自动购买（2026-11-09 新增）
+
+### 起因与选型
+
+用户要求：**监控 market 中 Stun Rune (Adventure) 的单价，出现 ≤ 0.2 NCG/件 就买**；
+特别强调「有一个相似的叫 Stun Rune (Arena)，不要搞混」「只搜名字可能出现不是这个
+物品的东西，看下有没有办法保证不会搞错，比如 id 之类的」。
+
+用户三项选择：**① 扫光所有 ≤0.2 单不设限 ② 独立脚本 + 独立链 ③ 直接开真实购买**。
+
+### 调研结论（全部在 Heimdall 实地验证）
+
+1. **精确识别（核心）**：查 Mimir `sheet(sheetName:"RuneSheet")` 得到权威表：
+   - `10021,Stun Rune (Adventure),RUNESTONE_STUN_ADVENTURE` ← 目标
+   - `10022,Stun Rune (Arena),RUNESTONE_STUN_ARENA` ← 明确排除
+   
+   市场里符文是 `FungibleAssetValue` 挂单，`asset.ticker` 就是唯一标识。9CAPI
+   `GET /marketProviderHeimdall/Market/products/fav?tickers=RUNESTONE_STUN_ADVENTURE`
+   按 ticker 精确返回该资产全部在售挂单（实测 74~77 条，`ticker` 全为目标、0 串货）。
+   Arena 是不同 ticker，从数据源头分开，**永不混入**。名字相似串、大小写不同、
+   其它符文一律被 `ticker === TARGET` 严格相等拒绝。
+
+2. **单价**：9CAPI 挂单带 `price`（整数 NCG 总价）、`quantity`（件数）、`unitPrice`。
+   判定 `price×100 <= 20×quantity`（纯 BigInt 整数），恰好 0.2 命中。链上 NCG 有
+   2 位小数，`price×100 = minor`。当前该符文最低单价 **0.7**，暂无 ≤0.2 的单，
+   因此上线后有充足观察窗口、不会立刻触发。
+
+3. **购买 action**：`buy_product3`。从 Mimir 取最近 SUCCESS 的真实交易解出 FAV 版结构：
+   ```
+   values = { a: 买家 avatar(20B), id: 随机16B, p: [ [ productId(16B),
+     [NCG currency dict, price×100(BigInt)], sellerAgent(20B), sellerAvatar(20B),
+     "FungibleAssetValue" ], ... ] }
+   ```
+   - `ProductId` 是 `.NET Guid.ToByteArray()`（bytes_le）；经 9CAPI `mobileBuyHeimdall`
+     对 `price=9` 返回 `i900e` 与链上真实交易双向验证：
+     `0fe1ae99-0588-411a-991b-37be51c44dc2` → `99aee10f88051a41...`。
+   - `Lib9c/Action/BuyProduct.cs` 的 `Capacity = 20`（单笔最多 20 单）、
+     `ProductInfos` 是 list → 支持一笔打包多单；`Execute` 里校验
+     `productsState.ProductIds.Contains(productId)` 与 `Price != productInfo.Price`
+     → 挂单失效/变价即 `ProductNotFoundException / InvalidPriceException`，FAILURE
+     无资金损失（天然兜底）。
+   - `Product.Serialize()` 用 `ProductId.Serialize()`（Guid→16B bytes_le）。
+
+4. **余额**：agent `0x491bd35C...` 有 4521.43 NCG（`stateQuery.balance`，quantity 是主单位）。
+
+### 实现（新增 2 文件，claim.mjs / claim.yml 零改动）
+
+- `market-buy.mjs`（自包含，独立签名栈）：
+  - `isTargetListing` 用 ticker 严格相等 + exist/legacy + 整数校验三重过滤；
+  - `isCheapEnough` 纯 BigInt 单价判定；`selectCandidates` 按单价升序；
+  - `fetchListings` 9CAPI ticker 精确查询 + 本地逐条复核；
+  - `verifyListingOnchain` 提交前 Mimir 链上复核，**仅在查到明确不符时拦截**，
+    not_found / 网络异常一律放行（Mimir 常不索引在售挂单，绝不误杀候选单）；
+  - `buildBuyAction` 复用链上 SUCCESS 模板字节，只替换动态字段；
+  - 逐笔串行提交、`getNonce`、`confirmTx` 只认终态；失败/PENDING/异常不锁死、
+    下轮重扫链上最新挂单；归属校验 + 可选余额预检；
+  - `--daemon` 自接力常驻（输出 `handoff:budget_exhausted`）、`--dry-run`、
+    `--self-test`、`--simulate-listings-file`。
+- `.github/workflows/market.yml`：独立 `concurrency: 9c-market-buy`（绝不与领奖链
+  共组，否则两条常驻 daemon 互相排队饿死）、schedule 错峰 `9,19,29...`、
+  keystore 解密 step 复用、接力 dispatch 指向 `market.yml` 自身、`timeout-minutes: 355`。
+
+### 验证（全部通过，未提交任何真实链上交易）
+
+| 项目 | 结果 |
+|---|---|
+| `node --check` + `--self-test` | **35/35**（ticker 精确/排除 Arena、单价边界 0.2 命中 0.21 拒绝、UUID bytes_le、终态、模板字节比对） |
+| **字节级比对** | `buildBuyAction` 用链上模板动态字段重建 → **与链上真实 SUCCESS 交易逐字节一致（240B）** |
+| **三方交叉** | 9CAPI 合法 action / 链上真实 FAV 交易 / 我方构造：NCG currency dict 编码、`price 9→i900e`、`a/id/p` 骨架完全一致 |
+| **真实签名编码** | `signTx`+`encodeSignedTx` 出的 1 单 / 2 单 payload 均可解码、`type_id=buy_product3`、p 字段正确 |
+| **mock 全场景** | **35/35**（走真实签名链路、仅替换网络层）：正常 2 单打包、Arena 不买、FAILURE/PENDING 不锁死、串货/变价拦截、链上复核通过、余额不足跳过、归属不符拦截、nonce 连续、action id 换新、23 单分批(20+3) |
+| 真实联网 `--dry-run` | 74 条目标挂单、0 串货、`candidateCount=0`（当前无便宜单），只读不提交 |
+| 注入挂单演练 | 命中 0.05/0.2 两单、Arena/近似名/下架/高价全排除、按单价升序 |
+| daemon 交棒 | `--max-run-seconds 8` 演练输出 `handoff:budget_exhausted`，接力 step 可识别 |
+| workflow | YAML 解析 OK、独立组、接力指向自身、粘贴版第 3 段可复制 |
+
+### 上线与观察
+
+- 部署包新增 `market-buy.mjs` 与 `.github/workflows/market.yml`（共 14 文件白名单）。
+- 上线后在 GitHub `Actions → 9C 市场扫货 → Run workflow`（取消勾选 dry_run）点火，
+  或等 schedule 错峰重燃；独立链与领奖链并行常驻。
+- 观察点：出现 ≤0.2 单时日志依次 `已提交 buy_product3（N 单）` → `购买成功（N 单）`；
+  未命中时每 60s 只有 `rawCount / candidateCount=0` 的 daemon 心跳。
+- 万一领奖链与扫货链极偶发撞 nonce：其中一笔 FAILURE 无资金损失，下轮自动重提
+  （沿用「重复提交没事、失败无所谓、只认链上」既定策略）。
