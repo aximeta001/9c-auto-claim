@@ -197,3 +197,59 @@ GitHub 官方明确：**`GITHUB_TOKEN` 触发的事件不会创建新的 workflo
 - 点火：1 次 `workflow_dispatch`（60s 短预算，链上远离窗口，**未提交任何交易**）。
 - 接力：1 次 `workflow_dispatch`（内置 token，创建第一跳常驻 job）。
 - **本阶段零链上领取交易**。当前链上：日常剩约 3.0h、巡逻剩约 8.8h，链会自己等到期后领取。
+
+---
+
+## 八、AP 满时先 Sweep（2026-11-09 新增）
+
+### 起因与纠错
+
+用户提出「日常领的是 AP，上限 120，满了就领不了，得先 Sweep 消耗完再领」。查
+`Lib9c/Action/DailyReward.cs` 源码后纠正了一个前提：**链上并没有「AP 满不能领」的检查**，
+`Execute` 只校验冷却块，最后无条件 `SetActionPoint(avatar, ActionPointMax = 120)`（**补满**）。
+即 AP 满时领取照样 `SUCCESS`，只是收益为 0 且白刷一次冷却 —— App 里点不动是客户端 UI 限制。
+
+所以真实诉求不是「修漏领」，而是「别浪费这次领取」：AP 满时先消耗掉 120 AP 再领，
+才能拿到整整 120 AP（外加 30 次 sweep 掉落）。用户确认按此实现并上线。
+
+### 链上排查结论
+
+| 项 | 结论 |
+|---|---|
+| 真实 action | `hack_and_slash_sweep10`（不是 `hack_and_slash_sweep`） |
+| 该角色成功记录 | block `11749808`、`11746256` 等 7 笔，均 `SUCCESS` |
+| 实际 sweep 关卡 | **world 9 / stage 446**，不是 `lastClearedStage` 的 world 10 / stage 495 —— 客户端按 `SweepRequiredCPSheet` 的 CP 要求选关，硬用 495 会 `NotEnoughCombatPointException` |
+| 关键参数 | `actionPoint=120`（一笔扣完）、`apStoneCount=0`、装备/服装/符文列表、每次新 `id` |
+| 失败代价 | CP 校验在扣 AP **之前**，sweep 失败不扣 AP，只费一个 nonce |
+| 构造方式 | Mimir `actions.raw` 与链上真实 action（`transaction.getTx.serializedPayload` 解出的 actions[0]）**逐字节完全相同**（1058 字节），仅换 `id` 即可，零类型风险 |
+| 当前 AP | 上线前实测 `actionPoint = 120`（满），下次日常解锁块 `11753626` |
+
+### 实现（只动 `claim.mjs`，未改 workflow）
+
+- `getAvatarState` 增读 `actionPoint`；`shouldSweep` 仅当「日常 + AP ≥ 120 + 开关开启」为真。
+- `fetchSweepTemplate`：从 Mimir 取**本角色最近一笔 `SUCCESS` 的 sweep** 原始字节，自动跟随装备/关卡变化；故障回退内置模板（block `11749808`）。
+- `buildSweepAction`：复用字节，只把 `GameAction.Id` 换成新的 16 字节，其余一字不改（保证 CP、`playCount`、`EntryCostItemCount` 全部与成功交易一致）。
+- `spendApBySweep`：提交 sweep → `confirmTx` 等终态 → 再提交日常（nonce 自动递增）。**失败/超时/模板异常一律降级照常领日常**，绝不因可选优化阻塞领取。
+- 触发判据只看链上 AP：sweep 成功扣完 AP 后 `shouldSweep` 自动变 false，交棒后新 job 不会重复 sweep。
+- 开关 `--no-sweep`（默认开）；演练钩子 `--simulate-ap-full`。
+
+### 验证（全部通过）
+
+- `node --check` + `self-test` **24/24**（新增 `shouldSweep` 8 例 + 模板重建保真）。
+- 内置模板与链上真实 action **逐字节一致**；除 `id` 外所有字段一致。
+- 真实链上 dry-run：日常剩 544 块未到期、不误触发。
+- daemon 演练 `--simulate-ap-full`：正确出现 `would_sweep`，仅 daily 触发、patrol 不触发，正常交棒。
+- mock 变异副本 8 场景：AP 满+sweep 成功 → **先 sweep(#7) 再 daily(#8)** nonce 递增正确；
+  sweep FAILURE/PENDING/模板异常均降级照常领；AP 未满/读不到/patrol/`--no-sweep` 均不 sweep。
+- 真实签名链路：两笔 `signTx` + `encodeSignedTx` 均可解码，
+  action 依次为 `hack_and_slash_sweep10`（stage 446、AP 120、新 16 字节 id）与 `daily_reward7`。
+- **本次改动全程未提交任何真实链上交易**（除只读查询）。
+
+### 上线
+
+- `claim.mjs` → commit `b839c55`（sha `cbd9aac`），`README.md`、`TRIGGER.md`、部署包同步。
+- 云端 runner 用仓库代码，已在两个奖励都远离解锁（日常剩数百块）时切换到新代码的 run，
+  旧提交锁定的 in_progress/pending run 已取消，链条无缝接管。
+- 观察点：下次日常到期（约 tip `11753626`）时，日志应出现
+  `AP 已满：已提交 sweep 消耗 AP` → `sweep 成功，AP 已消耗，继续领日常` → `领取成功`，
+  随后 Mimir 可查到 `hack_and_slash_sweep10` 与 `daily_reward7` 两笔 `SUCCESS`。
