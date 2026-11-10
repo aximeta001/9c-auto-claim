@@ -1,0 +1,104 @@
+name: 9C Adventure Boss 一键 Sweep (Heimdall)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 极简版：只做「一次连发 N 笔 sweep_adventure_boss」，代替手工一次一次点「冲」。
+# ───────────────────────────────────────────────────────────────────────────
+#  触发：只有 workflow_dispatch —— 你自己决定要不要点，没有 schedule、
+#        没有常驻 daemon、没有自接力、没有白名单、不判断是哪个 BOSS。
+#  默认：dry_run = true（只预览、不提交、不消耗 AP 药水）。
+#        要真跑，取消勾选 dry_run。次数默认 10，可改 1~50。
+#
+#  为什么不用判断 BOSS：sweep_adventure_boss 交易里没有 bossId 字段，
+#  4 个 BOSS 的 sweep_ap 全是 1，BOSS 由链上当前赛季决定，操作完全一样。
+#  脚本只把「赛季号 s」动态改成链上当前值（从本赛季窗口内 SUCCESS 的交易解析）。
+#
+#  前置（由你在游戏里手工完成，脚本不做）：
+#    · 首层解锁 / 挑战爬层（unlock_floor、explore_adventure_boss）
+#    · 保证当前赛季进行中、AP 药水够（每笔消耗 = 已通关层数 × 1 瓶）
+#
+#  私钥：与另外两条链共用同一份 keystore Secrets；仅在 runner 内临时解密，
+#        job 结束即销毁。三条链都动态取 nextTxNonce，撞上的概率很低；
+#        万一撞上，那一笔 FAILURE 不扣药水，脚本会停下并如实报告，重跑即可。
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '默认勾选：只预览、不提交、不消耗 AP 药水。要真跑请取消勾选'
+        type: boolean
+        default: true
+      times:
+        description: '本批连续 Sweep 次数（1~50，默认 10）'
+        type: string
+        default: '10'
+      season:
+        description: '可选：手工指定赛季号（留空 = 自动从链上解析；刚跨赛季解析不到时才填）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 9c-boss-sweep           # 独立组：不与 claim.yml / market.yml 共用
+  cancel-in-progress: false      # 一批跑到完，不中途取消
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass .env' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 纯逻辑自测（不联网）
+        run: node sweep-boss.mjs --self-test
+
+      - name: 连续 Sweep
+        env:
+          DRY: ${{ inputs.dry_run }}
+          TIMES: ${{ inputs.times }}
+          SEASON: ${{ inputs.season }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          if [ "$DRY" = "true" ]; then EXTRA="$EXTRA --dry-run"; fi
+          case "$TIMES" in
+            ''|*[!0-9]*) echo "times 非法，回退默认 10" ;;
+            *) EXTRA="$EXTRA --times $TIMES" ;;
+          esac
+          case "$SEASON" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --season $SEASON" ;;
+          esac
+          echo "运行参数:$EXTRA"
+          node sweep-boss.mjs $EXTRA 2>&1 | tee "$RUNNER_TEMP/sweep.log"
+          exit ${PIPESTATUS[0]}
