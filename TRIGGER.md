@@ -539,3 +539,76 @@ active（workflow id `411841247`）。点火按「先只读验证、再真实常
 - 观察点：下次日常领取（约 4.4h 后）应看到 sweep 一笔扣 **120AP**、随后 daily 补满 120，
   即「先 sweep 30 次、再领满 120AP」；若日志出现 `sweep 消耗 120 AP` 且链上
   `actionPoint=120`，即确认新逻辑生效。
+
+---
+
+## 三角色扩展上线实录（2026-11-11 完成）
+
+### 需求与链上核实
+
+用户希望 `bnbyes` / `tomoon` 两个角色的日常奖励与巡逻奖励也纳入自动领取。
+链上 `stateQuery.agent(address).avatarStates` 直接给出该 agent 下全部 avatar 的
+`name` / `address` / `index` / `level`，三者 `agentAddress` 完全一致：
+
+| 角色 | avatar 地址 | index | 等级 | 上线前 AP | 上线前日常领取块 | 上线前巡逻解锁块 |
+|---|---|---|---|---|---|---|
+| `bnb` | `0xAC9D…A21c` | 0 | 506 | 120 | 11774102 | 11775559 |
+| `bnbyes` | `0x3614…5044` | 1 | 424 | 0 | 11745542 | 11750943 |
+| `tomoon` | `0x897f…6eF1` | 2 | 440 | 0 | 11745591 | 11750990 |
+
+→ 三个角色同属 agent `0x491bd35CA5F8F261a0ad33A01c74501e6Bc5bc3f`，
+**同一把私钥即可签三个角色的交易，无需新增任何 Secrets**。
+`bnbyes` / `tomoon` 的四项奖励当时均已逾期约 2～3 天。
+
+### 架构决策：一条链串行，而不是三条并行
+
+三个 avatar 共用同一 signer，也就共用同一条 nonce 队列。三条并行常驻链同时提交
+会互抢 `nextTxNonce` 造成 `FAILURE`。因此改造为**单个 daemon 进程内串行**：
+
+- `NC_AVATARS`（逗号分隔 `名字:0x地址`）→ 默认内置三角色；`.env` 里的 `NC_AVATAR`
+  只作归属校验参考，不决定角色列表（否则 runner 上会退化成单角色）。
+- 全局 `ACTIVE` 角色上下文，`setActive()` 串行切换；所有链上查询、sweep 模板、
+  `buildActionValue` 都读当前角色。
+- 幂等锁 / 结果 / 计数按 `角色|奖励` 分键（`taskKey`），互不覆盖。
+- 每轮依次对每个角色读快照、归属校验、判断到期并**串行 await 提交**，每笔重新取 nonce。
+- 三个角色各自从 Mimir 取自己最近一笔 `SUCCESS` 的 `hack_and_slash_sweep10` 模板；
+  内置兜底模板属于 bnb，非 bnb 角色绝不套用（`buildSweepAction` 校验 avatarAddress）。
+- 新增 `--check-all` 只读模式，workflow 的 `dry_run` 分支改用它。
+
+用户拍板：沿用现有按区块自动领（日常 2550 / 巡逻 5400 块，不是「每天一次」）、
+三个角色都启用「AP 满先 30 次 Sweep」、部署后立即补领一次。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `node --check` | 通过 |
+| `--self-test` | **48/48**（新增 6 项：三角色配置 / `parseAvatars` / `taskKey` / 跨角色模板拒绝） |
+| 本地 `--check-all` | 3 个角色全部读到，`agentAddress` 一致，两新角色 4 项 `ready:true` |
+| daemon 离线演练 | `handoff:"budget_exhausted"` 保留，接力 step 的 grep 匹配不受影响 |
+| 线上 dry_run | run **#61**（`42947762160`）全 step success，runner 上 `--check-all` 输出三角色 |
+
+### 上线与切换
+
+| 项 | 值 |
+|---|---|
+| 基线 HEAD | `a84369d5` |
+| 代码提交 | **`cb9a7a06`** — `feat(claim): 三角色串行值守 bnb/bnbyes/tomoon 的日常与巡逻奖励`（`claim.mjs` / `claim.yml` / `README.md` / `DEPLOY.md` / `workflows-to-paste.txt`） |
+| 切换方式 | 先 dispatch 新 run 在同 `concurrency` 组占位，再 cancel 旧 run **#60**（`a84369d5`，单角色）；bnb 当时两项奖励均未到期，取消不影响领取 |
+| 线上 dry_run | run **#61** `42947762160` → `completed/success` |
+| 真实运行 | run **#62** `42947977811` → `in_progress`，`--daemon` 常驻中（新代码 `cb9a7a06`） |
+
+### 链上终态核验（tip = 11774855）
+
+| 角色 | 交易 | 区块 | 状态 | 变化 |
+|---|---|---|---|---|
+| `bnbyes` | `daily_reward7` | 11774825 | **SUCCESS** | `dailyRewardReceivedIndex` 11745542 → 11774825，AP 0 → 120 |
+| `bnbyes` | `claim_patrol_reward` | 11774826 | **SUCCESS** | 巡逻解锁块 11750943 → **11780226**（= 11774826 + 5400） |
+| `tomoon` | `daily_reward7` | 11774827 | **SUCCESS** | 11745591 → 11774827，AP 0 → 120 |
+| `tomoon` | `claim_patrol_reward` | 11774828 | **SUCCESS** | 巡逻解锁块 11750990 → **11780228**（= 11774828 + 5400） |
+| `bnb` | — | — | 未触发 | 两项均未到期（11776652 / 11775559），状态未变，AP 仍 120 |
+
+- 窗口内仅这 4 笔新交易，**无重复提交**；两角色上线前 AP=0，故本轮不触发 sweep，
+  没有浪费任何 AP，也没有产生多余交易。
+- 只认链上终态 `SUCCESS`；`INCLUDED` / `STAGING` 不算成功。
+- 之后三个角色都按各自区块周期由同一条常驻链自动领取，无需人工干预。
