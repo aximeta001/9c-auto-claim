@@ -72,7 +72,7 @@ jobs:
             echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
           fi
           umask 077
-          trap 'rm -f .keystore.json .kpass .env' EXIT
+          trap 'rm -f .keystore.json .kpass' EXIT
           printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
           printf '%s' "$NC_KEYSTORE_PASS" > .kpass
           ARGS="--keystore .keystore.json --passphrase-file .kpass"
