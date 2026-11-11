@@ -65,8 +65,39 @@ function loadEnv() {
   return out;
 }
 const ENV = { ...loadEnv(), ...process.env };
+
+// ---------------- 多角色（同一 agent 下的多个 avatar） ----------------
+// 一个 keystore/私钥对应一个 agent，一个 agent 下可以有多个 avatar（角色）。
+// 三个角色共用同一 signer，因而共用同一条 nonce 队列 —— 若开三条并行常驻链，
+// 会互相抢 nonce 造成 FAILURE。所以必须在「同一进程内串行」依次处理每个角色：
+// 每笔交易提交前都重新取 nextTxNonce，绝不并发提交。
+//
+// NC_AVATARS 支持 "名字:0x地址" 或纯 "0x地址"，用逗号/空白分隔；
+// 不配置时用下面三个已在 Heimdall 链上核实的角色（同属 agent 0x491b…c3f）。
+// 注意：.env 里由 import-key.mjs 写入的 NC_AVATAR 只用于归属校验参考，
+// 不参与角色列表决定 —— 否则 GitHub runner 上会退化成只跑一个角色。
+const DEFAULT_AVATARS = [
+  "bnb:0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c",
+  "bnbyes:0x3614521b77116568211b70d109A2822C15ec5044",
+  "tomoon:0x897fD3F58c87F26b5C13F78656E688B2a89C6eF1",
+];
+function parseAvatars(spec) {
+  const out = [];
+  for (const part of String(spec).split(/[,\s]+/)) {
+    if (!part) continue;
+    const i = part.indexOf(":");
+    const label = i >= 0 ? part.slice(0, i) : `avatar${out.length + 1}`;
+    const addr = i >= 0 ? part.slice(i + 1) : part;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) throw new Error(`角色地址格式错误: ${part}`);
+    out.push({ label, address: addr });
+  }
+  if (!out.length) throw new Error("NC_AVATARS 为空：至少需要一个角色");
+  return out;
+}
+const AVATARS = parseAvatars(ENV.NC_AVATARS || DEFAULT_AVATARS.join(","));
 const CFG = {
-  avatarAddress: ENV.NC_AVATAR || "0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c",
+  avatarAddress: AVATARS[0].address,   // 兼容旧字段 = 主角色
+  avatars: AVATARS,
   privateKey: ENV.NC_PRIVATE_KEY || "",
   // 两个 Heimdall RPC，按优先级做 failover
   rpcUrls: [
@@ -81,6 +112,13 @@ const CFG = {
   confirmTries: 12,
   confirmIntervalMs: 5000,
 };
+
+// 当前正在处理的角色。所有链上查询 / 交易构造都读它，由 setActive 串行切换。
+// 单角色配置下 ACTIVE 恒等于 AVATARS[0]，行为与旧版完全一致。
+let ACTIVE = AVATARS[0];
+function setActive(av) { ACTIVE = av; }
+function activeAddress() { return ACTIVE.address; }
+function taskKey(av, reward) { return `${av.label}|${reward}`; }
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
@@ -291,7 +329,7 @@ async function getTip() {
 // shouldSweep 会据此保守跳过 sweep，绝不臆测。
 async function getAvatarState() {
   const q = "query($a:Address!){ stateQuery { avatar(avatarAddress:$a){ actionPoint dailyRewardReceivedIndex agentAddress } } }";
-  const d = await gqlRpc(q, { a: CFG.avatarAddress });
+  const d = await gqlRpc(q, { a: activeAddress() });
   const av = d.data?.stateQuery?.avatar;
   return {
     dailyReceivedIndex: av?.dailyRewardReceivedIndex == null ? 0n : BigInt(av.dailyRewardReceivedIndex),
@@ -307,7 +345,7 @@ async function getPatrolUnblock() {
     const t = setTimeout(() => ctrl.abort(), 30000);
     const r = await fetch(CFG.api9c + "/PatrolUnblockIndexHeimdall", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ avatarAddress: CFG.avatarAddress }), signal: ctrl.signal,
+      body: JSON.stringify({ avatarAddress: activeAddress() }), signal: ctrl.signal,
     });
     clearTimeout(t);
     const j = await r.json();
@@ -319,7 +357,7 @@ async function getPatrolUnblock() {
   try {
     const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a,actionTypeId:"claim_patrol_reward"},take:5){
       items { blockIndex object { signer } } } }`;
-    const d = await gql(CFG.mimir, q, { a: CFG.avatarAddress });
+    const d = await gql(CFG.mimir, q, { a: activeAddress() });
     const items = d.data?.transactions?.items || [];
     if (items.length) {
       return { unblock: BigInt(items[0].blockIndex) + CFG.patrolInterval, source: "mimir" };
@@ -379,7 +417,7 @@ async function fetchSweepTemplate() {
   const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:40){
     items { blockIndex object { txStatus actions { typeId raw } } } } }`;
   try {
-    const d = await gql(CFG.mimir, q, { a: CFG.avatarAddress });
+    const d = await gql(CFG.mimir, q, { a: activeAddress() });
     const items = d.data?.transactions?.items || [];
     for (const it of items) {
       const o = it.object || {};
@@ -392,9 +430,15 @@ async function fetchSweepTemplate() {
       }
     }
   } catch (e) {
-    log({ level: "warn", msg: "拉取历史 sweep 模板失败，回退内置模板", detail: String(e.message) });
+    log({ level: "warn", msg: "拉取历史 sweep 模板失败", detail: String(e.message) });
   }
-  return { raw: FALLBACK_SWEEP_RAW, source: "fallback@11749808" };
+  // 内置兜底模板是主角色 bnb 的一笔已成功交易，只对主角色有效。其它角色
+  // 若 Mimir 没返回自己的 SUCCESS sweep，绝不能套用别人的模板（buildSweepAction
+  // 会校验 avatarAddress 并抛错）—— 直接报错让 sweep 降级，领取本身不受影响。
+  if (ACTIVE.address.toLowerCase() === CFG.avatarAddress.toLowerCase()) {
+    return { raw: FALLBACK_SWEEP_RAW, source: "fallback@11749808" };
+  }
+  throw new Error("本角色无可用 sweep 模板：Mimir 未返回历史交易，且内置模板属于主角色");
 }
 
 // 复用已验证成功的 sweep action 字节：只强制改写三个字段——
@@ -420,7 +464,7 @@ function buildSweepAction(rawHex) {
     throw new Error("sweep 模板 values 结构校验失败");
   }
   // 归属校验：模板里的 avatarAddress 必须就是本角色，防止误用他人参数
-  const mine = Buffer.from(Address.fromHex(CFG.avatarAddress).toBytes());
+  const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
   const tmpl = values.get("avatarAddress");
   if (!tmpl || !Buffer.isBuffer(tmpl) || !tmpl.equals(mine)) {
     throw new Error("sweep 模板 avatarAddress 与本角色不符");
@@ -780,6 +824,59 @@ function selfTest() {
     console.log(`  sweep 最多 ${SWEEP_MAX_ATTEMPTS} 笔=首次+${SWEEP_MAX_ATTEMPTS - 1} 次重试（期望 ${expected}）  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
+  // ---- 多角色（同一 agent 下串行处理，绝不串号 / 抢 nonce）----
+  total++;
+  try {
+    const ok = AVATARS.length === 3 &&
+      new Set(AVATARS.map((a) => a.address.toLowerCase())).size === 3 &&
+      AVATARS.every((a) => /^0x[0-9a-fA-F]{40}$/.test(a.address)) &&
+      CFG.avatarAddress === AVATARS[0].address;
+    console.log(`  默认三角色配置(3 个互异合法地址) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) { console.log(`  默认三角色配置 FAIL ${e.message}`); }
+  total++;
+  try {
+    const p = parseAvatars(`a:0x${"1".repeat(40)}, b:0x${"2".repeat(40)}`);
+    const ok = p.length === 2 && p[0].label === "a" && p[1].address === `0x${"2".repeat(40)}`;
+    console.log(`  parseAvatars(名字:地址 + 逗号空白) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) { console.log(`  parseAvatars FAIL ${e.message}`); }
+  total++;
+  try {
+    const q = parseAvatars(`0x${"a".repeat(40)}`);
+    const ok = q.length === 1 && q[0].label === "avatar1";
+    console.log(`  parseAvatars(纯地址自动命名) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) { console.log(`  parseAvatars 纯地址 FAIL ${e.message}`); }
+  total++;
+  {
+    let threw = false;
+    try { parseAvatars("bad:0x1234"); } catch (_) { threw = true; }
+    console.log(`  parseAvatars(非法地址必须报错) = ${threw}  ${threw ? "OK" : "FAIL"}`);
+    if (threw) pass++;
+  }
+  total++;
+  {
+    const ok = taskKey(AVATARS[0], "daily") !== taskKey(AVATARS[1], "daily") &&
+      taskKey(AVATARS[0], "daily") !== taskKey(AVATARS[0], "patrol");
+    console.log(`  taskKey 按角色+奖励分键 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  total++;
+  try {
+    const before = activeAddress();
+    setActive(AVATARS[1]);
+    const switched = activeAddress() === AVATARS[1].address;
+    let rejected = false;
+    // 主角色 bnb 的模板绝不能被 bnbyes 套用（归属校验必须拒绝）
+    try { buildSweepAction(FALLBACK_SWEEP_RAW); } catch (_) { rejected = true; }
+    setActive(AVATARS[0]);
+    const restored = activeAddress() === before;
+    const ok = switched && rejected && restored;
+    console.log(`  setActive 切换 + 跨角色模板被拒绝(不串号) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) { setActive(AVATARS[0]); console.log(`  多角色切换 FAIL ${e.message}`); }
+
   console.log(`  self-test: ${pass}/${total} 通过`);
   process.exit(pass === total ? 0 : 1);
 }
@@ -821,7 +918,7 @@ async function watchClaim(reward, ctx, ub, snap) {
   }
   try {
     const nonce = await getNonce(ctx.signer.toString());
-    const actionValue = buildActionValue(reward, Address.fromHex(CFG.avatarAddress));
+    const actionValue = buildActionValue(reward, Address.fromHex(activeAddress()));
     const txId = await submitTx({
       account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue,
     });
@@ -861,7 +958,7 @@ async function watchClaim(reward, ctx, ub, snap) {
 async function watchMode() {
   const started = Date.now();
   const out = {
-    network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, mode: "watch",
+    network: "heimdall", avatar: activeAddress(), dryRun: DRY, mode: "watch",
     rewards: [], ok: true,
     config: {
       windowBlocks: Number(WATCH_WINDOW), pollFromBlocks: Number(POLL_FROM),
@@ -1024,8 +1121,10 @@ async function daemonMode() {
   const started = Date.now();
   const out = {
     network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, mode: "daemon",
+    avatars: AVATARS.map((a) => ({ label: a.label, address: a.address })),
     rewards: [], ok: true, transientErrors: 0,
     config: {
+      avatars: AVATARS.length,
       maxRunSeconds: MAX_RUN_MS / 1000,
       pollFromBlocks: Number(POLL_FROM), pollSeconds: POLL_SEC,
       daemonSleepCapSec: DAEMON_CAP_SEC, handledTtlMs: HANDLED_TTL_MS,
@@ -1058,115 +1157,140 @@ async function daemonMode() {
     out.signer = ctx.signer.toString();
   }
 
-  const handled = new Map();    // reward -> { unblock: bigint, at: ms }
-  const retryAfter = new Map(); // reward -> ms（提交失败冷却）
-  const results = new Map();    // reward -> 最后一次 rec
-  const cycles = new Map();     // reward -> 本 job 内领取次数
+  // 幂等锁 / 结果 / 计数全部按「角色|奖励」分键，避免三个角色互相覆盖。
+  // 三个角色共用同一 signer 与 nonce 队列，因此整轮循环严格串行 await：
+  // 每笔交易提交前都重新取 nextTxNonce，绝不并发提交。
+  const handled = new Map();     // taskKey -> { unblock, at }
+  const retryAfter = new Map();  // taskKey -> ms（提交失败冷却）
+  const results = new Map();     // taskKey -> 最后一次 rec
+  const cycles = new Map();      // taskKey -> 本 job 内领取次数
   let simTip = null;
-  const simUb = {};             // 演练用解锁块
+  const simUb = {};              // 演练用解锁块（仅主角色）
   let first = true, round = 0, handoff = "budget_exhausted";
 
   while (true) {
     if (Date.now() - started >= MAX_RUN_MS) { handoff = "budget_exhausted"; break; }
 
-    let snap;
-    if (DRY && SIM_DELTA !== null) {
-      // 演练：纯离线模拟快照，不依赖链上连通性，结果确定且快
-      snap = {
-        st: { tip: simTip ?? 1000000n, rpc: "simulated" },
-        av: { dailyReceivedIndex: null, agentAddress: null,
-              actionPoint: SIM_AP_FULL ? AP_MAX : null },
-        unblock: {}, patrolSource: "simulated",
-      };
-    } else {
-      try {
-        snap = await readWatchSnapshot();
-      } catch (e) {
-        if (DRY) {
-          out.status = "snapshot_error"; out.ok = false; handoff = "snapshot_error"; break;
+    // 离线演练只需验证决策闭环，固定只跑主角色，保持结果确定性。
+    const loopAvatars = (DRY && SIM_DELTA !== null) ? AVATARS.slice(0, 1) : AVATARS;
+    let minRem = null, waitingRefresh = 0, roundTip = null, snapOk = false;
+    let aborted = false;
+
+    for (const av of loopAvatars) {
+      setActive(av);   // 之后所有链上查询 / 模板 / 交易构造都指向这个角色
+      let snap;
+      if (DRY && SIM_DELTA !== null) {
+        snap = {
+          st: { tip: simTip ?? 1000000n, rpc: "simulated" },
+          av: { dailyReceivedIndex: null, agentAddress: null,
+                actionPoint: SIM_AP_FULL ? AP_MAX : null },
+          unblock: {}, patrolSource: "simulated",
+        };
+      } else {
+        try {
+          snap = await readWatchSnapshot();
+        } catch (e) {
+          if (DRY) {
+            out.status = "snapshot_error"; out.ok = false;
+            handoff = "snapshot_error"; aborted = true; break;
+          }
+          // 单个角色快照失败只跳过它本轮，绝不拖垮其它角色的领取
+          log({ level: "warn", msg: "快照读取失败，跳过本角色本轮",
+                avatar: av.label, detail: String(e.message) });
+          continue;
         }
-        log({ level: "warn", msg: "快照读取失败，稍后重试", detail: String(e.message) });
-        await sleepMs(Math.min(POLL_SEC, 15) * 1000);
-        continue;
       }
+      snapOk = true;
+      if (roundTip === null) {
+        roundTip = snap.st.tip;
+        out.rpc = snap.st.rpc; out.patrolSource = snap.patrolSource;
+        out.agentAddress = snap.av.agentAddress;
+      }
+
+      // 归属校验：每个角色每轮都做（三个角色同 agent，但绝不假设）
+      if (!DRY && ctx && snap.av.agentAddress &&
+          ctx.signer.toString().toLowerCase() !== snap.av.agentAddress.toLowerCase()) {
+        out.status = "aborted"; out.ok = false; handoff = "aborted";
+        out.error = `私钥与角色 ${av.label} 不匹配：已阻止提交`;
+        log({ level: "error", msg: out.error, avatar: av.label });
+        aborted = true; break;
+      }
+
+      // 演练：伪造 tip 每轮前进、解锁块在领取后跳到下一周期
+      if (DRY && SIM_DELTA !== null) {
+        if (simTip === null) {
+          simTip = snap.st.tip;
+          for (const r of REWARDS) simUb[taskKey(av, r)] = simTip + SIM_DELTA;
+        } else {
+          simTip += SIM_TIP_STEP;
+        }
+        snap.st.tip = simTip;
+        for (const r of REWARDS) snap.unblock[r] = simUb[taskKey(av, r)];
+      }
+      if (first) {
+        first = false;
+        log({ level: "info", msg: "自接力常驻启动", tip: Number(snap.st.tip),
+              avatars: AVATARS.map((a) => a.label),
+              maxRunSeconds: MAX_RUN_MS / 1000, windowBlocks: Number(WATCH_WINDOW) });
+      }
+
+      for (const r of REWARDS) {
+        const key = taskKey(av, r);
+        const ub = snap.unblock[r];
+        if (ub === null || ub === undefined) continue;   // unknown：保守跳过
+        const h = handled.get(key);
+        if (h && ub > h.unblock) {
+          handled.delete(key);                           // 链上刷新出下一周期：解锁重来
+        } else if (h) {
+          // 宽限期内等索引刷新；超过 TTL 仍未刷新则主动解锁、按链上状态复核/重提。
+          // 链上有幂等保护，重复提交最多成功一笔，其余 FAILURE 无副作用。
+          if (Date.now() - h.at > HANDLED_TTL_MS) {
+            handled.delete(key);
+            log({ level: "warn", avatar: av.label, reward: r,
+                  msg: "解锁块超过 TTL 仍未刷新，主动解锁并按链上状态复核/重提",
+                  unblockBlock: Number(ub), tip: Number(snap.st.tip) });
+          } else {
+            waitingRefresh++;
+            continue;
+          }
+        }
+        if ((retryAfter.get(key) || 0) > Date.now()) continue;
+        const rem = ub > snap.st.tip ? ub - snap.st.tip : 0n;
+        if (minRem === null || rem < minRem) minRem = rem;
+
+        if (rem <= 0n) {
+          // 串行提交：watchClaim 内部 sweep → getNonce → submit → confirm 全程 await，
+          // 与下一个角色的下一笔交易之间绝无并发，共享 nonce 队列不会撞车。
+          const { rec } = await watchClaim(r, ctx, ub, snap);
+          rec.avatar = av.label; rec.avatarAddress = av.address;
+          results.set(key, rec);
+          // 只有「领取成功」才锁定解锁块。确认未出终态 / 超时 / 失败一律不锁，
+          // 冷却后按链上状态复核重提 —— 绝不错失一个周期。
+          const settled = ["claimed", "would_claim"].includes(rec.status);
+          if (settled) {
+            handled.set(key, { unblock: ub, at: Date.now() });
+            cycles.set(key, (cycles.get(key) || 0) + 1);
+            if (DRY && SIM_DELTA !== null) simUb[key] = simTip + SIM_CYCLE_BLOCKS;
+            log({ level: "daemon", phase: "claimed", avatar: av.label, reward: r,
+                  status: rec.status, cycle: cycles.get(key),
+                  unblockBlock: Number(ub), tip: Number(snap.st.tip) });
+          } else {
+            retryAfter.set(key, Date.now() + 60000);
+            out.transientErrors++;
+            log({ level: "warn", phase: "claim_retry", avatar: av.label, reward: r,
+                  status: rec.status, msg: "提交未成功，冷却 60s 后重试" });
+          }
+        }
+      }
+      if (aborted) break;
+    }
+    if (aborted) break;
+    if (!snapOk) {
+      await sleepMs(Math.min(POLL_SEC, 15) * 1000);
+      continue;
     }
     round++;
-
-    // 归属校验：每轮都做，快照里读得到 agentAddress 就校验
-    if (!DRY && ctx && snap.av.agentAddress &&
-        ctx.signer.toString().toLowerCase() !== snap.av.agentAddress.toLowerCase()) {
-      out.status = "aborted"; out.ok = false; handoff = "aborted";
-      out.error = "私钥与角色不匹配：已阻止提交";
-      log({ level: "error", msg: out.error });
-      break;
-    }
-
-    // 演练：伪造 tip 每轮前进、解锁块在领取后跳到下一周期，快速走多周期闭环
-    if (DRY && SIM_DELTA !== null) {
-      if (simTip === null) {
-        simTip = snap.st.tip;
-        for (const r of REWARDS) simUb[r] = simTip + SIM_DELTA;
-      } else {
-        simTip += SIM_TIP_STEP;
-      }
-      snap.st.tip = simTip;
-      for (const r of REWARDS) snap.unblock[r] = simUb[r];
-    }
-    out.tip = Number(snap.st.tip);
-    out.rpc = snap.st.rpc; out.patrolSource = snap.patrolSource;
-    out.agentAddress = snap.av.agentAddress;
-    if (first) {
-      first = false;
-      log({ level: "info", msg: "自接力常驻启动", tip: out.tip,
-            maxRunSeconds: MAX_RUN_MS / 1000, windowBlocks: Number(WATCH_WINDOW) });
-    }
-
-    let minRem = null, waitingRefresh = 0;
-    for (const r of REWARDS) {
-      const ub = snap.unblock[r];
-      if (ub === null || ub === undefined) continue;  // unknown：保守跳过
-      const h = handled.get(r);
-      if (h && ub > h.unblock) {
-        handled.delete(r);                            // 链上刷新出下一周期：解锁重来
-      } else if (h) {
-        // 链上仍是「已处理过的那个解锁块」：先等索引刷新。
-        // 但超过 TTL 仍未刷新，说明此前那笔很可能没真正成功（或索引异常滞后）——
-        // 绝不无限等待错失领取：主动解锁，按链上权威状态复核，确实没领就重新提交。
-        // 链上有幂等保护，重复提交最多成功一笔，其余 FAILURE 无副作用。
-        if (Date.now() - h.at > HANDLED_TTL_MS) {
-          handled.delete(r);
-          log({ level: "warn", reward: r,
-                msg: "解锁块超过 TTL 仍未刷新，主动解锁并按链上状态复核/重提",
-                unblockBlock: Number(ub), tip: out.tip });
-        } else {
-          waitingRefresh++;
-          continue;                                 // 宽限期内：等链上刷新
-        }
-      }
-      if ((retryAfter.get(r) || 0) > Date.now()) continue;
-      const rem = ub > snap.st.tip ? ub - snap.st.tip : 0n;
-      if (minRem === null || rem < minRem) minRem = rem;
-
-      if (rem <= 0n) {
-        const { rec } = await watchClaim(r, ctx, ub, snap);
-        results.set(r, rec);
-        // 只有「领取成功」才锁定解锁块。确认未出终态 / 超时 / 失败一律不锁，
-        // 冷却后按链上状态复核重提 —— 绝不错失一个周期。
-        const settled = ["claimed", "would_claim"].includes(rec.status);
-        if (settled) {
-          handled.set(r, { unblock: ub, at: Date.now() });
-          cycles.set(r, (cycles.get(r) || 0) + 1);
-          if (DRY && SIM_DELTA !== null) simUb[r] = simTip + SIM_CYCLE_BLOCKS;
-          log({ level: "daemon", phase: "claimed", reward: r, status: rec.status,
-                cycle: cycles.get(r), unblockBlock: Number(ub), tip: out.tip });
-        } else {
-          retryAfter.set(r, Date.now() + 60000);
-          out.transientErrors++;
-          log({ level: "warn", phase: "claim_retry", reward: r, status: rec.status,
-                msg: "提交未成功，冷却 60s 后重试" });
-        }
-      }
-    }
+    out.tip = Number(roundTip);
 
     let sec, phase;
     if (minRem === null) {
@@ -1177,7 +1301,8 @@ async function daemonMode() {
       sec = planSleepSec(minRem, DAEMON_CAP_SEC);
       phase = minRem <= POLL_FROM ? "poll" : "sleep";
     }
-    log({ level: "daemon", phase, round, remaining: minRem === null ? null : Number(minRem),
+    log({ level: "daemon", phase, round, avatars: AVATARS.length,
+          remaining: minRem === null ? null : Number(minRem),
           sleepSec: sec, cycles: Object.fromEntries(cycles),
           elapsedSec: Math.round((Date.now() - started) / 1000) });
 
@@ -1193,9 +1318,20 @@ async function daemonMode() {
   out.status = out.status || handoff;
   out.handoff = handoff;
   out.rounds = round;
-  out.rewards = REWARDS.map((r) => ({
-    reward: r, typeId: TYPE_ID[r], cycles: cycles.get(r) || 0,
-    ...(results.get(r) || { status: "watching", msg: "本 job 未触及领取点" }),
+  out.rewards = [];
+  for (const av of AVATARS) {
+    for (const r of REWARDS) {
+      const key = taskKey(av, r);
+      out.rewards.push({
+        avatar: av.label, avatarAddress: av.address,
+        reward: r, typeId: TYPE_ID[r], cycles: cycles.get(key) || 0,
+        ...(results.get(key) || { status: "watching", msg: "本 job 未触及领取点" }),
+      });
+    }
+  }
+  out.avatars = AVATARS.map((a) => ({
+    label: a.label, address: a.address,
+    cycles: Object.fromEntries(REWARDS.map((r) => [r, cycles.get(taskKey(a, r)) || 0])),
   }));
   out.elapsedMs = Date.now() - started;
   out.msg = out.msg || (handoff === "budget_exhausted"
@@ -1205,13 +1341,62 @@ async function daemonMode() {
   process.exit(out.ok ? 0 : 1);
 }
 
+// ---------------- 三角色链上核对（--check-all，只读、绝不提交） ----------------
+// 供 workflow 的 dry_run 分支使用：一次性列出每个角色的解锁块、剩余块数、AP、
+// 归属，以及本轮若到期会触发哪些动作。不签名、不 stageTransaction、不接力。
+async function checkAllMode() {
+  const out = {
+    network: "heimdall", mode: "check-all", dryRun: true,
+    avatars: [], rewards: [], ok: true,
+  };
+  for (const av of AVATARS) {
+    setActive(av);
+    const rec = { label: av.label, avatar: av.address };
+    try {
+      const snap = await readWatchSnapshot();
+      rec.tip = Number(snap.st.tip);
+      rec.rpc = snap.st.rpc;
+      rec.actionPoint = snap.av.actionPoint;
+      rec.agentAddress = snap.av.agentAddress;
+      rec.patrolSource = snap.patrolSource;
+      rec.rewards = REWARDS.map((r) => {
+        const ub = snap.unblock[r];
+        const rem = ub == null ? null : Number(ub > snap.st.tip ? ub - snap.st.tip : 0n);
+        return {
+          reward: r, typeId: TYPE_ID[r],
+          unblockBlock: ub == null ? null : Number(ub),
+          blocksRemaining: rem,
+          ready: ub != null && ub <= snap.st.tip,
+          wouldSweep: r === "daily" && shouldSweep(r, snap.av.actionPoint),
+        };
+      });
+    } catch (e) {
+      rec.error = String(e.message);
+      out.ok = false;
+    }
+    out.avatars.push(rec);
+    log({ level: "info", msg: "角色链上核对", avatar: av.label,
+          actionPoint: rec.actionPoint, agentAddress: rec.agentAddress,
+          rewards: rec.rewards });
+  }
+  for (const a of out.avatars) {
+    for (const r of a.rewards || []) out.rewards.push({ avatar: a.label, ...r });
+  }
+  out.msg = out.ok
+    ? `已核对 ${AVATARS.length} 个角色，未提交任何交易`
+    : "部分角色链上读取失败，未提交任何交易";
+  console.log(JSON.stringify(out));
+  process.exit(out.ok ? 0 : 1);
+}
+
 // ---------------- 主流程 ----------------
 async function main() {
   if (args.includes("--self-test")) return selfTest();
+  if (args.includes("--check-all")) return checkAllMode();
   if (DAEMON) return daemonMode();
   if (WATCH) return watchMode();
   const started = Date.now();
-  const out = { network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, rewards: [], ok: true };
+  const out = { network: "heimdall", avatar: activeAddress(), dryRun: DRY, rewards: [], ok: true };
 
   if (!CFG.privateKey && !DRY) {
     log({ level: "error", msg: "缺少私钥：请设置环境变量 NC_PRIVATE_KEY" });
@@ -1315,7 +1500,7 @@ async function main() {
     // 提交（单笔单 action）
     try {
       const nonce = await getNonce(signer.toString());
-      const actionValue = buildActionValue(reward, Address.fromHex(CFG.avatarAddress));
+      const actionValue = buildActionValue(reward, Address.fromHex(activeAddress()));
       const txId = await submitTx({ account, pub, signer, nonce, actionValue });
       rec.txId = txId;
       log({ level: "info", reward, msg: "交易已提交", txId, nonce: Number(nonce) });

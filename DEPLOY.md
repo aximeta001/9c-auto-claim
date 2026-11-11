@@ -119,7 +119,8 @@ DEPLOY.md
 | `NC_KEYSTORE_JSON` | 用记事本/文本编辑器打开你的 `keystore.json`，**全选复制整个 JSON 文本**，粘贴进 Value |
 | `NC_KEYSTORE_PASS` | keystore 密码 |
 
-> 可选：`Variables` 标签页加 `NC_AVATAR` = 角色地址。**不填也行**，脚本里已有默认地址 `0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c`。
+> 可选：`Variables` 标签页加 `NC_AVATAR` = 主角色地址（仅用于 `import-key.mjs` 归属校验，市场扫货链按它指定单个角色）。**不填也行**。
+> 领奖链的**角色列表不来自这里**，而是 `claim.mjs` 内置的三个角色（bnb / bnbyes / tomoon，同一 agent）。如需改动另加 `NC_AVATARS`（逗号分隔的 `名字:0x地址`），留空即用默认三角色。三个角色共用同一把私钥，无需新增任何 Secrets。
 >
 > 安全说明：这两个 Secret 在日志里会被 GitHub 自动遮蔽；每次运行把加密 keystore 写成 runner 内的临时文件，解密并校验归属后生成 600 权限的 `.env`，跑完即删，runner 随后销毁。**明文私钥从不进仓库、从不进日志。**
 
@@ -165,34 +166,41 @@ DEPLOY.md
 
 1. `Actions` → 左侧 `9C 自动领奖 (Heimdall)` 的运行列表里，**点这次运行的标题**（显示提交信息和时间的那一行）
 2. 进入运行详情页 → 点中间那个 job 卡片 **`claim`**
-3. 这时看到的是步骤列表，但**每一步默认折叠成一行**；点 **`检查并领取`** 左侧的 `>` 箭头展开，才能看到命令行输出
+3. 这时看到的是步骤列表，但**每一步默认折叠成一行**；点 **`常驻值守并领取（--daemon）`** 左侧的 `>` 箭头展开，才能看到命令行输出
 4. 拉到这一步日志的底部，最后一行就是脚本输出的结构化 JSON
 
 > 也可以在运行详情页右上角 `⋯` → `Download log` / `View raw logs` 看纯文本。
 > **「状态提示成功但没看到日志」几乎都是停在第 1～2 层**：停留在运行列表页或 job 概览页，
 > 只会看到绿色对勾和几个步骤标题，不会显示命令行输出。这不是日志丢了，是没展开。
 
-**「绿色对勾」本身已经等于验证通过**：它表示全部 5 个 step 退出码为 0，反推出
+**「绿色对勾」本身已经等于验证通过**：它表示全部 step 退出码为 0，反推出
 Secrets 值正确、keystore 解密成功、派生地址与链上 agent 匹配、脚本完整跑完。
 所以就算暂时没展开日志，也可以确认配置无误。
 
-展开后最后一行类似：
+展开后最后一行类似（手动 `dry_run` 现在是 `--check-all`，逐一核对 3 个角色）：
 
 ```json
-{"ok":true,"status":"checked","dryRun":true,"tip":11736xxx,
- "rewards":[{"reward":"daily","status":"not_ready",...},
-            {"reward":"patrol","status":"not_ready",...}]}
+{"network":"heimdall","mode":"check-all","dryRun":true,"ok":true,
+ "avatars":[
+   {"label":"bnb","avatar":"0xAC9D…","actionPoint":120,
+    "rewards":[{"reward":"daily","unblockBlock":11776652,"blocksRemaining":1942,"ready":false,"wouldSweep":true},
+               {"reward":"patrol","unblockBlock":11775559,"blocksRemaining":849,"ready":false,"wouldSweep":false}]},
+   {"label":"bnbyes","avatar":"0x3614…","actionPoint":0,"rewards":[…]},
+   {"label":"tomoon","avatar":"0x897f…","actionPoint":0,"rewards":[…]}],
+ "msg":"已核对 3 个角色，未提交任何交易"}
 ```
 
 | 日志里的关键字 | 含义 |
 |---|---|
-| `ok:true` + `not_ready` | 部署成功，还没到领取时间 |
-| `would_claim` | 正好到期，但勾了 `dry_run`，**没有提交任何交易** |
-| `claimed` | 那次是真实运行且**已经领取**（取消勾选 dry_run、或定时自动运行时才会出现） |
+| `ok:true` + 列出 3 个角色 | 部署成功，三个角色的链上状态都读到了 |
+| `ready:false` | 该角色这项奖励还没到领取时间 |
+| `ready:true` | 现在可领（但 `dry_run` 不会领，也不会值守/接力） |
+| `wouldSweep:true` | 该角色日常奖励到期时，会因 AP 满先做 30 次 Sweep |
 | `ok:false` | 常见原因是 Secret 粘贴不完整（JSON 少了尾部括号）或密码不对，见下方「排错」 |
 
-> **想确认有没有真的领到，就看 `claimed` 还是 `would_claim`。** 手动运行默认勾了 `dry_run`，
-> 只检查不领取；定时任务（schedule）才是真实模式，到期会签名上链。
+> **想确认有没有真的领到，就看 `claimed`。** 手动 `dry_run` 只做只读核对、从不提交交易；
+> 取消勾选 `dry_run`（或常驻链自动运行）后，日志里出现 `"status":"claimed"` 才是已领取。
+> 旧版 `--watch` 演练里的 `would_claim` 已不再出现在手动验证输出中。
 
 **验证通过之后，你什么都不用做**：关掉页面即可。定时任务会自动运行、到期自动领取，
 手动运行只是一次性验证，不会开启或关闭任何东西。
@@ -253,7 +261,7 @@ GitHub 官方规则：仓库 60 天无任何活动，会**自动禁用** schedul
 | GitHub 上传时提示 `.github` 是隐藏文件 / 看不见、传不上去 | **正常且必然**：网页上传界面会过滤点开头的隐藏项，改电脑的显示设置也无效。**不要上传它**，改用第 2 步的 `Add file → Create new file` 在 GitHub 里直接建；建好后 `.github` 在仓库里是可见的普通文件夹 |
 | `.gitignore` 同样传不上去 | 跳过即可，不影响运行；需要的话同样用 `Create new file` 新建 |
 | `Actions` 页找不到 `Run workflow` 按钮 | 九成是 workflow 文件没进仓库、或粘了多余说明文字 → 做第 5 步的「10 秒自检」；其次确认已**点进左侧 workflow 名称**（总览页没有按钮）、文件在默认分支、Actions 未被禁用。**这步可直接跳过**，等定时任务自动跑 |
-| 运行显示绿色「成功」，但看不到日志 | 日志没丢，是**没展开**：运行列表 → 点运行标题 → 点 job `claim` → 点 `检查并领取` 左侧的 `>` 展开步骤。也可用右上角 `⋯` → `View raw logs`。绿勾本身已说明 Secrets、解密、归属校验全通过 |
+| 运行显示绿色「成功」，但看不到日志 | 日志没丢，是**没展开**：运行列表 → 点运行标题 → 点 job `claim` → 点 `常驻值守并领取（--daemon）` 左侧的 `>` 展开步骤。也可用右上角 `⋯` → `View raw logs`。绿勾本身已说明 Secrets、解密、归属校验全通过 |
 | `npm ci` 报 `package-lock.json` 缺失 | 上传时漏了 `package-lock.json`，补传 |
 | `缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets` | 第 3 步两个 Secret 没建或名字拼错 |
 | `keystore 解密失败（密码错误或非标准 V3 格式）` | 重新复制完整 JSON（确认首尾花括号都在）、核对密码；不要用聊天里被截断的文本 |

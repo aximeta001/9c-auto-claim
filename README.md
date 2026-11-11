@@ -11,6 +11,24 @@
 
 **领奖链**：自动代替你打开 App 点「Get Reward」和「Daily Reward」。链上所有东西都是交易，领取 = 用角色所属 agent 的私钥签名并提交一笔交易。本项目已在真实 Heimdall 网络上端到端验证：构造 → 签名 → `stageTransaction` → 上链确认。
 
+### 领奖链同时值守 3 个角色（2026-11-11 起）
+
+同一个 keystore / agent 下可以挂多个 avatar，它们的日常奖励与巡逻奖励互相独立。链上核实三个角色同属 agent `0x491bd35CA5F8F261a0ad33A01c74501e6Bc5bc3f`，因此**同一把私钥就能签三个角色的交易，无需新增任何 Secrets**。
+
+| 角色 | avatar 地址 | 等级 |
+|---|---|---|
+| `bnb` | `0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c` | 506 |
+| `bnbyes` | `0x3614521b77116568211b70d109A2822C15ec5044` | 424 |
+| `tomoon` | `0x897fD3F58c87F26b5C13F78656E688B2a89C6eF1` | 440 |
+
+> **为什么是「一条链串行」而不是三条并行链**：三个角色共用同一 signer，也就共用同一条 nonce 队列；三条常驻链同时提交会互抢 nonce 造成 `FAILURE`。所以 `claim.mjs --daemon` 在每一轮里依次切换角色、逐个检查并**串行提交**，每笔都重新取 `nextTxNonce`；幂等锁、结果、计数都按「角色|奖励」分键，互不覆盖。
+>
+> 角色列表默认内置在脚本里；如需改动，在仓库 `Variables` 里设 `NC_AVATARS`（逗号分隔的 `名字:0x地址`），留空即用默认三角色。注意 `.env` 中的 `NC_AVATAR` 只用于归属校验参考，不决定角色列表。
+>
+> 三个角色**都启用**「AP 满先 30 次 Sweep 消耗 120AP 再领日常」，各自从 Mimir 取自己最近一笔 `SUCCESS` 的 sweep 模板，`buildSweepAction` 会校验模板里的 `avatarAddress` 必须等于当前角色，绝不串用他人模板。
+>
+> 手动验证用 `node claim.mjs --check-all`（只读，逐一列出三个角色的解锁块 / AP / 归属，不签名、不提交）；workflow 的 `dry_run` 分支已改为调用它。
+
 > **市场扫货功能详见第七节 [「七、市场扫货：Stun Rune (Adventure) 低价自动购买」](#七市场扫货stun-rune-adventure-低价自动购买)。**
 
 > **部署看 [`DEPLOY.md`](DEPLOY.md)（全新安装）；最终架构与上线实录看 [`TRIGGER.md`](TRIGGER.md)。**
@@ -178,7 +196,11 @@ node import-key.mjs --hex <64位hex>
 node import-key.mjs --mnemonic "word1 word2 ... word12"
 # 角色不是默认地址时加： --avatar 0x你的角色地址
 
-# ---- 一次性检查（本地 / 兼容调用）----
+# ---- 三角色只读核对（workflow 的 dry_run 分支使用）----
+node claim.mjs --check-all                 # 逐一列出 3 个角色解锁块/AP/归属，绝不提交
+node claim.mjs --self-test                 # 48 项离线自测（含多角色不串号校验）
+
+# ---- 一次性 / 蹲守（兼容调用；这两种模式只处理主角色 bnb）----
 node claim.mjs --dry-run                   # 完整检查，不提交任何交易（安全）
 node claim.mjs                             # 检查并领取两种（本地含窗口早退）
 node claim.mjs --no-idle-skip               # 强制完整检查并领取

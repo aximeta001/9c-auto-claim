@@ -51,6 +51,9 @@ name: 9C 自动领奖 (Heimdall)
 #  点火：手动 Run workflow 一次（取消勾选 dry_run），或等 schedule 偶尔命中。
 #  值守：job 内 `claim.mjs --daemon` 常驻 5.5h，按链上区块休眠/轮询，
 #        谁到期就领谁，跨越多个奖励周期，领完不退出。
+#        同一条链内串行值守 3 个角色（bnb / bnbyes / tomoon）：三者同属一个
+#        agent、共用同一私钥与 nonce 队列，必须串行提交，绝不开并行链抢 nonce。
+#        角色列表默认内置在脚本里，也可用仓库 Variable `NC_AVATARS` 覆盖。
 #  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
 #        下一个常驻 job。官方文档明确 workflow_dispatch / repository_dispatch
 #        是「GITHUB_TOKEN 防递归规则」的例外，会创建新 workflow run。
@@ -70,7 +73,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: '手动验证时勾选：只做一次链上检查，不值守、不提交、不接力'
+        description: '手动验证时勾选：逐一核对 3 个角色链上状态，不值守、不提交、不接力'
         type: boolean
         default: true
       max_run_seconds:
@@ -131,6 +134,8 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           EVENT_NAME: ${{ github.event_name }}
           MAX_RUN: ${{ inputs.max_run_seconds }}
+          # 可选覆盖：逗号分隔的 "名字:0x地址"。留空即用脚本内置的三角色。
+          NC_AVATARS: ${{ vars.NC_AVATARS }}
         run: |
           set -o pipefail
           # 仅调试用：允许把常驻预算临时改短，快速验证交棒；留空则走默认 5.5h。
@@ -140,8 +145,8 @@ jobs:
             *) EXTRA="--max-run-seconds $MAX_RUN" ;;
           esac
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
-            echo "手动验证模式：只检查一次，不值守、不提交、不接力"
-            node claim.mjs --watch --dry-run 2>&1 | tee "$RUNNER_TEMP/daemon.log"
+            echo "手动验证模式：逐一核对 3 个角色链上状态，不值守、不提交、不接力"
+            node claim.mjs --check-all 2>&1 | tee "$RUNNER_TEMP/daemon.log"
           else
             # 真实常驻：守满预算，期间按链上区块自等待、到期即领、领完继续。
             # 输出 tee 到文件，供接力 step 校验是否为「正常交棒」。
