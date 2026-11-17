@@ -1,0 +1,139 @@
+name: 9C Adventure Boss 自动爬楼 (Heimdall / explore + unlock)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 自动把本季个人通关层数爬到目标层数，代替手工在游戏里一次一次点「挑战」。
+# ───────────────────────────────────────────────────────────────────────────
+#  触发：只有 workflow_dispatch —— 你下指令才跑，没有 schedule、没有常驻、
+#        没有自接力。跑到目标层数或预算用尽就退出。
+#  默认：dry_run = true（只预览、不提交、不消耗 AP / Golden Dust）。
+#        要真跑，取消勾选 dry_run。
+#
+#  目标层数：
+#    · 留空 = 按 BOSS 自动：Surtr(211000)=29，其它三个=28。
+#      依据你的实测：surtr 能到 29，hella 保底 28，其余一般 28 没问题。
+#    · 填数字 = 强制目标层数（1~30）。例如 hella 想冲 29 就填 29。
+#
+#  门票铁律：需要解锁楼层时提交 unlock_floor，脚本强制 u=false = Golden Dust，
+#            绝不用 NCG。你要求「只要下指令爬楼，门票一律 Golden Dust」。
+#
+#  执行策略：
+#    · 一笔 explore 会从 Floor+1 自动连爬到 MaxFloor；同一层随机种子不同，
+#      这次打不过下次可能过，所以按「提交→等链上终态→重读个人 floor→
+#      没到目标再来一笔」循环，直到 floor >= 目标。
+#    · 个人 floor/maxFloor/bossId 读 Heimdall stateQuery.adventureBossSeasonStatus，
+#      是节点上的权威 Explorer 状态，不看 9CAPI 展示值、不依赖交易索引。
+#    · floor==maxFloor 且未达标时先 unlock_floor（Golden Dust）解锁下一批 5 层。
+#    · 只认链上终态：SUCCESS/FAILURE/INVALID，伪 INVALID 不算；非 SUCCESS 立即停。
+#    · max_attempts 限制最多提交多少笔，防无限重试烧 AP。
+#
+#  成本：explore 每层消耗 explore_ap(=2) 瓶 AP 药水；解锁用 Golden Dust(600201)。
+#        AP 不足 / Golden Dust 不足时链上 FAILURE，脚本停下并说明原因。
+#
+#  私钥：与其余链共用 keystore Secrets；仅在 runner 内临时解密，job 结束即销毁。
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '默认勾选：只预览、不提交、不消耗 AP / Golden Dust。要真跑请取消勾选'
+        type: boolean
+        default: true
+      floor:
+        description: '目标层数（留空=按BOSS自动 Surtr29/其它28；填数字=强制，1~30）'
+        type: string
+        default: ''
+      max_attempts:
+        description: '最多提交多少笔 explore（防无限重试烧 AP，默认 15）'
+        type: string
+        default: '15'
+      no_unlock:
+        description: '默认关闭：勾选后禁止提交 unlock_floor（只爬当前已解锁的层）'
+        type: boolean
+        default: false
+      season:
+        description: '可选：手工指定赛季号（留空=自动从链上解析）'
+        type: string
+        default: ''
+      gap_ms:
+        description: '两笔之间间隔毫秒（留空=3000）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 9c-boss-explore         # 独立组：不与 sweep / claim / market 共用
+  cancel-in-progress: false
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 纯逻辑自测（不联网）
+        run: node explore-boss.mjs --self-test
+
+      - name: 自动爬楼（explore + unlock，门票 Golden Dust）
+        env:
+          DRY: ${{ inputs.dry_run }}
+          FLOOR: ${{ inputs.floor }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          NO_UNLOCK: ${{ inputs.no_unlock }}
+          SEASON: ${{ inputs.season }}
+          GAP_MS: ${{ inputs.gap_ms }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          if [ "$DRY" = "true" ]; then EXTRA="$EXTRA --dry-run"; fi
+          case "$FLOOR" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --floor $FLOOR" ;;
+          esac
+          case "$MAX_ATTEMPTS" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --max-attempts $MAX_ATTEMPTS" ;;
+          esac
+          if [ "$NO_UNLOCK" = "true" ]; then EXTRA="$EXTRA --no-unlock"; fi
+          case "$SEASON" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --season $SEASON" ;;
+          esac
+          case "$GAP_MS" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --gap-ms $GAP_MS" ;;
+          esac
+          echo "运行参数:$EXTRA"
+          node explore-boss.mjs $EXTRA 2>&1 | tee "$RUNNER_TEMP/explore.log"
+          exit ${PIPESTATUS[0]}
