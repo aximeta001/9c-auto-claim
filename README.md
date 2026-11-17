@@ -5,7 +5,7 @@
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（精确强化+3、≤2 NCG/件、封顶 500 NCG） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG） | 自接力常驻 |
 | **AB Sweep 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
 | **AB 爬楼链** | **`explore-boss.yml`** | **`explore-boss.mjs`** | Adventure Boss 自动挑战爬楼到目标层（门票全程 Golden Dust） | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
@@ -177,7 +177,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 文件 | 作用 |
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + 精确强化+3 + ≤2 NCG/件 + 500 NCG 封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
 | `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
 | `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
@@ -339,7 +339,7 @@ tail -f claim.log
 
 1. **Stun Rune (Adventure)**：单价 ≤ 0.2 NCG/件就整单买下；绝不能和相似的
    **Stun Rune (Arena)** 或名字近似物品搞混（7.1–7.6）。
-2. **Valkyrie 五部位装备**：强化等级精确 ==3、单价 ≤2 NCG、全部元素变体，本次运行累计
+2. **Valkyrie 五部位装备**：强化等级 ≥3、单价 ≤2 NCG、全部元素变体，本次运行累计
    封顶 500 NCG（7.7）。
 
 ### 7.1 为什么不会搞错（用 id，不用名字）
@@ -449,12 +449,12 @@ node market-buy.mjs --daemon --dry-run --simulate-listings-file sim.json  # 注�
 ### 7.7 Valkyrie 五部位装备扫货（新增）
 
 **目标**：Valkyrie Sword / Armor / Necklace / Belt / Ring 五部位，**同时满足**：
-- 强化等级 **`level === 3`（精确 +3）**：只买强化恰好 +3 的，+4/+5/…/+28 等更高等级一律过滤掉（链上装备的 `level` 字段，不是 item grade；可用 `--valk-level` 覆盖）；
+- 强化等级 `level >= 3`（链上装备的 `level` 字段，不是 item grade；**同价位下强化越高越划算，+4/+5 等高等级一律照常纳入，不过滤**）；
 - 单价 `price <= 2 NCG`（装备按件卖，`price` 即单价整数 NCG）；
 - 全部 5 种元素变体（Normal / Fire / Water / Land / Wind）都纳入；
 - **本次运行累计买够 500 NCG 就停止买装备**（接力后额度重置，符文扫货不受此预算约束）。
 
-> **为什么仍保留 `order=level_desc` 抓取排序**：9CAPI 市场接口**不支持服务端按强化等级过滤**（实测 `level` / `minLevel` / `enhancement` 等参数均被忽略），只能在脚本本地筛。本地只能筛「拉到的」数据，因此用 `level_desc` 把高强化装备排到前面、配合 500 条拉取量确保 +3 挂单被拉到，再由本地 `level===3` 精确锁定——两者配合才既不漏买、又不买错等级。仅靠排序或仅靠本地过滤都不稳。
+> **为什么用 `order=level_desc` 抓取排序**：9CAPI 市场接口**不支持服务端按强化等级过滤**（实测 `level` / `minLevel` / `enhancement` 等参数均被忽略），只能在脚本本地筛。本地只能筛「拉到的」数据，因此用 `level_desc` 把高强化装备排到最前、配合 500 条拉取量确保 ≥3 级挂单被拉到，再由本地 `level>=3` 设门槛。**同价位下强化越高性价比越好，高等级一律纳入**——排序把高等级排前面，也利于优先买入。
 
 **身份判定（用 id，不用名字）**：从 `EquipmentItemSheet` 拿权威 itemId 段位，逐条精确匹配：
 
