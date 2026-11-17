@@ -1,15 +1,38 @@
-# 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货 + 无限塔冲塔
+# 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货 + 无限塔冲塔 + AB 爬楼
 
-本仓库含**两条相互独立的纯 GitHub 自接力链**、**一条纯手工触发的 AB 链**，外加**一条无限塔新赛季冲塔链**：
+本仓库含**两条相互独立的纯 GitHub 自接力链**、**两条纯手工触发的 AB 链**，外加**一条无限塔新赛季冲塔链**：
 
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
 | **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG） | 自接力常驻 |
-| **AB 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
+| **AB Sweep 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
+| **AB 爬楼链** | **`explore-boss.yml`** | **`explore-boss.mjs`** | Adventure Boss 自动挑战爬楼到目标层（门票全程 Golden Dust） | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
 
-各链有独立 `concurrency` 组、共用同一 keystore Secrets，互不干扰。AB 链不常驻、不定时、不自动触发。无限塔链采用与领奖链相同的自接力常驻架构（详见下节），**不依赖不稳的 schedule cron 抢首层**。
+各链有独立 `concurrency` 组、共用同一 keystore Secrets，互不干扰。AB 两条链都不常驻、不定时、不自动触发。无限塔链采用与领奖链相同的自接力常驻架构（详见下节），**不依赖不稳的 schedule cron 抢首层**。
+
+### AB 爬楼链：自动挑战到目标层（2026-11-17 起）
+
+在游戏里一层一层点「挑战」很慢、网络又卡，这条链替你自动爬楼。只手工触发，跑到目标层或预算用尽就退出。
+
+**目标层数**：默认按 BOSS 自动 —— Surtr(211000)=29 层，其余三个（含 Hella）=28 层（依据实测：surtr 能到 29，hella 保底 28）；dispatch 时填 `floor` 可强制指定（1~30）。
+
+**关键机制（Lib9c 源码 + 链上真实交易确认）**：
+
+| 点 | 说明 |
+|---|---|
+| explore 自动连爬 | `explore_adventure_boss` 没有楼层字段，一笔从 `Floor+1` 自动连爬到 `MaxFloor`；打不动就停在上一层，但**交易仍是 SUCCESS**——所以判定真通关必须重读链上个人 `floor`，不能只看终态 |
+| 失败重试 | 同一层随机种子不同，这次不过下次可能过；脚本「提交→等终态→重读 floor→没到目标再来一笔」循环，直到 `floor >= 目标`（正是 hella 25 层要试两三次、28 层要多试几次） |
+| 门票全程 Golden Dust | 需要解锁时提交 `unlock_floor`，`buildUnlockAction` **强制 `u=false` = GoldenDust(600201)，绝不用 NCG**；即使模板来自曾用 NCG 的历史交易也会被改正 |
+| 解锁时机 | `floor == maxFloor` 且未达标时解锁下一批 5 层（门票点 6/11/16/21/26 层），上限 30 层；前提是当前解锁的层已全部通关 |
+| 权威状态 | 个人 `floor/maxFloor/bossId` 读 Heimdall `stateQuery.adventureBossSeasonStatus`，是节点上的 Explorer 状态，不看 9CAPI 展示值、不依赖交易索引 |
+| 只认链上终态 | SUCCESS/FAILURE/INVALID，伪 INVALID 不算；非 SUCCESS 立即停并说明原因 |
+| 预算保护 | `--max-attempts`（默认 15）限制最多提交笔数，防无限重试烧 AP |
+
+**成本**：explore 每层消耗 2 瓶 AP 药水；解锁用 Golden Dust。AP / Golden Dust 不足时链上 FAILURE，脚本停下说明原因。
+
+**用法**：dispatch `explore-boss.yml` → 真跑取消勾选 `dry_run`；`floor` 留空自动、填数字强制；`max_attempts` 控制预算；`no_unlock` 可禁止解锁（只爬已解锁层）。默认 `dry_run=true`，绝不误触发。
 
 ### 无限塔链：新赛季自动冲第 1 层（2026-11-17 起）
 
