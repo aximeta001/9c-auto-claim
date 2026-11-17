@@ -1,0 +1,162 @@
+name: 9C 无限塔 下一赛季自动冲塔 (Heimdall)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 盯《无限塔》新赛季（默认第 11 期），一旦链上排期上线，立刻自动提交一笔
+# infinite_tower_battle 打第 1 层 —— 个人补票时钟锚定在「首次进塔」那一笔，
+# 越早打第 1 层越早开始计时。
+#
+# 【为什么不用 schedule 当主力】GitHub 的 schedule cron 在高负载时会延迟数十分钟
+#   甚至整点丢弃，抢首层完全靠不住。本 workflow 复用领奖链已验证的高可用架构：
+#
+#   主力：job 内 infinite-tower.mjs --watch 长驻，进程内每 20 秒轮询链上一次，
+#         赛季一排期上链，最多 20 秒内命中并提交（不等下一条 cron）。
+#   接力：单个 job 守满预算（默认 5.5h < 6h 上限）后打印
+#         {"handoff":"budget_exhausted"}，本文件末尾的接力 step 用
+#         workflow_dispatch REST API 即时刻下一个 job，concurrency 组保证串行无缝。
+#   停止：冲塔成功 / 交易定论后打印 {"done":...} / 非交棒结果，接力 step 不接力，
+#         赛季内不再空转浪费 runner 额度。
+#   保险：schedule 每 10 分钟只作「接力链意外断裂时重新点火」，链正常时根本用不到。
+#
+#  判定（脚本内只读链上权威状态，全部满足才提交）：
+#    · infiniteTowerId >= 11 且 isActive 且 clearedFloor < 1 且 remainingTickets >= 1
+#    · 第 1 层通关后永久幂等跳过；交易只认 SUCCESS/FAILURE/INVALID 终态，跨节点复核。
+#  前置：新赛季排期由官方 patch 注入链上 —— 未上线前脚本只轮询等待，不乱提交。
+#
+#  私钥：与领奖/扫货/AB 三条链共用同一份 keystore Secrets，仅在 runner 内临时解密，
+#        job 结束即销毁。单笔交易，无 AP 消耗、无 NCG/材料花费（新赛季首笔送 1 票）。
+#  通知：全程静默，不推送任何通知，结果只在 Actions 日志里。
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    # 仅「断链重燃」保险：即使被 GitHub 延迟/丢弃也不影响主力接力链。
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '默认勾选：只轮询不提交（手工验证用）。要真跑请取消勾选'
+        type: boolean
+        default: true
+      season:
+        description: '目标赛季号（默认 11；留空用默认）'
+        type: string
+        default: '11'
+      max_watch_seconds:
+        description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
+
+concurrency:
+  group: 9c-infinite-tower        # 独立组：不与 claim/market/boss-sweep 共用
+  cancel-in-progress: false       # 接力的新 run 排队，当前 job 一结束就无缝接上，永不并发
+
+jobs:
+  tower:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360           # > 5.5h 蹲守预算，留足交棒余量（< GitHub 单 job 上限 6h）
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 纯逻辑自测（不联网）
+        run: node infinite-tower.mjs --self-test
+
+      - name: 蹲守新赛季并冲第 1 层（进程内高频轮询）
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+          SEASON: ${{ inputs.season }}
+          WATCH_SEC: ${{ inputs.max_watch_seconds }}
+        run: |
+          set -o pipefail
+          # 主力真跑：--watch 常驻高频轮询。schedule 触发或手工取消 dry_run 勾选 = 真跑。
+          EXTRA="--watch --gap-ms 20000"
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
+            EXTRA="$EXTRA --dry-run"
+          fi
+          case "$SEASON" in
+            ''|*[!0-9]*) EXTRA="$EXTRA --season 11" ;;
+            *) EXTRA="$EXTRA --season $SEASON" ;;
+          esac
+          case "$WATCH_SEC" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --max-watch-seconds $WATCH_SEC" ;;
+          esac
+          echo "运行参数: $EXTRA"
+          node infinite-tower.mjs $EXTRA 2>&1 | tee "$RUNNER_TEMP/infinite-tower.log"
+          exit ${PIPESTATUS[0]}
+
+      - name: 接力（预算耗尽时触发下一个蹲守 job）
+        if: always()
+        env:
+          # 未配置 PAT 时用内置 GITHUB_TOKEN（零配置即可跑）；
+          # 若自接力被平台限制，可加 Secret NC_DISPATCH_TOKEN 兜底。
+          DISPATCH_TOKEN: ${{ secrets.NC_DISPATCH_TOKEN || github.token }}
+          RELAY_REPO: ${{ github.repository }}
+          RELAY_REF: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SEASON: ${{ inputs.season }}
+        run: |
+          # 只在「预算耗尽、正常交棒」时接力。演练、冲塔成功、异常中止绝不接力，
+          # 避免高频空转刷爆 run 次数；断链时由 schedule 重燃。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动演练模式：不接力"; exit 0
+          fi
+          LOG="$RUNNER_TEMP/infinite-tower.log"
+          if ! grep -q '"handoff":"budget_exhausted"' "$LOG" 2>/dev/null; then
+            echo "未检测到正常交棒标记（可能已冲塔成功/定论/异常），不接力"; exit 0
+          fi
+          echo "检测到正常交棒，发起接力…"
+          SEASON_IN="${SEASON:-11}"
+          case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="11" ;; esac
+          CODE=""
+          for i in 1 2 3; do
+            CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\"}}" \
+              "https://api.github.com/repos/$RELAY_REPO/actions/workflows/infinite-tower.yml/dispatches") || CODE="000"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
+            echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"
+            sleep 5
+          done
+          echo "接力 dispatch HTTP=$CODE"
+          if [ "$CODE" != "204" ] && [ "$CODE" != "200" ]; then
+            echo "::warning::接力失败 HTTP=$CODE，链将依赖 schedule 重燃"
+            head -c 300 "$RUNNER_TEMP/relay_resp.txt" 2>/dev/null || true
+          fi
+          # 接力失败不算 job 失败：蹲守工作已正常完成一轮。
+          exit 0
