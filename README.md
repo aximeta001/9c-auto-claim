@@ -5,7 +5,7 @@
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 监控并自动低价购买 **Stun Rune (Adventure)**（单价 ≤ 0.2 NCG/件） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG） | 自接力常驻 |
 | **AB 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
 
@@ -154,7 +154,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 文件 | 作用 |
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)、单价判定、`buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
 | `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
 | `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
@@ -309,11 +309,15 @@ tail -f claim.log
 
 ---
 
-## 七、市场扫货：Stun Rune (Adventure) 低价自动购买
+## 七、市场扫货：Stun Rune (Adventure) + Valkyrie 装备 低价自动购买
 
-独立的一条自接力链（`market.yml` + `market-buy.mjs`），与领奖链完全隔离。
-需求：**监控市场里 Stun Rune (Adventure) 的单价，出现 ≤ 0.2 NCG/件 就整单买下**；
-绝不能和相似的 **Stun Rune (Arena)** 或名字近似物品搞混。
+独立的一条自接力链（`market.yml` + `market-buy.mjs`），与领奖链完全隔离。两个目标共用
+同一条链、同一次扫描、同一私钥：
+
+1. **Stun Rune (Adventure)**：单价 ≤ 0.2 NCG/件就整单买下；绝不能和相似的
+   **Stun Rune (Arena)** 或名字近似物品搞混（7.1–7.6）。
+2. **Valkyrie 五部位装备**：强化等级 ≥3、单价 ≤2 NCG、全部元素变体，本次运行累计
+   封顶 500 NCG（7.7）。
 
 ### 7.1 为什么不会搞错（用 id，不用名字）
 
@@ -388,7 +392,7 @@ values = {
 ### 7.5 命令速查与参数
 
 ```
-node market-buy.mjs --self-test                  # 离线自测（35/35，含字节级比对，不联网）
+node market-buy.mjs --self-test                  # 离线自测（60/60，含 FAV/NonFungible 字节级比对，不联网）
 node market-buy.mjs --dry-run                   # 联网只读扫描一轮，绝不提交
 node market-buy.mjs                            # 真实扫描并购买命中的便宜单
 node market-buy.mjs --daemon                   # 自接力常驻 5.5h（线上 workflow 用这个）
@@ -418,3 +422,56 @@ node market-buy.mjs --daemon --dry-run --simulate-listings-file sim.json  # 注�
   勾选则只扫描一轮验证、不提交、不接力。
 - 观察到便宜单时日志依次为 `已提交 buy_product3（N 单）` → `购买成功（N 单）`；
   未命中时每轮只有 `rawCount / candidateCount=0` 的 daemon 心跳。
+
+### 7.7 Valkyrie 五部位装备扫货（新增）
+
+**目标**：Valkyrie Sword / Armor / Necklace / Belt / Ring 五部位，**同时满足**：
+- 强化等级 `level >= 3`（链上装备的 `level` 字段，不是 item grade）；
+- 单价 `price <= 2 NCG`（装备按件卖，`price` 即单价整数 NCG）；
+- 全部 5 种元素变体（Normal / Fire / Water / Land / Wind）都纳入；
+- **本次运行累计买够 500 NCG 就停止买装备**（接力后额度重置，符文扫货不受此预算约束）。
+
+**身份判定（用 id，不用名字）**：从 `EquipmentItemSheet` 拿权威 itemId 段位，逐条精确匹配：
+
+| 部位 | itemId 段位 | 链上 itemSubType |
+|---|---|---|
+| Valkyrie Sword | `1017xxxx` | `Weapon` |
+| Valkyrie Armor | `1027xxxx` | `Armor` |
+| Valkyrie Belt | `1037xxxx` | `Belt` |
+| Valkyrie Necklace | `1047xxxx` | `Necklace` |
+| Valkyrie Ring | `1057xxxx` | `Ring` |
+
+名字里带 `Valkyrie` 的其它装备（如 5 级 `Valkyrie's Sword` = `10155000`）段位不符，**一律排除**。
+
+**数据源**：9CAPI 物品接口 `/marketProviderHeimdall/Market/products/items/{subType}?order=cp_desc`，
+Valkyrie 是高 CP 装备，`cp_desc` 让它们排在最前（默认每部位拉 500 条本地筛）。接口返回的
+`itemId / level / price / productId / tradableId / seller*` 就是判定与构造所需的全部字段。
+某部位请求失败不影响其它部位；Mimir 挂单索引不作放行前置，延续「只认链上、失败无所谓」。
+
+**购买 action（NonFungible 版 `buy_product3`）**：与 FAV 版同骨架，仅 `p[0]` 从 5 字段变 8 字段
+（末尾多 `itemSubType` 字符串 + `tradableId` 16B）：
+
+```
+p[0] = [ productId(16B), [NCG currency, price×100], sellerAgent(20B), sellerAvatar(20B),
+         "NonFungible", false, itemSubType("Weapon"...), tradableId(16B) ]
+```
+
+模板来自 9CAPI `mobileBuyHeimdall` 的合法返回，已验证与 FAV 版 NCG currency dict 编码一致、
+自测中 **NonFungible action 模板逐字节复现（262B）**、FAV action 逐字节不变（240B）。
+
+**新参数**（都有默认值，通常无需改）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--valk-max-price-ncg N` | `2` | 装备单价上限 NCG |
+| `--valk-spend-cap-ncg N` | `500` | 装备总花费封顶 NCG（本次运行累计） |
+| `--valk-min-level N` | `3` | 最低强化等级 |
+| `--valk-listing-limit N` | `500` | 每部位拉取多少条高 CP 挂单本地筛 |
+| `--valk-fetch-timeout-ms N` | `25000` | 单部位单次请求超时 |
+| `--valk-fetch-retries N` | `3` | 每部位最多重试次数 |
+| `--valk-fetch-budget-seconds N` | `150` | 5 部位抓取总预算，超时后剩余部位留空、不拖垮一轮 |
+| `--no-valkyrie` | 关闭 | 临时只跑符文扫货 |
+
+**演练**：`--simulate-listings-file sim.json` 现支持 `{ "fav":[...], "valkyrie":{ "Sword":[...], ... } }`
+结构，离线验证筛选 / 排序 / 预算，不提交任何交易。自测已扩到 **60/60**（含装备段位、
+等级/单价边界、元素变体、NonFungible 字节级比对、预算封顶）。
