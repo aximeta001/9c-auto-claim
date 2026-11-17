@@ -24,8 +24,10 @@
  *   - 全部元素变体（Normal/Fire/Water/Land/Wind）
  *   - 强化等级 level >= 3（链上装备 level 字段，非 item grade）
  *   - 单价 <= 2 NCG/件（装备按件卖，price 即单价 NCG 整数）
- *   - 用 9CAPI /Market/products/items/{subType}?order=cp_desc 拉高 CP 装备挂单，
+ *   - 用 9CAPI /Market/products/items/{subType}?order=level_desc 拉「强化等级降序」挂单，
  *     本地按 itemId 段位精确筛出 Valkyrie，绝不按名字模糊匹配。
+ *     【2026-11-17 修复】原用 cp_desc（战力降序），把强化>=3 的低价装备挤到 500 条之外
+ *     导致 2NCG 的 lv3 装备全部漏买；改用 level_desc 后 lv3 排最前，命中正常。
  *   - 购买用 buy_product3 的 NonFungible 版（p[0] 8 字段，多 itemSubType/tradableId）。
  *   - 总花费封顶 500 NCG（本次运行累计，买够即停并正常交棒）。
  *
@@ -141,8 +143,11 @@ const VALK_MIN_LEVEL = Math.max(0, Math.trunc(numArg("--valk-min-level", 3)));
 const VALK_MAX_PRICE_NCG = Math.max(0, Math.trunc(numArg("--valk-max-price-ncg", 2)));
 // 总花费封顶（本次运行累计 NCG）：买够即停止提交新单并正常交棒，接力后重置。
 const VALK_SPEND_CAP_NCG = Math.max(0, numArg("--valk-spend-cap-ncg", 500));
-// 每个部位拉取多少条高 CP 挂单本地筛选（Valkyrie 是高 CP 装，cp_desc 让它们排前面）
+// 每个部位拉取多少条挂单本地筛选（level_desc 让高强化装备排最前，500 足以覆盖所有 lv>=3）
 const VALK_LISTING_LIMIT = Math.max(50, Math.trunc(numArg("--valk-listing-limit", 500)));
+// 抓取排序：必须 level_desc（强化等级降序）。9CAPI 也支持 cp_desc/price_asc，
+// 但只有 level_desc 能把强化>=3 的低价装备排到前面；可用参数覆盖以便排查。
+const VALK_ORDER = strArg("--valk-order", "level_desc");
 // 抓取健壮性：单请求超时 / 每部位重试次数 / 全部位总预算（秒）。防止某部位无限重试拖垮一轮。
 const VALK_FETCH_TIMEOUT_MS = Math.max(5000, Math.trunc(numArg("--valk-fetch-timeout-ms", 25000)));
 const VALK_FETCH_RETRIES = Math.max(1, Math.min(6, Math.trunc(numArg("--valk-fetch-retries", 3))));
@@ -381,8 +386,9 @@ async function fetchListings() {
 }
 
 // Valkyrie 挂单来源：9CAPI 物品接口，按部位 subType 分类拉取。
-// GET /marketProviderHeimdall/Market/products/items/{subType}?limit=N&offset=0&order=cp_desc
-// Valkyrie 是高 CP 装备，用 cp_desc 让它们排在最前，limit=500 足够覆盖。
+// GET /marketProviderHeimdall/Market/products/items/{subType}?limit=N&offset=0&order=level_desc
+// 用 level_desc（强化等级降序）让高强化装备排最前——2026-11-17 修复：
+// 原 cp_desc（战力降序）会把强化>=3 的廉价装备挤到 500 条之外，导致 2NCG 的 lv3 漏买。
 // 返回 { byPart: { [key]: [...] }, rawCount, errors }。单部位失败不影响其它部位。
 async function fetchValkyrieListings() {
   const byPart = {};
@@ -396,7 +402,7 @@ async function fetchValkyrieListings() {
       continue;
     }
     const url = `${CFG.api9c}/marketProviderHeimdall/Market/products/items/${part.subType}` +
-      `?limit=${VALK_LISTING_LIMIT}&offset=0&order=cp_desc`;
+      `?limit=${VALK_LISTING_LIMIT}&offset=0&order=${encodeURIComponent(VALK_ORDER)}`;
     let arr = null;
     const partDeadline = Math.min(deadline, Date.now() + VALK_FETCH_TIMEOUT_MS * VALK_FETCH_RETRIES);
     for (let attempt = 0; attempt < VALK_FETCH_RETRIES && !arr && Date.now() < partDeadline; attempt++) {
@@ -1007,6 +1013,7 @@ function selfTest() {
 
   // 8) Valkyrie 候选筛选：按部位 + 单价升序
   {
+    chk("Valk 抓取排序默认 level_desc(防漏买强化装)", VALK_ORDER === "level_desc", `got ${VALK_ORDER}`);
     const mk = (itemId, level, price) => ({ itemId, level, price, itemSubType: 6,
       productId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", tradableId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       sellerAgentAddress: "0x" + "11".repeat(20), sellerAvatarAddress: "0x" + "22".repeat(20) });
