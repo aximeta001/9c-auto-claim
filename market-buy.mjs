@@ -22,7 +22,7 @@
  * 【第二条扫货目标：Valkyrie 装备】与 FAV 符文共用同一条链、同一次扫描：
  *   - 部位：Valkyrie Sword/Armor/Necklace/Belt/Ring（itemId 段 1017/1027/1047/1037/1057）
  *   - 全部元素变体（Normal/Fire/Water/Land/Wind）
- *   - 强化等级 level === 3（精确强化 +3；+4/+5 等更高等级和其它等级全部过滤掉）
+ *   - 强化等级 level >= 3（链上装备 level 字段，非 item grade；同价位下高等级更划算，一律纳入）
  *   - 单价 <= 2 NCG/件（装备按件卖，price 即单价 NCG 整数）
  *   - 用 9CAPI /Market/products/items/{subType}?order=level_desc 拉「强化等级降序」挂单，
  *     本地按 itemId 段位精确筛出 Valkyrie，绝不按名字模糊匹配。
@@ -138,10 +138,10 @@ const VALKYRIE_PARTS = [
   { key: "Necklace", subType: 9,  re: /^1047\d{4}$/, itemSubType: "Necklace" },
   { key: "Ring",     subType: 10, re: /^1057\d{4}$/, itemSubType: "Ring" },
 ];
-// Valkyrie 精确强化等级：只买 level 恰好等于此值的装备（默认 +3）。
-// 与旧的 minLevel 不同，这里用严格相等：+4/+5/.../+28 等更高等级一律过滤掉。
-// 兼容旧参数 --valk-min-level（作为别名），但新参数 --valk-level 优先。
-const VALK_LEVEL = Math.max(0, Math.trunc(numArg("--valk-level", numArg("--valk-min-level", 3))));
+// Valkyrie 最低强化等级门槛：level >= 3 即纳入。同价位下强化越高越划算，故不过滤高等级。
+// 9CAPI 不支持服务端按等级过滤，靠 order=level_desc 把高强化装备排前面确保拉到，再本地筛 level>=门槛。
+// --valk-level 为 --valk-min-level 的别名（保留兼容），默认 3。
+const VALK_MIN_LEVEL = Math.max(0, Math.trunc(numArg("--valk-min-level", numArg("--valk-level", 3))));
 // 装备按件卖：API price 是整数 NCG（即单价）；<= 上限即命中。用整数比较，无浮点。
 const VALK_MAX_PRICE_NCG = Math.max(0, Math.trunc(numArg("--valk-max-price-ncg", 2)));
 // 总花费封顶（本次运行累计 NCG）：买够即停止提交新单并正常交棒，接力后重置。
@@ -289,14 +289,14 @@ function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR) {
 }
 
 // ---------------- Valkyrie 装备：身份判定 / 候选筛选 / action 构造 ----------------
-// 判定单条装备挂单是否为「目标 Valkyrie」：itemId 命中部位段位 + level 精确等于目标 +
+// 判定单条装备挂单是否为「目标 Valkyrie」：itemId 命中部位段位 + level>=门槛 +
 // 单价<=上限 + 关键字段齐全。全部走 itemId 段位（不是名字），杜绝近似装备。
 function isValkyrieListing(p, part, opts = {}) {
   if (!p || typeof p !== "object") return false;
-  const level = opts.level ?? VALK_LEVEL;
+  const minLevel = opts.minLevel ?? VALK_MIN_LEVEL;
   const maxPrice = opts.maxPrice ?? VALK_MAX_PRICE_NCG;
   if (!part.re.test(String(p.itemId))) return false;                 // 部位段位精确
-  if (!Number.isInteger(p.level) || p.level !== level) return false; // 强化等级精确等于目标（严格相等，过滤掉 +4/+5...）
+  if (!Number.isInteger(p.level) || p.level < minLevel) return false; // 强化等级 >= 门槛（高等级照常纳入）
   if (!Number.isInteger(p.price) || p.price < 0 || p.price > maxPrice) return false; // 单价 NCG
   if (p.exist === false || p.legacy === true) return false;          // 已下架/旧版
   // 购买所需关键字段必须齐全
@@ -736,7 +736,7 @@ async function daemonMode() {
     ticker: TARGET_TICKER, maxUnitPriceNcg: Number(UNIT_PRICE_MINOR) / 100,
     ok: true, rounds: 0, totals: { candidates: 0, bought: 0, tx: 0 }, transientErrors: 0,
     valkyrie: {
-      enabled: ENABLE_VALKYRIE, level: VALK_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
+      enabled: ENABLE_VALKYRIE, minLevel: VALK_MIN_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
       spendCapNcg: VALK_SPEND_CAP_NCG, spentNcg: 0, capReached: false,
     },
     config: {
@@ -786,7 +786,7 @@ async function daemonMode() {
       first = false;
       log({ level: "info", msg: "市场扫货常驻启动", tip,
             ticker: TARGET_TICKER, maxUnitPriceNcg: Number(UNIT_PRICE_MINOR) / 100,
-            valkyrie: ENABLE_VALKYRIE ? `5部位/lv===${VALK_LEVEL}/<=${VALK_MAX_PRICE_NCG}NCG/封顶${VALK_SPEND_CAP_NCG}NCG` : "关闭",
+            valkyrie: ENABLE_VALKYRIE ? `5部位/lv>=${VALK_MIN_LEVEL}/<=${VALK_MAX_PRICE_NCG}NCG/封顶${VALK_SPEND_CAP_NCG}NCG` : "关闭",
             pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000 });
     }
     try {
@@ -878,7 +878,7 @@ async function onceMode() {
   out.txSubmitted = r.txSubmitted; out.txLog = r.txLog || [];
   out.ncgBalanceNcg = r.ncgBalanceNcg ?? null;
   out.valkyrie = {
-    enabled: ENABLE_VALKYRIE, level: VALK_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
+    enabled: ENABLE_VALKYRIE, minLevel: VALK_MIN_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
     spendCapNcg: VALK_SPEND_CAP_NCG, candidates: r.valkCandidates || [],
     rawCount: r.valkRawCount ?? null, fetchErrors: r.valkFetchErrors || [],
   };
@@ -1000,10 +1000,10 @@ function selfTest() {
     chk("Valk Sword 5元素变体全命中", ["10170000","10171000","10172000","10173000","10174000"]
       .every((id) => isValkyrieListing(good({ itemId: id }), sword)));
     chk("Valk lv2 拒绝", !isValkyrieListing(good({ level: 2 }), sword));
-    // 精确 +3：更高等级（+4/+5/+28）也必须全部拒绝
-    chk("Valk lv4 拒绝(精确+3)", !isValkyrieListing(good({ level: 4 }), sword));
-    chk("Valk lv5 拒绝(精确+3)", !isValkyrieListing(good({ level: 5 }), sword));
-    chk("Valk lv28 拒绝(精确+3)", !isValkyrieListing(good({ level: 28 }), sword));
+    // 等级>=3 门槛：更高等级（+4/+5/+28）同价位更划算，必须照常纳入
+    chk("Valk lv4 命中(高等级纳入)", isValkyrieListing(good({ level: 4 }), sword));
+    chk("Valk lv5 命中(高等级纳入)", isValkyrieListing(good({ level: 5 }), sword));
+    chk("Valk lv28 命中(高等级纳入)", isValkyrieListing(good({ level: 28 }), sword));
     chk("Valk price3>2 拒绝", !isValkyrieListing(good({ price: 3 }), sword));
     chk("Valk price2 边界命中", isValkyrieListing(good({ price: 2 }), sword));
     chk("Valk 非本部位段位拒绝(Sword里放Armor id)", !isValkyrieListing(good({ itemId: 10270000 }), sword));
@@ -1024,15 +1024,15 @@ function selfTest() {
     const mk = (itemId, level, price) => ({ itemId, level, price, itemSubType: 6,
       productId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", tradableId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       sellerAgentAddress: "0x" + "11".repeat(20), sellerAvatarAddress: "0x" + "22".repeat(20) });
-    // 精确 +3 默认：lv5 那条被过滤，只剩两条 lv3（其中 price9 超上限被排除）→ 1 条
+    // level>=3 门槛：lv5 与两条 lv3 都纳入（price9 超上限被排除）→ 3 条
     const byPart = { Sword: [mk(10174000, 5, 2), mk(10170000, 3, 1), mk(10171000, 3, 9)], Armor: [mk(10270000, 3, 2)] };
     const cands = selectValkyrieCandidates(byPart);
-    chk("Valk 精确+3过滤lv5 + price上限", cands.length === 2, `got ${cands.length}`);
+    chk("Valk 门槛纳入高等级 + price上限", cands.length === 3, `got ${cands.length}`);
     chk("Valk 候选按单价升序", cands[0].priceNcg === 1 && cands[1].priceNcg === 2);
     chk("Valk 候选带 partKey/kind", cands.every((c) => c.kind === "valkyrie" && !!c.partKey));
-    // 自定义精确等级覆盖默认值（level:5）→ 只命中 lv5 那条
-    const cands2 = selectValkyrieCandidates(byPart, { level: 5, maxPrice: 2 });
-    chk("Valk 自定义精确等级(lv5)", cands2.length === 1 && cands2[0].level === 5, `got ${cands2.length}`);
+    // 自定义门槛覆盖默认值（minLevel:5）→ 只命中 lv5 那条
+    const cands2 = selectValkyrieCandidates(byPart, { minLevel: 5, maxPrice: 2 });
+    chk("Valk 自定义门槛(lv5)", cands2.length === 1 && cands2[0].level === 5, `got ${cands2.length}`);
   }
 
   // 9) NonFungible buy action 构造：p[0] 8 字段、用 9CAPI 合法模板字节规范
