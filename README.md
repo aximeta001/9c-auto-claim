@@ -1,13 +1,61 @@
-# 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货
+# 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货 + 无限塔冲塔
 
-本仓库含**两条相互独立的纯 GitHub 自接力链**：
+本仓库含**两条相互独立的纯 GitHub 自接力链**、**一条纯手工触发的 AB 链**，外加**一条无限塔新赛季冲塔链**：
 
-| 链 | workflow | 脚本 | 作用 |
-|---|---|---|---|
-| 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 监控并自动低价购买 **Stun Rune (Adventure)**（单价 ≤ 0.2 NCG/件） |
+| 链 | workflow | 脚本 | 作用 | 触发 |
+|---|---|---|---|---|
+| 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 监控并自动低价购买 **Stun Rune (Adventure)**（单价 ≤ 0.2 NCG/件） | 自接力常驻 |
+| **AB 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
+| **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
 
-两条链各有独立 `concurrency` 组、独立接力、共用同一 keystore Secrets，互不干扰。
+各链有独立 `concurrency` 组、共用同一 keystore Secrets，互不干扰。AB 链不常驻、不定时、不自动触发。无限塔链采用与领奖链相同的自接力常驻架构（详见下节），**不依赖不稳的 schedule cron 抢首层**。
+
+### 无限塔链：新赛季自动冲第 1 层（2026-11-17 起）
+
+**为什么越早打越好**：无限塔的个人计时器锚定在「首次进塔那一笔」——Lib9c `PerformSeasonReset` 在首次进入某赛季时把 `LastTicketRefillBlockIndex` 设为当前块并发 1 张票，之后每天免费票都按这个锚点每 5400 块补 1 张。**越早打第 1 层，你的补票时钟就越早开始滚动**，整个赛季能多领若干张免费票。
+
+**判定（只读链上权威状态，四条全满足才提交）**：
+
+1. `infiniteTowerStatus.infiniteTowerId >= 目标赛季`（默认 11，新赛季排期由官方 patch 注入链上才出现）；
+2. `isActive === true`（赛季窗口进行中）；
+3. `clearedFloor < 1`（第 1 层未通关 —— **通关后永久幂等跳过，绝不重复提交**）；
+4. `remainingTickets >= 1`（新赛季首笔送 1 票，正好够第 1 层，**不花 NCG / 材料 / AP**）。
+
+**交易构造**：复用你本人最近一笔 `SUCCESS` 的 `infinite_tower_battle.raw` 作字节级模板，只改 `id`（新 16 字节）、`infiniteTowerId`→链上实际赛季号、`floorId`→1；装备 / 时装 / 符文槽原样保留，自动跟随养成。提交后跨节点并行复核终态（只认 `SUCCESS/FAILURE/INVALID`），成功后再次读链上确认 `clearedFloor>=1`。
+
+**为什么不用 schedule 当主力**：GitHub 的 schedule cron 在高负载时会延迟数十分钟甚至整点丢弃，抢首层完全靠不住（这正是早期"几笔操作失败/延迟很久"的根因）。本链复用领奖链已验证的高可用架构：
+
+| 机制 | 行为 |
+|---|---|
+| **主力：`--watch` 常驻蹲守** | job 内进程每 **20 秒**轮询一次链上状态，赛季一排期上链最多 20 秒内命中并提交；一个 job 守满 5.5h（< 单 job 6h 上限） |
+| **自接力** | 预算耗尽打印 `{"handoff":"budget_exhausted"}`，接力 step 用 `workflow_dispatch` REST API 即时刻下一个 job，`concurrency` 同组排队**无缝衔接**，不受 cron 调度延迟影响 |
+| **自动停止** | 冲塔成功 / 交易定论后打印 `{"done":...}`，接力 step 不再接力，赛季内不再空转浪费 runner |
+| **schedule（每 10 分钟）** | 仅作「接力链意外断裂时重新点火」的保险，链正常时根本用不到；即使被延迟/丢弃也不影响主力 |
+| `workflow_dispatch` | 手工验证用，`dry_run` 默认勾选 = 只轮询不提交 |
+
+> 赛季排期表（`InfiniteTowerScheduleSheet`）只有在新赛季被官方 patch 注入链上后才会出现第 11 行。在那之前脚本每轮只会输出「目标第 11 期尚未上线」并安静跳过，**不会误提交**。当前正处第 10 期结束后、第 11 期 patch 注入前的切换真空期，headless 偶发返回空状态属正常，脚本会 catch 后继续轮询。
+
+---
+
+### AB 链：批量提交（2026-11-16 起）
+
+AB 与领奖链的**风险模型不同**：领取是「一次机会、重复领取就浪费」，必须逐笔等链上终态确认；AB 是「同一操作重复执行、失败可事后补齐」，逐笔确认纯属浪费时间。因此 `sweep-boss.mjs` 默认走**批量模式**：
+
+1. 整批取一次 `nextTxNonce`，之后本地严格 `+1` 连续递增，同一 signer 不并发抢号，每笔独立随机 `id`；
+2. 连续提交 N 笔，笔间只留 `--gap-ms`（默认 2000ms，实测单笔「签名 + `stageTransaction`」约 200~600ms），**不等链上终态**；
+3. 全部提交完做**一次总复核**：并行轮询所有 txId 的终态、跨节点取结果，只认 `SUCCESS/FAILURE/INVALID`；节点尚未索引时短暂的「伪 INVALID」（`blockIndex=null` 且无异常名）不算结论，继续等；
+4. 按链上 `SUCCESS` 数与目标次数的**差额自动补齐**，最多 `--max-rounds` 轮；未决交易先占位、不重复提交，避免多刷 / 重复扣药水。
+
+需要回退到旧的「每笔等终态」时加 `--confirm-each`（workflow 里勾 `confirm_each`）。**领奖链 `claim.mjs` 不受影响**，仍是逐笔复核 + 幂等锁。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--gap-ms` | 2000 | 笔间间隔，应略大于单笔提交耗时 |
+| `--final-tries` | 12 | 总复核最多轮询轮数 |
+| `--final-interval-ms` | 3000 | 总复核轮询间隔（并行查全部 txId，不随笔数增长） |
+| `--max-rounds` | 3 | 最多「提交＋复核」轮数，防止无限补齐 |
+| `--confirm-each` | 关 | 回退到逐笔等终态的旧模式 |
 
 **领奖链**：自动代替你打开 App 点「Get Reward」和「Daily Reward」。链上所有东西都是交易，领取 = 用角色所属 agent 的私钥签名并提交一笔交易。本项目已在真实 Heimdall 网络上端到端验证：构造 → 签名 → `stageTransaction` → 上链确认。
 
@@ -107,10 +155,12 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
 | `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)、单价判定、`buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
-| `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（两条链共用） |
+| `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
+| `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
 | `.github/workflows/claim.yml` | GitHub Actions 领奖任务（`--daemon` 常驻 + 接力 step + schedule 重燃 + 手动验证） |
 | `.github/workflows/market.yml` | **GitHub Actions 扫货任务**（独立 `concurrency` 组 `9c-market-buy`，与领奖链隔离；接力指向 `market.yml` 自身） |
+| `.github/workflows/infinite-tower.yml` | **GitHub Actions 无限塔冲塔任务**（`--watch` 20 秒轮询常驻 + 接力 step + schedule 重燃 + 手工验证；独立 `concurrency` 组 `9c-infinite-tower`） |
 | `.github/workflows/keepalive.yml` | 每周空提交，防止 GitHub 60 天无活动自动停用定时任务 |
 | `run.sh` | 本地 cron 入口：加锁防重、日志轮转 |
 | `DEPLOY.md` | 全新部署指南（零基础逐步操作） |
@@ -220,6 +270,15 @@ node claim.mjs --daemon --sweep-attempts 6 # sweep 最多 6 笔（默认，= 首
 node claim.mjs --daemon --dry-run          # 演练：只规划一轮，不真睡、不提交
 node claim.mjs --daemon --max-run-seconds 19800   # 自定义预算（秒，须 < 6h）
 node claim.mjs --self-test                 # 离线自测（含 sweep 判定 + 重试决策 + 模板重建）
+
+# ---- 无限塔新赛季冲塔链 ----
+node infinite-tower.mjs --self-test              # 24 项离线自测（判定 + action 构造 + 归属校验）
+node infinite-tower.mjs --watch --dry-run         # 只读演练：20 秒轮询蹲守，命中也不提交
+node infinite-tower.mjs --watch                   # 真跑主力：常驻蹲守 5.5h、20 秒轮询，命中即提交第1层，成功即停
+node infinite-tower.mjs --watch --season 11      # 指定目标赛季蹲守
+node infinite-tower.mjs --watch --gap-ms 20000 --max-watch-seconds 19800  # 轮询间隔/预算（默认 20s / 5.5h）
+node infinite-tower.mjs --watch --max-watch-seconds 60 --dry-run  # 快速验证交棒：预算60秒，耗尽打印 handoff
+node infinite-tower.mjs --once                   # 单次检查（备用），命中即提交一笔
 
 # ---- 本地 cron 入口 ----
 bash run.sh --dry-run
