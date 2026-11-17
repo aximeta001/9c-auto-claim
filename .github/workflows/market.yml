@@ -1,15 +1,16 @@
-name: 9C 市场扫货 (Heimdall / Stun Rune Adventure)
+name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 独立链：与 claim.yml 领奖链完全隔离、互不干扰（各自独立 concurrency 组）。
 # 架构同为「纯 GitHub 自接力长链」，不依赖 WorkBuddy / 任何外部闹钟。
 #
-#  监控：job 内 `market-buy.mjs --daemon` 常驻 5.5h，每 ~60s 扫一次市场：
-#        · 按 ticker 精确拉取 RUNESTONE_STUN_ADVENTURE 的全部在售挂单
-#          （用资产唯一 ticker，绝不名字搜索；Stun Rune (Arena) 永不混入）
-#        · 单价 unitPrice <= 0.2 NCG/件 才买（整数比较，避开总价陷阱）
-#        · 命中即提交 buy_product3，提交前链上复核、提交后只认链上终态
-#        · 无命中/失败/异常一律进入下一轮重扫，绝不锁死、绝不误买
+#  监控：job 内 `market-buy.mjs --daemon` 常驻 5.5h，每 ~60s 扫一次市场，两个目标：
+#        · Stun Rune (Adventure)：按 ticker 精确拉取挂单（唯一 ticker，绝不名字搜索；
+#          Stun Rune (Arena) 永不混入），单价 <= 0.2 NCG/件 才买（整数比较）。
+#        · Valkyrie 五部位装备：itemId 段位精确匹配 Sword/Armor/Belt/Necklace/Ring，
+#          lv>=3、单价<=2 NCG、全部元素变体；本次运行累计封顶 500 NCG。
+#        · 命中即提交 buy_product3（FAV / NonFungible 两版），提交前链上复核、
+#          提交后只认链上终态；无命中/失败/异常一律下一轮重扫，绝不锁死、绝不误买。
 #  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
 #        下一个常驻 job（GITHUB_TOKEN 是防递归规则的例外）。
 #  重燃：schedule 每 10 分钟错峰（与领奖链 4,14,24... 错开到 9,19,29...），
