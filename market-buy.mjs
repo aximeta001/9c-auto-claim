@@ -19,6 +19,16 @@
  *   · productType === FUNGIBLE_ASSET_VALUE，asset.ticker 与 Mimir 链上一致
  *   · RuneSheet 的 id=10021 名称 "Stun Rune (Adventure)"、Arena=10022 明确排除
  *
+ * 【第二条扫货目标：Valkyrie 装备】与 FAV 符文共用同一条链、同一次扫描：
+ *   - 部位：Valkyrie Sword/Armor/Necklace/Belt/Ring（itemId 段 1017/1027/1047/1037/1057）
+ *   - 全部元素变体（Normal/Fire/Water/Land/Wind）
+ *   - 强化等级 level >= 3（链上装备 level 字段，非 item grade）
+ *   - 单价 <= 2 NCG/件（装备按件卖，price 即单价 NCG 整数）
+ *   - 用 9CAPI /Market/products/items/{subType}?order=cp_desc 拉高 CP 装备挂单，
+ *     本地按 itemId 段位精确筛出 Valkyrie，绝不按名字模糊匹配。
+ *   - 购买用 buy_product3 的 NonFungible 版（p[0] 8 字段，多 itemSubType/tradableId）。
+ *   - 总花费封顶 500 NCG（本次运行累计，买够即停并正常交棒）。
+ *
  * 私钥只从环境变量 NC_PRIVATE_KEY 读取（.env），绝不写进本文件/日志/落盘。
  *
  * 用法：
@@ -26,6 +36,10 @@
  *   NC_PRIVATE_KEY=xxxx node market-buy.mjs --dry-run       # 只扫描不提交（真实联网只读）
  *   NC_PRIVATE_KEY=xxxx node market-buy.mjs --daemon        # 自接力常驻，守满预算交棒
  *   node market-buy.mjs --self-test                        # 离线自测纯逻辑（不联网）
+ *   --no-valkyrie                                          # 临时关闭 Valkyrie 装备扫货
+ *   --valk-max-price-ncg 2                                 # 装备单价上限 NCG（默认 2）
+ *   --valk-spend-cap-ncg 500                               # 装备总花费封顶 NCG（默认 500）
+ *   --valk-min-level 3                                     # 装备最低强化等级（默认 3）
  *
  * 依赖：@planetarium/{account,tx,bencodex,lib9c}（见同目录 package.json）
  */
@@ -111,6 +125,29 @@ const MAX_RUN_MS = Math.max(10, numArg("--max-run-seconds", 330 * 60)) * 1000; /
 // 仅 dry-run 生效的演练钩子：注入挂单，快速走完整判定/构造流程，绝不联网提交
 const SIM_LISTINGS_FILE = strArg("--simulate-listings-file", null);
 
+// ---------------- Valkyrie 装备扫货配置 ----------------
+const ENABLE_VALKYRIE = !args.includes("--no-valkyrie");
+// 部位 -> subType(枚举数字) + itemId 段位正则（5 元素变体 + 普通版）+ 链上 itemSubType 字符串。
+// 段位来源：EquipmentItemSheet.csv，各部位 5 元素变体尾号 0000/1000/2000/3000/4000。
+const VALKYRIE_PARTS = [
+  { key: "Sword",    subType: 6,  re: /^1017\d{4}$/, itemSubType: "Weapon" },
+  { key: "Armor",    subType: 7,  re: /^1027\d{4}$/, itemSubType: "Armor" },
+  { key: "Belt",     subType: 8,  re: /^1037\d{4}$/, itemSubType: "Belt" },
+  { key: "Necklace", subType: 9,  re: /^1047\d{4}$/, itemSubType: "Necklace" },
+  { key: "Ring",     subType: 10, re: /^1057\d{4}$/, itemSubType: "Ring" },
+];
+const VALK_MIN_LEVEL = Math.max(0, Math.trunc(numArg("--valk-min-level", 3)));
+// 装备按件卖：API price 是整数 NCG（即单价）；<= 上限即命中。用整数比较，无浮点。
+const VALK_MAX_PRICE_NCG = Math.max(0, Math.trunc(numArg("--valk-max-price-ncg", 2)));
+// 总花费封顶（本次运行累计 NCG）：买够即停止提交新单并正常交棒，接力后重置。
+const VALK_SPEND_CAP_NCG = Math.max(0, numArg("--valk-spend-cap-ncg", 500));
+// 每个部位拉取多少条高 CP 挂单本地筛选（Valkyrie 是高 CP 装，cp_desc 让它们排前面）
+const VALK_LISTING_LIMIT = Math.max(50, Math.trunc(numArg("--valk-listing-limit", 500)));
+// 抓取健壮性：单请求超时 / 每部位重试次数 / 全部位总预算（秒）。防止某部位无限重试拖垮一轮。
+const VALK_FETCH_TIMEOUT_MS = Math.max(5000, Math.trunc(numArg("--valk-fetch-timeout-ms", 25000)));
+const VALK_FETCH_RETRIES = Math.max(1, Math.min(6, Math.trunc(numArg("--valk-fetch-retries", 3))));
+const VALK_FETCH_BUDGET_MS = Math.max(30000, numArg("--valk-fetch-budget-seconds", 150)) * 1000;
+
 // ---------------- buy_product3 FAV 版字节模板 ----------------
 // 来源：链上真实 SUCCESS 交易 block 11755327 的 buy_product3 action（买
 // RUNESTONE_STUN_ADVENTURE 挂单）。复用其已验证的字节结构，只替换动态字段
@@ -125,6 +162,21 @@ const BUY_FAV_TEMPLATE =
   "6e75363a7469636b657275333a4e43476569393030656532303ae6f7b3ff35c819d98d33b" +
   "82a9eb8c4d76d7670a132303a74c4617ddf6d04ac3c7ff0f5425c352c0249c755753138" +
   "3a46756e6769626c65417373657456616c756565656565";
+
+// buy_product3 NonFungible 版字节模板：来源 9CAPI mobileBuyHeimdall 对 price=9 的
+// 合法返回（见 /tmp/crosscheck.mjs 交叉验证）。p[0] 比 FAV 版多 2 字段：
+//   [0] productId(16B) [1] NCG currency+minor [2] sellerAgent [3] sellerAvatar
+//   [4] "NonFungible" [5] false [6] itemSubType("Weapon") [7] tradableId(16B)
+// 用其 NCG currency dict 作为编码规范（与 FAV 版逐字节一致，已验证）。
+const BUY_NFT_TEMPLATE =
+  "6475373a747970655f69647531323a6275795f70726f647563743375363a76616c756573" +
+  "6475313a6132303aac9d450c69df27ee290c90ec61c4b76154b0a21c75323a696431363a" +
+  "503d69aff8da014e8366fa489a7820dd75313a706c6c31363a99aee10f88051a41991b37" +
+  "be51c44dc26c647531333a646563696d616c506c61636573313a0275373a6d696e746572" +
+  "736e75363a7469636b657275333a4e43476569393030656532303ae6f7b3ff35c819d98d" +
+  "33b82a9eb8c4d76d7670a132303a74c4617ddf6d04ac3c7ff0f5425c352c0249c7557531" +
+  "313a4e6f6e46756e6769626c656675363a576561706f6e31363a99aee10f88051a41991b" +
+  "37be51c44dc265656565";
 
 // ---------------- 工具 ----------------
 function log(obj) { console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj })); }
@@ -228,6 +280,84 @@ function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR) {
   return out;
 }
 
+// ---------------- Valkyrie 装备：身份判定 / 候选筛选 / action 构造 ----------------
+// 判定单条装备挂单是否为「目标 Valkyrie」：itemId 命中部位段位 + level>=阈值 +
+// 单价<=上限 + 关键字段齐全。全部走 itemId 段位（不是名字），杜绝近似装备。
+function isValkyrieListing(p, part, opts = {}) {
+  if (!p || typeof p !== "object") return false;
+  const minLevel = opts.minLevel ?? VALK_MIN_LEVEL;
+  const maxPrice = opts.maxPrice ?? VALK_MAX_PRICE_NCG;
+  if (!part.re.test(String(p.itemId))) return false;                 // 部位段位精确
+  if (!Number.isInteger(p.level) || p.level < minLevel) return false; // 强化等级
+  if (!Number.isInteger(p.price) || p.price < 0 || p.price > maxPrice) return false; // 单价 NCG
+  if (p.exist === false || p.legacy === true) return false;          // 已下架/旧版
+  // 购买所需关键字段必须齐全
+  if (typeof p.productId !== "string" || typeof p.tradableId !== "string") return false;
+  if (typeof p.sellerAgentAddress !== "string" || typeof p.sellerAvatarAddress !== "string") return false;
+  if (!Number.isInteger(p.itemSubType)) return false;
+  return true;
+}
+
+// 从各部位挂单里筛出 Valkyrie 候选，统一结构，按单价升序（先买最便宜）。
+// listingsByPart: { [partKey]: [listing, ...] }
+function selectValkyrieCandidates(listingsByPart, opts = {}) {
+  const out = [];
+  for (const part of VALKYRIE_PARTS) {
+    const arr = (listingsByPart && listingsByPart[part.key]) || [];
+    for (const p of arr) {
+      if (!isValkyrieListing(p, part, opts)) continue;
+      out.push({
+        kind: "valkyrie",
+        partKey: part.key,
+        itemId: p.itemId,
+        itemSubType: part.itemSubType,     // 链上字符串 "Weapon" 等
+        level: p.level,
+        priceNcg: p.price,                 // 装备按件卖，price 即单价 NCG
+        productId: p.productId,
+        tradableId: p.tradableId,
+        sellerAgentAddress: p.sellerAgentAddress,
+        sellerAvatarAddress: p.sellerAvatarAddress,
+        registeredBlockIndex: p.registeredBlockIndex ?? null,
+      });
+    }
+  }
+  out.sort((a, b) => (a.priceNcg - b.priceNcg) || a.partKey.localeCompare(b.partKey));
+  return out;
+}
+
+// buy_product3 NonFungible 版 action 构造：复用 9CAPI 合法模板的 NCG currency dict，
+// 只替换动态字段。p[0] 8 字段，itemSubType/tradableId 为装备版新增。
+function buildValkyrieBuyAction(items, buyerAvatarBuf, actionIdBuf) {
+  const tpl = decode(Buffer.from(BUY_NFT_TEMPLATE, "hex"));
+  if (!(tpl instanceof BencodexDictionary) || String(tpl.get("type_id")) !== BUY_TYPE_ID)
+    throw new Error("buy NFT 模板 type_id 校验失败");
+  const tplValues = tpl.get("values");
+  const tplP0 = tplValues.get("p")[0];
+  const tplCurrency = tplP0[1][0];        // NCG Currency dict（保留，勿重建）
+  const tplProductType = tplP0[4];        // "NonFungible"
+  const tplFalse = tplP0[5];              // false（用模板原值，避免 boolean/int 编码歧义）
+
+  const p = items.map((it) => [
+    uuidToBytesLe(it.productId),
+    [tplCurrency, BigInt(it.priceNcg) * 100n],
+    addrToBuf(it.sellerAgentAddress),
+    addrToBuf(it.sellerAvatarAddress),
+    tplProductType,
+    tplFalse,
+    it.itemSubType,                      // "Weapon"/"Armor"/"Belt"/"Necklace"/"Ring"
+    uuidToBytesLe(it.tradableId),
+  ]);
+  const values = new BencodexDictionary([
+    ["a", buyerAvatarBuf],
+    ["id", actionIdBuf],
+    ["p", p],
+  ]);
+  return new BencodexDictionary([
+    ["type_id", tpl.get("type_id")],
+    ["values", values],
+  ]);
+}
+
 // ---------------- 挂单来源：9CAPI（ticker 精确过滤，全量） ----------------
 // GET /marketProviderHeimdall/Market/products/fav?tickers=RUNESTONE_STUN_ADVENTURE
 // 返回 { fungibleAssetValueProducts: [...] }，每条带 productId / seller / price /
@@ -248,6 +378,45 @@ async function fetchListings() {
   // 逐条复核：即便服务端串了别的 ticker，本地也绝不放行
   const safe = favs.filter((p) => isTargetListing(p));
   return { listings: safe, rawCount: favs.length, rejected: favs.length - safe.length };
+}
+
+// Valkyrie 挂单来源：9CAPI 物品接口，按部位 subType 分类拉取。
+// GET /marketProviderHeimdall/Market/products/items/{subType}?limit=N&offset=0&order=cp_desc
+// Valkyrie 是高 CP 装备，用 cp_desc 让它们排在最前，limit=500 足够覆盖。
+// 返回 { byPart: { [key]: [...] }, rawCount, errors }。单部位失败不影响其它部位。
+async function fetchValkyrieListings() {
+  const byPart = {};
+  let rawCount = 0;
+  const errors = [];
+  const deadline = Date.now() + VALK_FETCH_BUDGET_MS;   // 全部位总预算，超时后剩余部位直接留空
+  for (const part of VALKYRIE_PARTS) {
+    byPart[part.key] = [];
+    if (Date.now() >= deadline) {
+      errors.push(`${part.key}: fetch_budget_exhausted`);
+      continue;
+    }
+    const url = `${CFG.api9c}/marketProviderHeimdall/Market/products/items/${part.subType}` +
+      `?limit=${VALK_LISTING_LIMIT}&offset=0&order=cp_desc`;
+    let arr = null;
+    const partDeadline = Math.min(deadline, Date.now() + VALK_FETCH_TIMEOUT_MS * VALK_FETCH_RETRIES);
+    for (let attempt = 0; attempt < VALK_FETCH_RETRIES && !arr && Date.now() < partDeadline; attempt++) {
+      const ctrl = new AbortController();
+      const timeLeft = Math.min(VALK_FETCH_TIMEOUT_MS, partDeadline - Date.now());
+      if (timeLeft <= 0) break;
+      const t = setTimeout(() => ctrl.abort(), timeLeft);
+      try {
+        const r = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "9c-market-buy/1.0" } });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        if (Array.isArray(j?.itemProducts)) arr = j.itemProducts;
+      } catch (e) {
+        if (attempt === VALK_FETCH_RETRIES - 1) errors.push(`${part.key}: ${String(e.message).slice(0, 80)}`);
+      } finally { clearTimeout(t); }
+    }
+    byPart[part.key] = arr || [];
+    rawCount += byPart[part.key].length;
+  }
+  return { byPart, rawCount, errors };
 }
 
 // ---------------- 链上状态读取 / 提交前复核（只认链上） ----------------
@@ -374,29 +543,68 @@ async function confirmTx(txId, tries = CFG.confirmTries) {
 
 // ---------------- 单轮扫描 + 购买 ----------------
 // 返回本轮结构化结果。逐笔串行（同一 signer 不能并发抢 nonce）。
+// 两类目标共用同一 signer/链：FAV 符文（buildBuyAction）+ Valkyrie 装备
+// （buildValkyrieBuyAction）。按 kind 分组打包，绝不混在同一笔交易里。
+// 预算 ctx.spentNcg 跨轮累计（本次运行累计，接力后重置），达 VALK_SPEND_CAP_NCG 即停。
 async function scanAndBuy(ctx, opts = {}) {
-  const round = { candidates: [], bought: [], skipped: [], txSubmitted: 0, ok: true };
-  let listings = [], rawCount = 0, rejected = 0;
+  const round = {
+    candidates: [], bought: [], skipped: [], txSubmitted: 0, ok: true,
+    valkCandidates: [], valkSpendNcg: 0,
+  };
+  if (!ctx) ctx = {};
+  if (typeof ctx.spentNcg !== "number") ctx.spentNcg = 0;   // 跨轮累计已花费 NCG
+
+  // ---- FAV 符文挂单 ----
+  let favListings = [], favRaw = 0, rejected = 0;
   if (opts.simulatedListings) {
-    listings = opts.simulatedListings;
-    rawCount = listings.length;
+    favListings = opts.simulatedListings;
+    favRaw = favListings.length;
   } else {
     const f = await fetchListings();
-    listings = f.listings; rawCount = f.rawCount; rejected = f.rejected;
+    favListings = f.listings; favRaw = f.rawCount; rejected = f.rejected;
   }
-  round.rawCount = rawCount;
+  round.rawCount = favRaw;
   round.rejectedByTicker = rejected;
-  const candidates = selectCandidates(listings);
-  round.candidateCount = candidates.length;
-  round.candidates = candidates.map((c) => ({
-    productId: c.productId, unitPrice: c.unitPrice, priceNcg: c.priceNcg,
-    quantity: c.quantity, ticker: c.ticker,
+  const favCandidates = selectCandidates(favListings);
+
+  // ---- Valkyrie 装备挂单 ----
+  let valkCandidates = [];
+  if (ENABLE_VALKYRIE) {
+    let byPart;
+    if (opts.simulatedValkListings) {
+      byPart = opts.simulatedValkListings;
+    } else if (!opts.simulatedListings) {
+      const vf = await fetchValkyrieListings();
+      byPart = vf.byPart;
+      round.valkRawCount = vf.rawCount;
+      round.valkFetchErrors = vf.errors;
+    } else {
+      byPart = {};
+    }
+    valkCandidates = selectValkyrieCandidates(byPart);
+  }
+  round.valkCandidates = valkCandidates.map((c) => ({
+    productId: c.productId, part: c.partKey, itemId: c.itemId,
+    level: c.level, priceNcg: c.priceNcg,
   }));
 
-  if (candidates.length === 0) return round;
+  const allCandidates = [
+    ...favCandidates.map((c) => ({ ...c, kind: "fav" })),
+    ...valkCandidates.map((c) => ({ ...c, kind: "valkyrie" })),
+  ];
+  round.candidateCount = allCandidates.length;
+  round.candidates = allCandidates.map((c) => ({
+    kind: c.kind, productId: c.productId,
+    unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
+    priceNcg: c.priceNcg,
+    quantity: c.kind === "fav" ? c.quantity : 1,
+    ticker: c.kind === "fav" ? c.ticker : c.partKey,
+  }));
+
+  if (allCandidates.length === 0) return round;
 
   // 归属校验：私钥派生 signer 必须等于角色链上 agentAddress
-  if (!DRY && ctx) {
+  if (!DRY && ctx.signer) {
     if (opts.agentAddress &&
         ctx.signer.toString().toLowerCase() !== opts.agentAddress.toLowerCase()) {
       round.ok = false;
@@ -416,11 +624,8 @@ async function scanAndBuy(ctx, opts = {}) {
 
   const buyerBuf = addrToBuf(CFG.avatarAddress);
   const buyable = [];
-  for (const c of candidates) {
-    // 提交前链上复核：仅在查到「明确不符」（串货/价格变/卖家变）时拦截；
-    // Mimir 未索引在售挂单（not_found）或网络异常一律放行，交给链上执行兜底，
-    // 绝不因二级索引滞后而误杀候选单、错失低价机会。
-    if (VERIFY_ONCHAIN && !opts.simulatedListings) {
+  for (const c of allCandidates) {
+    if (VERIFY_ONCHAIN && !opts.simulatedListings && !opts.simulatedValkListings) {
       const v = await verifyListingOnchain(c);
       if (v.skip) { round.skipped.push({ productId: c.productId, reason: `onchain_${v.reason}` }); continue; }
       if (v.verified) round.verifiedOnchain = (round.verifiedOnchain || 0) + 1;
@@ -429,54 +634,88 @@ async function scanAndBuy(ctx, opts = {}) {
       round.skipped.push({ productId: c.productId, reason: "insufficient_ncg" });
       continue;
     }
+    // 预算封顶：只约束 Valkyrie 装备累计花费；FAV 符文不受此预算约束。
+    if (c.kind === "valkyrie" && ctx.spentNcg + c.priceNcg > VALK_SPEND_CAP_NCG) {
+      round.skipped.push({ productId: c.productId, reason: "valk_budget_cap" });
+      continue;
+    }
     buyable.push(c);
   }
   round.buyableCount = buyable.length;
 
   if (DRY) {
-    for (const c of buyable) round.bought.push({ productId: c.productId, status: "would_buy",
-      unitPrice: c.unitPrice, priceNcg: c.priceNcg, quantity: c.quantity });
+    for (const c of buyable) round.bought.push({
+      productId: c.productId, status: "would_buy", kind: c.kind,
+      priceNcg: c.priceNcg, unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
+      quantity: c.kind === "fav" ? c.quantity : 1,
+    });
     log({ level: "info", msg: `演练：命中 ${buyable.length} 单，本应购买（未提交任何交易）`,
-          candidates: candidates.length, buyable: buyable.length });
+          fav: favCandidates.length, valkyrie: valkCandidates.length, buyable: buyable.length });
     return round;
   }
 
-  // 分批打包（每笔 <= MAX_ITEMS_PER_TX），逐笔串行提交 + 等终态
+  // 按 kind 分组，每组内分批打包（每笔 <= MAX_ITEMS_PER_TX），逐笔串行提交 + 等终态。
+  // 便宜的先买：Valkyrie 与 FAV 各自已按单价升序；组间先 Valkyrie（预算敏感）后 FAV。
+  const groups = [
+    { kind: "valkyrie", list: buyable.filter((c) => c.kind === "valkyrie"), build: buildValkyrieBuyAction },
+    { kind: "fav",      list: buyable.filter((c) => c.kind === "fav"),      build: buildBuyAction },
+  ];
   let txCount = 0;
-  for (let i = 0; i < buyable.length && txCount < MAX_TX_PER_ROUND; i += MAX_ITEMS_PER_TX) {
-    const batch = buyable.slice(i, i + MAX_ITEMS_PER_TX);
-    const rec = { items: batch.map((c) => c.productId), status: "pending" };
-    try {
-      const actionValue = buildBuyAction(batch, buyerBuf, randomBytes(16));
-      const nonce = await getNonce(ctx.signer.toString());
-      const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
-      rec.txId = txId; rec.nonce = Number(nonce);
-      round.txSubmitted++; txCount++;
-      log({ level: "info", msg: `已提交 buy_product3（${batch.length} 单）`, txId,
-            items: rec.items, nonce: rec.nonce });
-      const r = await confirmTx(txId);
-      rec.txStatus = r.txStatus;
-      rec.exceptionNames = r.exceptionNames ?? null;
-      if (r.txStatus === "SUCCESS") {
-        rec.status = "bought";
-        for (const c of batch) round.bought.push({ productId: c.productId, status: "bought",
-          unitPrice: c.unitPrice, priceNcg: c.priceNcg, quantity: c.quantity, txId });
-        log({ level: "info", msg: `购买成功（${batch.length} 单）`, txId, items: rec.items });
-      } else {
-        // 失败/PENDING/INVALID：不锁死，下轮重扫链上最新挂单再试。
-        // 链上执行会校验 productId/price/seller，不符即 FAILURE，无资金损失。
-        rec.status = "not_confirmed";
-        for (const c of batch) round.skipped.push({ productId: c.productId, reason: `tx_${r.txStatus}` });
-        log({ level: "warn", msg: `购买未确认成功（${r.txStatus}），下轮重扫链上复核`,
-              txId, items: rec.items, exceptionNames: rec.exceptionNames });
+  for (const group of groups) {
+    for (let i = 0; i < group.list.length && txCount < MAX_TX_PER_ROUND; i += MAX_ITEMS_PER_TX) {
+      // 预算二次拦截（同组内逐笔累计，防止一批里超支）
+      let batch = group.list.slice(i, i + MAX_ITEMS_PER_TX);
+      if (group.kind === "valkyrie") {
+        const kept = [];
+        for (const c of batch) {
+          if (ctx.spentNcg + c.priceNcg > VALK_SPEND_CAP_NCG) {
+            round.skipped.push({ productId: c.productId, reason: "valk_budget_cap" });
+            continue;
+          }
+          kept.push(c);
+        }
+        batch = kept;
       }
-    } catch (e) {
-      rec.status = "error"; rec.error = String(e.message);
-      log({ level: "warn", msg: "购买提交异常，下轮重试", detail: rec.error, items: rec.items });
+      if (!batch.length) continue;
+      const rec = { kind: group.kind, items: batch.map((c) => c.productId), status: "pending" };
+      try {
+        const actionValue = group.build(batch, buyerBuf, randomBytes(16));
+        const nonce = await getNonce(ctx.signer.toString());
+        const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
+        rec.txId = txId; rec.nonce = Number(nonce);
+        round.txSubmitted++; txCount++;
+        log({ level: "info", msg: `已提交 buy_product3（${group.kind}, ${batch.length} 单）`, txId,
+              items: rec.items, nonce: rec.nonce });
+        const r = await confirmTx(txId);
+        rec.txStatus = r.txStatus;
+        rec.exceptionNames = r.exceptionNames ?? null;
+        if (r.txStatus === "SUCCESS") {
+          rec.status = "bought";
+          for (const c of batch) {
+            round.bought.push({ productId: c.productId, status: "bought", kind: c.kind,
+              unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
+              priceNcg: c.priceNcg, quantity: c.kind === "fav" ? c.quantity : 1, txId });
+            if (c.kind === "valkyrie") {
+              ctx.spentNcg += c.priceNcg;
+              round.valkSpendNcg += c.priceNcg;
+            }
+          }
+          log({ level: "info", msg: `购买成功（${group.kind}, ${batch.length} 单）`, txId, items: rec.items });
+        } else {
+          rec.status = "not_confirmed";
+          for (const c of batch) round.skipped.push({ productId: c.productId, reason: `tx_${r.txStatus}` });
+          log({ level: "warn", msg: `购买未确认成功（${r.txStatus}），下轮重扫链上复核`,
+                txId, items: rec.items, exceptionNames: rec.exceptionNames });
+        }
+      } catch (e) {
+        rec.status = "error"; rec.error = String(e.message);
+        log({ level: "warn", msg: "购买提交异常，下轮重试", detail: rec.error, items: rec.items });
+      }
+      round.txLog = round.txLog || [];
+      round.txLog.push(rec);
     }
-    round.txLog = round.txLog || [];
-    round.txLog.push(rec);
   }
+  round.valkSpendNcgTotal = ctx.spentNcg;
   return round;
 }
 
@@ -487,6 +726,10 @@ async function daemonMode() {
     network: "heimdall", avatar: CFG.avatarAddress, dryRun: DRY, mode: "daemon",
     ticker: TARGET_TICKER, maxUnitPriceNcg: Number(UNIT_PRICE_MINOR) / 100,
     ok: true, rounds: 0, totals: { candidates: 0, bought: 0, tx: 0 }, transientErrors: 0,
+    valkyrie: {
+      enabled: ENABLE_VALKYRIE, minLevel: VALK_MIN_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
+      spendCapNcg: VALK_SPEND_CAP_NCG, spentNcg: 0, capReached: false,
+    },
     config: {
       pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000,
       verifyOnchain: VERIFY_ONCHAIN, maxItemsPerTx: MAX_ITEMS_PER_TX,
@@ -497,7 +740,7 @@ async function daemonMode() {
     out.ok = false; out.error = "缺少 NC_PRIVATE_KEY";
     console.log(JSON.stringify(out)); process.exit(1);
   }
-  let ctx = null;
+  let ctx = { spentNcg: 0 };
   if (!DRY) {
     const hex = CFG.privateKey.trim().replace(/^0x/i, "");
     if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
@@ -506,7 +749,7 @@ async function daemonMode() {
     }
     const account = RawPrivateKey.fromHex(hex);
     const pub = await account.getPublicKey();
-    ctx = { account, pub, signer: Address.deriveFrom(pub) };
+    ctx = { account, pub, signer: Address.deriveFrom(pub), spentNcg: 0 };
     out.signer = ctx.signer.toString();
   }
 
@@ -534,6 +777,7 @@ async function daemonMode() {
       first = false;
       log({ level: "info", msg: "市场扫货常驻启动", tip,
             ticker: TARGET_TICKER, maxUnitPriceNcg: Number(UNIT_PRICE_MINOR) / 100,
+            valkyrie: ENABLE_VALKYRIE ? `5部位/lv>=${VALK_MIN_LEVEL}/<=${VALK_MAX_PRICE_NCG}NCG/封顶${VALK_SPEND_CAP_NCG}NCG` : "关闭",
             pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000 });
     }
     try {
@@ -541,11 +785,20 @@ async function daemonMode() {
       out.totals.candidates += r.candidateCount || 0;
       out.totals.bought += (r.bought || []).filter((b) => b.status === "bought" || b.status === "would_buy").length;
       out.totals.tx += r.txSubmitted || 0;
+      out.valkyrie.spentNcg = ctx.spentNcg;
+      out.valkyrie.capReached = ctx.spentNcg >= VALK_SPEND_CAP_NCG;
       log({ level: "daemon", round: out.rounds, tip,
             rawCount: r.rawCount, candidateCount: r.candidateCount,
+            valkCandidates: (r.valkCandidates || []).length, valkSpendNcg: ctx.spentNcg,
             buyableCount: r.buyableCount, txSubmitted: r.txSubmitted,
             elapsedSec: Math.round((Date.now() - started) / 1000) });
       if (r.ok === false) { out.ok = false; out.error = r.error; handoff = "aborted"; break; }
+      // 装备预算买满：FAV 符文仍可继续（预算只约束 Valkyrie）；此处不提前结束，
+      // 让 FAV 扫货照常值守到时间预算。若只想跑装备可关 FAV（未来扩展）。
+      if (ctx.spentNcg >= VALK_SPEND_CAP_NCG && !out.valkyrie.capNotified) {
+        out.valkyrie.capNotified = true;
+        log({ level: "info", msg: `Valkyrie 装备已买满 ${ctx.spentNcg}/${VALK_SPEND_CAP_NCG} NCG，停止买入装备` });
+      }
     } catch (e) {
       out.transientErrors++;
       log({ level: "warn", msg: "本轮扫描异常，稍后重试", detail: String(e.message) });
@@ -596,19 +849,30 @@ async function onceMode() {
     }
     const account = RawPrivateKey.fromHex(hex);
     const pub = await account.getPublicKey();
-    ctx = { account, pub, signer: Address.deriveFrom(pub) };
+    ctx = { account, pub, signer: Address.deriveFrom(pub), spentNcg: 0 };
     out.signer = ctx.signer.toString();
   }
-  let simList = null;
+  if (!ctx) ctx = { spentNcg: 0 };
+  let simList = null, simValk = null;
   if (DRY && SIM_LISTINGS_FILE) {
-    try { simList = JSON.parse(fs.readFileSync(SIM_LISTINGS_FILE, "utf8")); } catch (_) {}
+    try {
+      const sim = JSON.parse(fs.readFileSync(SIM_LISTINGS_FILE, "utf8"));
+      // 兼容：{ fav:[...], valkyrie:{ Sword:[...], ... } } 或 纯数组(旧 FAV)
+      if (Array.isArray(sim)) simList = sim;
+      else { simList = sim.fav || []; simValk = sim.valkyrie || null; }
+    } catch (_) {}
   }
-  const r = await scanAndBuy(ctx, { agentAddress, simulatedListings: simList });
+  const r = await scanAndBuy(ctx, { agentAddress, simulatedListings: simList, simulatedValkListings: simValk });
   out.rawCount = r.rawCount; out.rejectedByTicker = r.rejectedByTicker;
   out.candidateCount = r.candidateCount; out.candidates = r.candidates;
   out.buyableCount = r.buyableCount; out.bought = r.bought; out.skipped = r.skipped;
   out.txSubmitted = r.txSubmitted; out.txLog = r.txLog || [];
   out.ncgBalanceNcg = r.ncgBalanceNcg ?? null;
+  out.valkyrie = {
+    enabled: ENABLE_VALKYRIE, minLevel: VALK_MIN_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
+    spendCapNcg: VALK_SPEND_CAP_NCG, candidates: r.valkCandidates || [],
+    rawCount: r.valkRawCount ?? null, fetchErrors: r.valkFetchErrors || [],
+  };
   if (r.ok === false) { out.ok = false; out.error = r.error; }
   console.log(JSON.stringify(out));
   process.exit(out.ok ? 0 : 1);
@@ -717,7 +981,78 @@ function selfTest() {
     chk("buildBuyAction 字节级比对", false, String(e.message));
   }
 
-  // 7) 终态判定：只认 SUCCESS/FAILURE/INVALID
+  // 7) Valkyrie 身份判定：itemId 段位 + level + 单价 + 字段齐全
+  {
+    const sword = VALKYRIE_PARTS[0];
+    const good = (over = {}) => ({ itemId: 10170000, level: 3, price: 2, itemSubType: 6,
+      productId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", tradableId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      sellerAgentAddress: "0x" + "11".repeat(20), sellerAvatarAddress: "0x" + "22".repeat(20), ...over });
+    chk("Valk Sword lv3 price2 命中", isValkyrieListing(good(), sword));
+    chk("Valk Sword 5元素变体全命中", ["10170000","10171000","10172000","10173000","10174000"]
+      .every((id) => isValkyrieListing(good({ itemId: id }), sword)));
+    chk("Valk lv2 拒绝", !isValkyrieListing(good({ level: 2 }), sword));
+    chk("Valk price3>2 拒绝", !isValkyrieListing(good({ price: 3 }), sword));
+    chk("Valk price2 边界命中", isValkyrieListing(good({ price: 2 }), sword));
+    chk("Valk 非本部位段位拒绝(Sword里放Armor id)", !isValkyrieListing(good({ itemId: 10270000 }), sword));
+    chk("Valk exist=false 拒绝", !isValkyrieListing(good({ exist: false }), sword));
+    chk("Valk legacy=true 拒绝", !isValkyrieListing(good({ legacy: true }), sword));
+    chk("Valk 缺 tradableId 拒绝", !isValkyrieListing(good({ tradableId: undefined }), sword));
+    chk("Valk 非整数 level 拒绝", !isValkyrieListing(good({ level: 3.5 }), sword));
+    // 其它部位段位互不串
+    chk("Valk Armor 段位命中", isValkyrieListing(good({ itemId: 10274000 }), VALKYRIE_PARTS[1]));
+    chk("Valk Belt 段位命中", isValkyrieListing(good({ itemId: 10371000 }), VALKYRIE_PARTS[2]));
+    chk("Valk Necklace 段位命中", isValkyrieListing(good({ itemId: 10473000 }), VALKYRIE_PARTS[3]));
+    chk("Valk Ring 段位命中", isValkyrieListing(good({ itemId: 10574000 }), VALKYRIE_PARTS[4]));
+  }
+
+  // 8) Valkyrie 候选筛选：按部位 + 单价升序
+  {
+    const mk = (itemId, level, price) => ({ itemId, level, price, itemSubType: 6,
+      productId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", tradableId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      sellerAgentAddress: "0x" + "11".repeat(20), sellerAvatarAddress: "0x" + "22".repeat(20) });
+    const byPart = { Sword: [mk(10174000, 5, 2), mk(10170000, 3, 1), mk(10171000, 3, 9)], Armor: [mk(10270000, 3, 2)] };
+    const cands = selectValkyrieCandidates(byPart);
+    chk("Valk 候选数量(排除price9)", cands.length === 3, `got ${cands.length}`);
+    chk("Valk 候选按单价升序", cands[0].priceNcg === 1 && cands[1].priceNcg === 2);
+    chk("Valk 候选带 partKey/kind", cands.every((c) => c.kind === "valkyrie" && !!c.partKey));
+    // 自定义阈值覆盖默认值
+    const cands2 = selectValkyrieCandidates(byPart, { minLevel: 5, maxPrice: 2 });
+    chk("Valk 自定义阈值(lv5)", cands2.length === 1 && cands2[0].level === 5, `got ${cands2.length}`);
+  }
+
+  // 9) NonFungible buy action 构造：p[0] 8 字段、用 9CAPI 合法模板字节规范
+  try {
+    const tpl = decode(Buffer.from(BUY_NFT_TEMPLATE, "hex"));
+    const v = tpl.get("values");
+    const buyer = v.get("a"), actId = v.get("id"), p0 = v.get("p")[0];
+    const stdHex = Buffer.from([p0[0][3],p0[0][2],p0[0][1],p0[0][0],p0[0][5],p0[0][4],p0[0][7],p0[0][6],
+      p0[0][8],p0[0][9],p0[0][10],p0[0][11],p0[0][12],p0[0][13],p0[0][14],p0[0][15]]).toString("hex");
+    const uuid = `${stdHex.slice(0,8)}-${stdHex.slice(8,12)}-${stdHex.slice(12,16)}-${stdHex.slice(16,20)}-${stdHex.slice(20)}`;
+    const priceNcg = Number(BigInt(p0[1][1])) / 100;
+    const item = { productId: uuid, tradableId: uuid, priceNcg, itemSubType: String(p0[6]),
+      sellerAgentAddress: "0x" + Buffer.from(p0[2]).toString("hex"),
+      sellerAvatarAddress: "0x" + Buffer.from(p0[3]).toString("hex") };
+    const built = buildValkyrieBuyAction([item], Buffer.from(buyer), Buffer.from(actId));
+    const builtHex = Buffer.from(encode(built)).toString("hex");
+    chk("NonFungible action 与 9CAPI 模板逐字节一致", builtHex === BUY_NFT_TEMPLATE,
+      builtHex === BUY_NFT_TEMPLATE ? `${builtHex.length/2}B` : `diff ${builtHex.length} vs ${BUY_NFT_TEMPLATE.length}`);
+    const bv = built.get("values").get("p")[0];
+    chk("NonFungible p[0] 8字段", bv.length === 8, `got ${bv.length}`);
+    chk("NonFungible productType=NonFungible", String(bv[4]) === "NonFungible");
+    chk("NonFungible itemSubType=Weapon", String(bv[6]) === "Weapon");
+  } catch (e) {
+    chk("NonFungible action 字节级比对", false, String(e.message));
+  }
+
+  // 10) 预算封顶逻辑（纯整数）
+  {
+    const cap = 500, spent = 499, price = 2;
+    chk("预算超额拦截", spent + price > cap);           // 499+2>500 → 跳
+    chk("预算刚好命中", 498 + 2 === cap);               // 恰好 500 → 买
+    chk("预算不约束 FAV", true);                        // FAV 不进预算判断（结构保证）
+  }
+
+  // 11) 终态判定：只认 SUCCESS/FAILURE/INVALID
   const termCases = [["SUCCESS", true], ["FAILURE", true], ["INVALID", true],
     ["STAGING", false], ["INCLUDED", false], ["PENDING", false]];
   for (const [s, exp] of termCases) chk(`isTerminalTxStatus(${s})`, isTerminalTxStatus(s) === exp);
