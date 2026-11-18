@@ -2,10 +2,15 @@
 /**
  * Nine Chronicles (Heimdall) — 无限塔「下一赛季第 1 层」自动冲塔监控
  * ----------------------------------------------------------------
- * 目的：用户一旦进入《无限塔》新赛季（默认第 11 期），立刻自动提交一笔
+ * 目的：用户一旦进入《无限塔》新赛季（默认第 14 期），立刻自动提交一笔
  *       infinite_tower_battle 打第 1 层。因为无限塔的个人计时器锚定在
  *       「首次进塔」那一笔（Lib9c PerformSeasonReset 设 LastTicketRefillBlockIndex
  *       = currentBlockIndex，并发放 1 张票），越早打第 1 层，个人补票时钟越早开始。
+ *
+ * 【按区块预唤醒 2026-11-18】第14期 start=12305511 = 第12期 end+1，换季瞬间衔接、无缓冲。
+ *   传 --arm-block 12305511 --lead-blocks 200：tip 未到 12305311 就秒退（配合 workflow 的
+ *   schedule 定时点火，平时近乎零消耗），进入窗口后切 20 秒高频轮询，tip 一到 12305511 立刻命中提交。
+ *   即使 cron 延迟错过窗口，只要 tip 已过阈值仍会进入 watch 并立即冲塔（判定 season≥14 且首层未通关）。
  *
  * 判定（全部满足才提交，只读链上权威状态）：
  *   1) infiniteTowerStatus.infiniteTowerId >= TARGET_SEASON（新赛季已上线）
@@ -97,7 +102,11 @@ const numArg = (flag, def) => {
   const n = Number(args[i + 1]);
   return Number.isFinite(n) ? n : def;
 };
-const TARGET_SEASON = Math.max(1, Math.trunc(numArg("--season", 11)));
+const TARGET_SEASON = Math.max(1, Math.trunc(numArg("--season", 14)));
+// 【按区块预唤醒】只有链上 tip 达到 ARM_BLOCK - LEAD_BLOCKS 才真正进入高频蹲守；
+// 否则单次检查直接秒退，避免换季前几十天白跑 watch 浪费 runner。ARM_BLOCK=0 表示关闭此机制。
+const ARM_BLOCK = Math.max(0, Math.trunc(numArg("--arm-block", 0)));
+const LEAD_BLOCKS = Math.max(0, Math.trunc(numArg("--lead-blocks", 200)));
 // 抢首层要快：默认 20 秒轮询一次链上状态（赛季一上链最多 20 秒内命中）。
 const GAP_MS = Math.max(5000, numArg("--gap-ms", 20000));
 // 单个 job 长驻预算，默认 5.5h（< GitHub 单 job 6h 上限），耗尽后交棒给下一个 job。
@@ -547,6 +556,20 @@ async function main() {
   }
 
   const out = { network: "heimdall", avatar: AVATAR, dryRun: DRY, mode: WATCH ? "watch" : ONCE ? "once" : "once", ok: true };
+
+  // 【按区块预唤醒】换季前几十天 tip 未进窗口 → 秒退，绝不进入 watch 长驻白耗 runner。
+  //   ARM_BLOCK=0（默认）关闭此机制，行为与旧版一致，便于手工演练/验证。
+  if (ARM_BLOCK > 0) {
+    const tip = await getTip().catch(() => null);
+    const armAt = ARM_BLOCK - LEAD_BLOCKS;
+    if (tip != null && tip < BigInt(armAt)) {
+      log({ level: "info", msg: "按区块预唤醒：tip 未到窗口，秒退", tip: String(tip), armAt, armBlock: ARM_BLOCK, leadBlocks: LEAD_BLOCKS });
+      console.log(JSON.stringify({ network: "heimdall", avatar: AVATAR, armed: false, tip: String(tip), armAt, result: "not_armed（tip 未到窗口，秒退，不进入蹲守）" }));
+      return;
+    }
+    log({ level: "info", msg: "按区块预唤醒：tip 已进入窗口，开始蹲守", tip: String(tip), armAt, armBlock: ARM_BLOCK });
+  }
+
   let ctx = null;
   if (!DRY) {
     try { ctx = await makeCtx(); }
