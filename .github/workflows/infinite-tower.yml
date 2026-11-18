@@ -20,6 +20,9 @@ name: 9C 无限塔 下一赛季自动冲塔 (Heimdall)
 #  判定（脚本内只读链上权威状态，全部满足才提交）：
 #    · infiniteTowerId >= 11 且 isActive 且 clearedFloor < 1 且 remainingTickets >= 1
 #    · 第 1 层通关后永久幂等跳过；交易只认 SUCCESS/FAILURE/INVALID 终态，跨节点复核。
+#  交易构造（2026-11-18 重写）：调 Heimdall 官方 stateQuery.infiniteTowerBattle 接口，
+#    用「当前实时装备 + 最近成功笔符文槽」现场生成 action，彻底废弃会过期的历史模板；
+#    loadout 两者兜底（实时 inventory → 最近 SUCCESS 笔），buyTicket/useNcg 均为 false。
 #  前置：新赛季排期由官方 patch 注入链上 —— 未上线前脚本只轮询等待，不乱提交。
 #
 #  私钥：与领奖/扫货/AB 三条链共用同一份 keystore Secrets，仅在 runner 内临时解密，
