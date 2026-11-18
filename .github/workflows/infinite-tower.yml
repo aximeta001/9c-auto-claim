@@ -1,9 +1,15 @@
 name: 9C 无限塔 下一赛季自动冲塔 (Heimdall)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 盯《无限塔》新赛季（默认第 11 期），一旦链上排期上线，立刻自动提交一笔
+# 盯《无限塔》新赛季（默认第 14 期），一旦链上排期上线，立刻自动提交一笔
 # infinite_tower_battle 打第 1 层 —— 个人补票时钟锚定在「首次进塔」那一笔，
 # 越早打第 1 层越早开始计时。
+#
+# 【按区块预唤醒 2026-11-18】链上赛季表证实：第14期 start=12305511 = 第12期 end+1（无缝衔接），
+#   且第11/13期被治理跳号，根本不存在。第12期约 42 天后才结束，没必要现在就每 10 分钟空跑 watch。
+#   故新增「前置 tip 探测」step：每次调度先用一次 curl 查 tip，未到 12305511-200=12305311 就直接
+#   结束整个 job（不 checkout、不 npm ci、不解 keystore，成本近乎为零）；进入窗口才拉起 watch 高频蹲守。
+#   即使 cron 延迟错过窗口，只要 tip 已过阈值，任意一轮触发仍会立即进入 watch 并冲塔。
 #
 # 【为什么不用 schedule 当主力】GitHub 的 schedule cron 在高负载时会延迟数十分钟
 #   甚至整点丢弃，抢首层完全靠不住。本 workflow 复用领奖链已验证的高可用架构：
@@ -18,7 +24,7 @@ name: 9C 无限塔 下一赛季自动冲塔 (Heimdall)
 #   保险：schedule 每 10 分钟只作「接力链意外断裂时重新点火」，链正常时根本用不到。
 #
 #  判定（脚本内只读链上权威状态，全部满足才提交）：
-#    · infiniteTowerId >= 11 且 isActive 且 clearedFloor < 1 且 remainingTickets >= 1
+#    · infiniteTowerId >= 14 且 isActive 且 clearedFloor < 1 且 remainingTickets >= 1
 #    · 第 1 层通关后永久幂等跳过；交易只认 SUCCESS/FAILURE/INVALID 终态，跨节点复核。
 #  交易构造（2026-11-18 重写）：调 Heimdall 官方 stateQuery.infiniteTowerBattle 接口，
 #    用「当前实时装备 + 最近成功笔符文槽」现场生成 action，彻底废弃会过期的历史模板；
@@ -41,9 +47,17 @@ on:
         type: boolean
         default: true
       season:
-        description: '目标赛季号（默认 11；留空用默认）'
+        description: '目标赛季号（默认 14；留空用默认）'
         type: string
-        default: '11'
+        default: '14'
+      arm_block:
+        description: '预定换季起始区块（默认 12305511=第14期；tip 到达 [arm_block-lead_blocks] 才真正蹲守）'
+        type: string
+        default: '12305511'
+      lead_blocks:
+        description: '提前多少块进入蹲守窗口（默认 200 块≈27 分钟）'
+        type: string
+        default: '200'
       max_watch_seconds:
         description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
         type: string
@@ -62,19 +76,61 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360           # > 5.5h 蹲守预算，留足交棒余量（< GitHub 单 job 上限 6h）
     steps:
+      # ── 前置闸门：换季前先用一次 curl 查 tip，未进窗口就整个 job 秒退（不装依赖/不解私钥，近乎零消耗）──
+      - name: 按预定区块探测是否进入蹲守窗口
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+          LEAD_BLOCKS: ${{ inputs.lead_blocks }}
+        run: |
+          set -o pipefail
+          AB="${ARM_BLOCK:-12305511}"; LB="${LEAD_BLOCKS:-200}"
+          case "$AB" in ''|*[!0-9]*) AB="12305511";; esac
+          case "$LB" in ''|*[!0-9]*) LB="200";; esac
+          ARM_AT=$((AB - LB))
+          echo "arm_block=$AB lead_blocks=$LB 窗口起点=$ARM_AT"
+          # 手工演练(dry_run=true)不设闸门：便于随时验证流程；真跑(schedule/dispatch 真跑)才拦截
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+            echo "手工演练：跳过区块闸门"; exit 0
+          fi
+          TIP=$(curl -s -m 20 -X POST 'https://heimdall6.9capi.com/graphql' \
+            -H 'Content-Type: application/json' \
+            --data-raw '{"query":"{ nodeStatus { tip { index } } }"}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["nodeStatus"]["tip"]["index"])' 2>/dev/null)
+          echo "当前 tip=$TIP"
+          if [ -z "$TIP" ]; then
+            # 查 tip 失败：保守起见放行，交给脚本层再次判断（脚本层查不到则照常轮询，不误杀）
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+            echo "tip 探测失败，放行由脚本层兜底"; exit 0
+          fi
+          if [ "$TIP" -ge "$ARM_AT" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+            echo "tip($TIP) 已进入/越过窗口起点($ARM_AT)，拉起蹲守"
+          else
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+            echo "tip($TIP) 距窗口还有 $((ARM_AT - TIP)) 块，本次秒退（换季前不空跑）"
+          fi
+
       - name: 检出代码
+        if: steps.gate.outputs.armed == 'true'
         uses: actions/checkout@v4
 
       - name: 准备 Node
+        if: steps.gate.outputs.armed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
 
       - name: 安装依赖
+        if: steps.gate.outputs.armed == 'true'
         run: npm ci --omit=dev --no-audit --no-fund
 
       - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        if: steps.gate.outputs.armed == 'true'
         env:
           NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
           NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
@@ -93,23 +149,33 @@ jobs:
           node import-key.mjs $ARGS
 
       - name: 纯逻辑自测（不联网）
+        if: steps.gate.outputs.armed == 'true'
         run: node infinite-tower.mjs --self-test
 
       - name: 蹲守新赛季并冲第 1 层（进程内高频轮询）
+        if: steps.gate.outputs.armed == 'true'
         env:
           EVENT: ${{ github.event_name }}
           DRY: ${{ inputs.dry_run }}
           SEASON: ${{ inputs.season }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+          LEAD_BLOCKS: ${{ inputs.lead_blocks }}
           WATCH_SEC: ${{ inputs.max_watch_seconds }}
         run: |
           set -o pipefail
           # 主力真跑：--watch 常驻高频轮询。schedule 触发或手工取消 dry_run 勾选 = 真跑。
           EXTRA="--watch --gap-ms 20000"
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
+            # 手工演练不带 arm 开关（tip 未到窗口也能验证入口流程）；真跑带 arm 作脚本层双保险。
             EXTRA="$EXTRA --dry-run"
+          else
+            AB="${ARM_BLOCK:-12305511}"; LB="${LEAD_BLOCKS:-200}"
+            case "$AB" in ''|*[!0-9]*) AB="12305511";; esac
+            case "$LB" in ''|*[!0-9]*) LB="200";; esac
+            EXTRA="$EXTRA --arm-block $AB --lead-blocks $LB"
           fi
           case "$SEASON" in
-            ''|*[!0-9]*) EXTRA="$EXTRA --season 11" ;;
+            ''|*[!0-9]*) EXTRA="$EXTRA --season 14" ;;
             *) EXTRA="$EXTRA --season $SEASON" ;;
           esac
           case "$WATCH_SEC" in
@@ -121,7 +187,7 @@ jobs:
           exit ${PIPESTATUS[0]}
 
       - name: 接力（预算耗尽时触发下一个蹲守 job）
-        if: always()
+        if: always() && steps.gate.outputs.armed == 'true'
         env:
           # 未配置 PAT 时用内置 GITHUB_TOKEN（零配置即可跑）；
           # 若自接力被平台限制，可加 Secret NC_DISPATCH_TOKEN 兜底。
@@ -131,6 +197,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DRY_RUN: ${{ inputs.dry_run }}
           SEASON: ${{ inputs.season }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+          LEAD_BLOCKS: ${{ inputs.lead_blocks }}
         run: |
           # 只在「预算耗尽、正常交棒」时接力。演练、冲塔成功、异常中止绝不接力，
           # 避免高频空转刷爆 run 次数；断链时由 schedule 重燃。
@@ -142,15 +210,18 @@ jobs:
             echo "未检测到正常交棒标记（可能已冲塔成功/定论/异常），不接力"; exit 0
           fi
           echo "检测到正常交棒，发起接力…"
-          SEASON_IN="${SEASON:-11}"
-          case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="11" ;; esac
+          SEASON_IN="${SEASON:-14}"
+          case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="14" ;; esac
+          AB_IN="${ARM_BLOCK:-12305511}"; LB_IN="${LEAD_BLOCKS:-200}"
+          case "$AB_IN" in ''|*[!0-9]*) AB_IN="12305511";; esac
+          case "$LB_IN" in ''|*[!0-9]*) LB_IN="200";; esac
           CODE=""
           for i in 1 2 3; do
             CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
               -H "Authorization: Bearer $DISPATCH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\"}}" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\",\"arm_block\":\"$AB_IN\",\"lead_blocks\":\"$LB_IN\"}}" \
               "https://api.github.com/repos/$RELAY_REPO/actions/workflows/infinite-tower.yml/dispatches") || CODE="000"
             if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
             echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"
