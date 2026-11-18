@@ -140,6 +140,12 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 function isTerminalTxStatus(s) {
   return s === "SUCCESS" || s === "FAILURE" || s === "INVALID";
 }
+// 是否为「已入块的可信终态」：终态且 blockIndex 非空。
+// 交易刚 stage 未入块时节点可能短暂返回 INVALID/FAILURE（blockIndex=null），属伪终态，不可采信。
+function isConfirmedTerminal(r) {
+  if (!r || !isTerminalTxStatus(r.txStatus)) return false;
+  return r.blockIndex != null && r.blockIndex !== "";
+}
 
 // ---------------- 链上状态读取 ----------------
 async function getTip() {
@@ -175,10 +181,14 @@ async function getAgentAddress(avatar) {
 }
 
 // ---------------- 模板获取与 action 构造 ----------------
-// 从 Mimir 拉该 avatar 最近一笔 SUCCESS 的 infinite_tower_battle.raw
-async function fetchTemplateRaw(avatar) {
+// 【修复 2026-11-18】模板必须带「当前装备」：equipments 字段来自模板原样保留，
+//   写死的旧 fallback 模板用的是赛季10/第100层的旧装备，套到新赛季第1层会因
+//   楼层准入/装备条件不符而 FAILURE。真跑只接受 Mimir 上该 avatar 最近 SUCCESS 的模板
+//   （装备即当前装备），彻底废弃 fallback 用于真跑；fallback 仅 dry-run/自测可用。
+async function fetchTemplateRaw(avatar, { allowFallback = false } = {}) {
   const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:60){
     items { blockIndex object { txStatus actions { typeId raw } } } } }`;
+  const candidates = [];
   try {
     const d = await gql(CFG.mimir, q, { a: avatar });
     const items = d.data?.transactions?.items || [];
@@ -188,17 +198,25 @@ async function fetchTemplateRaw(avatar) {
       for (const a of o.actions || []) {
         if (a.typeId === TYPE_ID && a.raw &&
             /^[0-9a-fA-F]+$/.test(a.raw) && a.raw.length % 2 === 0) {
-          return { raw: a.raw, source: `mimir@${it.blockIndex}` };
+          candidates.push({ raw: a.raw, blockIndex: Number(it.blockIndex) || 0, source: `mimir@${it.blockIndex}` });
         }
       }
     }
   } catch (e) {
     log({ level: "warn", msg: "拉取历史 infinite_tower_battle 模板失败", detail: String(e.message) });
   }
-  if (avatar.toLowerCase() === MAIN_AVATAR.toLowerCase()) {
+  if (candidates.length) {
+    // 取最新一笔（装备最接近当前状态）
+    candidates.sort((a, b) => b.blockIndex - a.blockIndex);
+    const best = candidates[0];
+    log({ level: "info", msg: "采用链上最新 SUCCESS 模板（含当前装备）", source: best.source, blockIndex: best.blockIndex });
+    return best;
+  }
+  if (allowFallback && avatar.toLowerCase() === MAIN_AVATAR.toLowerCase()) {
+    log({ level: "warn", msg: "无链上模板，仅在演练/自测使用过期 fallback（真跑不可用）", source: "fallback@11833685" });
     return { raw: FALLBACK_RAW, source: "fallback@11833685" };
   }
-  throw new Error("本 avatar 无可用 infinite_tower_battle 模板：Mimir 未返回，且内置模板属于主角色");
+  throw new Error("无可用链上 SUCCESS 模板（装备未知）——拒绝用过期 fallback 真跑以免浪费票；请先用官方客户端手工打一次第1层生成模板");
 }
 
 // 只改写三个字段：id(新16字节)、infiniteTowerId→赛季、floorId→1；其余原样保留。
@@ -263,9 +281,14 @@ async function submitTx({ account, pub, signer, nonce, actionValue }) {
   return d.data.stageTransaction;
 }
 
-// 跨节点并行复核：任节点返回终态即采用（防单节点「伪 INVALID」）
+// 跨节点并行复核：必须「终态且已入块」才采用，杜绝「伪 INVALID」。
+// 【修复 2026-11-18】旧逻辑：任一节点返回 INVALID/FAILURE 就立即当终态返回。
+//   但交易刚 stageTransaction、尚未入块时，部分节点会短暂返回 INVALID（blockIndex=null），
+//   脚本据此误判失败并交棒，导致同 nonce 反复提交、空转刷 run。
+//   新逻辑：终态必须带非空 blockIndex（真正上过链）才算数；否则继续轮询到超时。
 async function confirmTxAcrossNodes(txId, tries = CFG.confirmTries) {
   const q = "query($t:TxId!){ transaction { transactionResult(txId:$t){ txStatus blockIndex exceptionNames } } }";
+  let lastUnconfirmed = null;
   for (let i = 0; i < tries; i++) {
     const results = await Promise.all(CFG.rpcUrls.map(async (url) => {
       try {
@@ -273,12 +296,18 @@ async function confirmTxAcrossNodes(txId, tries = CFG.confirmTries) {
         return d.data?.transaction?.transactionResult;
       } catch (_) { return null; }
     }));
+    // 优先采用「终态 + 已入块」的结果；PENDING 或伪 INVALID（无 blockIndex）只记为候选
+    let confirmed = null;
     for (const r of results) {
-      if (r && isTerminalTxStatus(r.txStatus)) return r;
+      if (!r) continue;
+      if (isConfirmedTerminal(r)) { confirmed = r; break; }
+      if (!lastUnconfirmed || r.txStatus === "PENDING") lastUnconfirmed = r;
     }
+    if (confirmed) return confirmed;
     if (i < tries - 1) await sleepMs(CFG.confirmIntervalMs);
   }
-  return { txStatus: "PENDING" };
+  // 超时仍未入块：返回最后一次看到的非终态/未入块状态，交由上层按「未定论」处理，绝不误判为失败终态
+  return lastUnconfirmed || { txStatus: "PENDING" };
 }
 
 // ---------------- 判定：是否满足提交条件 ----------------
@@ -314,7 +343,7 @@ async function runOnce(ctx, out) {
   if (!d.ok) { out.result = "skip"; return; }
 
   const season = d.currentSeason;   // 用链上实际赛季号（>= 目标），而非写死，避免错过换季
-  const template = await fetchTemplateRaw(AVATAR);
+  const template = await fetchTemplateRaw(AVATAR, { allowFallback: DRY });
   out.template = { source: template.source };
   const actionValue = buildBattleAction(template.raw, AVATAR, season, 1);
   out.action = { typeId: TYPE_ID, infiniteTowerId: season, floorId: 1 };
@@ -333,11 +362,24 @@ async function runOnce(ctx, out) {
   out.nonce = String(nonce);
   log({ level: "info", msg: "已提交 infinite_tower_battle 第1层", txId, nonce: String(nonce), season });
 
+  // 【修复 2026-11-18】提交过交易即视为「本轮已用掉一次机会」，无论结果都不再交棒空转。
+  //   接力风暴根因：伪 INVALID → result 非 SUCCESS → break，但 out.handoff 仍为空 →
+  //   watch 主循环补 budget_exhausted → workflow 立刻拉新 job → 同 nonce 反复提交。
+  out.submitted = true;
   const result = await confirmTxAcrossNodes(txId);
   out.txResult = result;
   log({ level: "info", msg: "交易终态", txId, ...result });
+  if (!isConfirmedTerminal(result)) {
+    // 未入块/未定论：不重复提交（避免 nonce 冲突），标记 settled 让 watch 停止并交棒给需继续蹲守的场景。
+    // 但本轮已提交过，绝不因「未成功」而再次提交。
+    out.result = `交易未定论（${result.txStatus}，未入块）——不重复提交，等待人工/链上确认`;
+    log({ level: "warn", msg: "交易未定论，停止本轮提交以免 nonce 冲突与浪费票", txId });
+    return;
+  }
   if (result.txStatus !== "SUCCESS") {
-    out.result = `交易未成功（${result.txStatus}）`;
+    // 真正上链的 FAILURE/INVALID（有 blockIndex）：本轮已定论，不重复提交、不空转接力。
+    out.result = `交易未成功（${result.txStatus}@block${result.blockIndex}）`;
+    log({ level: "warn", msg: "交易已上链但未成功，停止本轮以免浪费票", txId, blockIndex: result.blockIndex });
     return;
   }
   // 成功后再次读链上确认第1层已通关（交易 SUCCESS 但战斗失利也可能发生）
@@ -393,16 +435,24 @@ async function main() {
           out.handoff = "none";
           break;
         }
-        if (out.result && out.result.startsWith("交易未成功")) break;   // 已定论，不盲目重复
-        if (out.result && out.result.startsWith("交易 SUCCESS 但未确认通关")) break;  // 已花票，等人工复核
+        if (out.result && out.result.startsWith("交易未成功")) { out.handoff = "none"; break; }   // 已上链定论，不重复提交、不接力
+        if (out.result && out.result.startsWith("交易未定论")) { out.handoff = "none"; break; }   // 已提交，等链上确认，不接力空转
+        if (out.result && out.result.startsWith("交易 SUCCESS 但未确认通关")) { out.handoff = "none"; break; }  // 已花票，等人工复核
       } catch (e) {
         log({ level: "warn", msg: "本轮检查异常，稍后重试", detail: e.message });
       }
       await sleepMs(GAP_MS);
     }
     if (!out.done && !out.handoff) {
-      // 预算耗尽（非命中、非定论、非演练）：正常交棒，由 workflow 接力 step 立即拉起下一个 job。
-      out.handoff = DRY ? "dry_run" : "budget_exhausted";
+      // 【修复 2026-11-18】只有「从未提交过交易、仅因预算耗尽」才交棒。
+      //   一旦 out.submitted=true 却走到这里，说明状态判断有遗漏，也绝不交棒，避免接力风暴。
+      if (out.submitted) {
+        out.handoff = "none";
+        log({ level: "warn", msg: "已提交过交易但无明确定义结论，为安全起见不交棒" });
+      } else {
+        // 预算耗尽（非命中、非定论、非演练）：正常交棒，由 workflow 接力 step 拉起下一个 job 继续蹲守。
+        out.handoff = DRY ? "dry_run" : "budget_exhausted";
+      }
     }
     out.rounds = rounds;
     out.elapsedSec = Math.round((Date.now() - started) / 1000);
@@ -427,6 +477,13 @@ function selfTest() {
   ok("中间态 STAGING 不算终态", isTerminalTxStatus("STAGING") === false);
   ok("中间态 INCLUDED 不算终态", isTerminalTxStatus("INCLUDED") === false);
   ok("PENDING 不算终态", isTerminalTxStatus("PENDING") === false);
+
+  // 【修复回归】已入块终态 vs 伪终态
+  ok("SUCCESS+有block = 可信终态", isConfirmedTerminal({ txStatus: "SUCCESS", blockIndex: 11853728 }) === true);
+  ok("INVALID+无block = 伪终态不采信", isConfirmedTerminal({ txStatus: "INVALID", blockIndex: null }) === false);
+  ok("FAILURE+无block = 伪终态不采信", isConfirmedTerminal({ txStatus: "FAILURE" }) === false);
+  ok("SUCCESS+无block 不采信", isConfirmedTerminal({ txStatus: "SUCCESS", blockIndex: null }) === false);
+  ok("PENDING+有block 也不算终态", isConfirmedTerminal({ txStatus: "PENDING", blockIndex: 123 }) === false);
 
   // 判定逻辑
   const base = { infiniteTowerId: 10, isActive: true, clearedFloor: 0, remainingTickets: 1, scheduleStatus: "Active" };
