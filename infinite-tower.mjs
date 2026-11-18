@@ -13,13 +13,16 @@
  *   3) clearedFloor < 1（第 1 层尚未通关 —— 幂等：通关后本脚本永不重复提交）
  *   4) remainingTickets >= 1（有票；Lib9c 新赛季首笔会送 1 张，正好够第 1 层）
  *
- * 交易构造（字节级复用「本人已成功」的历史 infinite_tower_battle 模板）：
- *   · 从 Mimir 拉该 avatar 最近一笔 SUCCESS 的 infinite_tower_battle.raw；
- *     取不到则回退到内置模板（主角色 bnb 的一笔已成功交易，仅对主角色有效）。
- *   · 只强制改写三个字段：id(新16字节)、infiniteTowerId→目标赛季、floorId→1。
- *   · 装备 / 时装 / 食物 / 符文槽 / buyTicketIfNeeded / useNcgForTicket 原样保留，
- *     确保 CP、装备、符文等链上校验与那笔「最近 SUCCESS」完全一致，自动跟随养成。
- *   · buyTicketIfNeeded=false、useNcgForTicket=false：新赛季首笔送 1 票，不花 NCG/材料。
+ * 交易构造（【2026-11-18 重写】从官方接口现场构造，杜绝过期模板）：
+ *   · 旧方案套用历史 infinite_tower_battle.raw，equipments/costumes/runeSlotInfos 是
+ *     当时的快照；新赛季装备一变就校验失败（今天首层全 FAILURE 的根因）。即使改用
+ *     「最近 SUCCESS 那笔」，下赛季它又过期——死循环。
+ *   · 新方案调用 Heimdall 官方 stateQuery.infiniteTowerBattle(avatarAddress, floorId,
+ *     equipmentIds, costumeIds, foodIds, runeSlotInfos)，由服务端用「当前链上状态 +
+ *     当前 loadout」现场构造并返回 action raw（每次调用自带全新 id，无 nonce 冲突）。
+ *   · loadout 两者兜底：① 优先实时读 avatar.inventory(equipped=true) 的装备/时装 GUID
+ *     + 最近成功笔的符文槽配置；② 失败则整包退回最近 SUCCESS 笔的 loadout。
+ *   · buyTicketIfNeeded=false、useNcgForTicket=false（接口默认）：首笔送 1 票，不花 NCG/材料。
  *
  * 终态只认 SUCCESS / FAILURE / INVALID（同 claim.mjs 的 isTerminalTxStatus）；
  * 提交后跨节点并行复核，防「伪 INVALID」。提交成功后再次读链上 clearedFloor 确认 >=1。
@@ -180,7 +183,109 @@ async function getAgentAddress(avatar) {
   return d.data?.stateQuery?.avatar?.agentAddress || null;
 }
 
-// ---------------- 模板获取与 action 构造 ----------------
+// ---------------- 现场 action 构造（官方接口，杜绝过期模板） ----------------
+// 从 avatar 最近 SUCCESS 的 infinite_tower_battle 交易取「符文槽配置 + 兜底 loadout」。
+// 符文槽配置(slotIndex→runeId) GraphQL 无法从 avatar 当前状态直接读出，故沿用最近成功笔的；
+// 符文槽比装备稳定，且接口会按当前状态重新算 CP。
+async function fetchLastLoadout(avatar) {
+  const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:80){
+    items { blockIndex object { id txStatus actions { typeId } } } } }`;
+  const d = await gql(CFG.mimir, q, { a: avatar });
+  const items = d.data?.transactions?.items || [];
+  // 从新到旧找第一笔 SUCCESS 的 tower 交易（拿它的 txId 去查 firstClear loadout）
+  const succTxs = [];
+  for (const it of items) {
+    const o = it.object || {};
+    if (o.txStatus !== "SUCCESS" || !o.id) continue;
+    if ((o.actions || []).some(a => a.typeId === TYPE_ID)) succTxs.push(o.id);
+  }
+  if (!succTxs.length) return null;
+  const fq = `query($t:TxId!){ stateQuery { infiniteTowerFirstClear(txId:$t){
+    equipmentIds costumeIds foodIds runeSlotInfos { slotIndex runeId }
+  } } }`;
+  for (const txId of succTxs.slice(0, 3)) {
+    try {
+      const fd = await gql(CFG.statusRpc, fq, { t: txId });
+      const r = fd.data?.stateQuery?.infiniteTowerFirstClear;
+      if (r && Array.isArray(r.runeSlotInfos)) {
+        return {
+          equipmentIds: r.equipmentIds || [],
+          costumeIds: r.costumeIds || [],
+          foodIds: r.foodIds || [],
+          runeSlotInfos: (r.runeSlotInfos || []).map(x => ({ slotIndex: Number(x.slotIndex), runeId: Number(x.runeId) })),
+          source: `firstClear@${String(txId).slice(0, 12)}`,
+        };
+      }
+    } catch (_) { /* 试下一笔 */ }
+  }
+  return null;
+}
+
+// 优先实时读 avatar 当前已装备的 GUID（equipments/costumes），符文槽沿用最近成功笔。
+// 任何一步失败都整包退回最近成功笔的 loadout。
+async function resolveLoadout(avatar) {
+  const hist = await fetchLastLoadout(avatar).catch(e => {
+    log({ level: "warn", msg: "读取最近成功笔 loadout 失败", detail: String(e.message) });
+    return null;
+  });
+  const liveQ = `query($a:Address!){ stateQuery { avatar(avatarAddress:$a){
+    inventory { equipments { itemId equipped } costumes { itemId equipped } } } } }`;
+  try {
+    const d = await gql(CFG.statusRpc, liveQ, { a: avatar });
+    const inv = d.data?.stateQuery?.avatar?.inventory;
+    if (!inv) throw new Error("avatar inventory 为空");
+    const equipmentIds = (inv.equipments || []).filter(e => e.equipped).map(e => e.itemId);
+    const costumeIds = (inv.costumes || []).filter(c => c.equipped).map(c => c.itemId);
+    if (!equipmentIds.length) throw new Error("当前无已装备的 equipments");
+    const runeSlotInfos = hist?.runeSlotInfos || [];
+    log({ level: "info", msg: "loadout=实时装备", equipments: equipmentIds.length, costumes: costumeIds.length,
+          runeSlots: runeSlotInfos.length, runeSource: hist?.source || "none" });
+    return { equipmentIds, costumeIds, foodIds: hist?.foodIds || [], runeSlotInfos, source: "live-inventory" };
+  } catch (e) {
+    log({ level: "warn", msg: "实时装备读取失败，退回最近成功笔 loadout", detail: String(e.message) });
+    if (hist) {
+      log({ level: "info", msg: "loadout=历史成功笔", source: hist.source, equipments: hist.equipmentIds.length });
+      return hist;
+    }
+    throw new Error("实时装备与历史 loadout 均不可用，拒绝构造以免 FAILURE 浪费票");
+  }
+}
+
+// 现场构造：调用官方 infiniteTowerBattle 接口，服务端按当前链上状态+loadout 生成 action raw。
+// 返回解码后的 BencodexDictionary（与 submitTx 期望的 actionValue 一致）。
+async function buildBattleActionLive(avatar, season, floor) {
+  const loadout = await resolveLoadout(avatar);
+  const q = `query($a:Address!,$f:Int!,$eq:[Guid!],$co:[Guid!],$fo:[Guid!],$ru:[RuneSlotInfoInputType!]){
+    stateQuery { infiniteTowerBattle(avatarAddress:$a, floorId:$f,
+      equipmentIds:$eq, costumeIds:$co, foodIds:$fo, runeSlotInfos:$ru) } }`;
+  const vars = {
+    a: avatar, f: floor, eq: loadout.equipmentIds, co: loadout.costumeIds,
+    fo: loadout.foodIds, ru: loadout.runeSlotInfos,
+  };
+  const d = await gql(CFG.statusRpc, q, vars);
+  const raw = d.data?.stateQuery?.infiniteTowerBattle;
+  if (!raw || !/^[0-9a-fA-F]+$/.test(raw) || raw.length % 2 !== 0) {
+    throw new Error("infiniteTowerBattle 接口未返回合法 action raw");
+  }
+  const action = decode(Buffer.from(raw, "hex"));
+  if (!(action instanceof BencodexDictionary) || String(action.get("type_id")) !== TYPE_ID) {
+    throw new Error("现场 action type_id 校验失败");
+  }
+  const values = action.get("values");
+  // 关键校验：赛季与楼层必须是目标值（防止接口返回错位）
+  if (Number(values.get("infiniteTowerId")) !== Number(season) || Number(values.get("floorId")) !== Number(floor)) {
+    throw new Error(`现场 action 字段不符：season=${values.get("infiniteTowerId")} floor=${values.get("floorId")}，期望 ${season}/${floor}`);
+  }
+  // 归属校验
+  const mine = Buffer.from(Address.fromHex(avatar).toBytes());
+  const addr = values.get("avatarAddress");
+  if (!addr || !Buffer.isBuffer(addr) || !addr.equals(mine)) {
+    throw new Error("现场 action avatarAddress 与本角色不符");
+  }
+  return { actionValue: action, loadout: loadout.source };
+}
+
+// ---------------- [旧] 历史模板构造（保留供兼容/自测，主路径已弃用） ----------------
 // 【修复 2026-11-18】模板必须带「当前装备」：equipments 字段来自模板原样保留，
 //   写死的旧 fallback 模板用的是赛季10/第100层的旧装备，套到新赛季第1层会因
 //   楼层准入/装备条件不符而 FAILURE。真跑只接受 Mimir 上该 avatar 最近 SUCCESS 的模板
@@ -343,10 +448,11 @@ async function runOnce(ctx, out) {
   if (!d.ok) { out.result = "skip"; return; }
 
   const season = d.currentSeason;   // 用链上实际赛季号（>= 目标），而非写死，避免错过换季
-  const template = await fetchTemplateRaw(AVATAR, { allowFallback: DRY });
-  out.template = { source: template.source };
-  const actionValue = buildBattleAction(template.raw, AVATAR, season, 1);
-  out.action = { typeId: TYPE_ID, infiniteTowerId: season, floorId: 1 };
+  // 【2026-11-18 重写】现场构造 action：官方接口 + 当前 loadout，杜绝过期模板。
+  const built = await buildBattleActionLive(AVATAR, season, 1);
+  const actionValue = built.actionValue;
+  out.action = { typeId: TYPE_ID, infiniteTowerId: season, floorId: 1, build: "live", loadout: built.loadout };
+  log({ level: "info", msg: "现场构造 action 完成", season, floor: 1, loadout: built.loadout });
 
   if (DRY) { out.result = "dry-run（未提交）"; return; }
 
@@ -411,6 +517,34 @@ async function makeCtx() {
 
 async function main() {
   if (SELF_TEST) return selfTest();
+
+  // --build-test：联网验证「现场构造」路径（读 loadout + 调官方接口 + 校验字段），绝不提交交易。
+  if (args.includes("--build-test")) {
+    const out = { network: "heimdall", avatar: AVATAR, mode: "build-test", ok: true };
+    try {
+      const status = await getTowerStatus(AVATAR);
+      const season = Number(status.infiniteTowerId);
+      const built = await buildBattleActionLive(AVATAR, season, 1);
+      const v = built.actionValue.get("values");
+      out.detail = {
+        season, floor: 1, loadout: built.loadout,
+        typeId: String(built.actionValue.get("type_id")),
+        innerSeason: String(v.get("infiniteTowerId")),
+        innerFloor: String(v.get("floorId")),
+        equipmentCount: Array.isArray(v.get("equipments")) ? v.get("equipments").length : -1,
+        costumeCount: Array.isArray(v.get("costumes")) ? v.get("costumes").length : -1,
+        buyTicketIfNeeded: v.get("buyTicketIfNeeded"),
+        useNcgForTicket: v.get("useNcgForTicket"),
+      };
+      log({ level: "info", msg: "现场构造验证成功（未提交交易）", ...out.detail });
+    } catch (e) {
+      out.ok = false; out.error = e.message;
+      log({ level: "error", msg: "现场构造验证失败", detail: e.message });
+    }
+    console.log(JSON.stringify(out));
+    if (!out.ok) process.exit(1);
+    return;
+  }
 
   const out = { network: "heimdall", avatar: AVATAR, dryRun: DRY, mode: WATCH ? "watch" : ONCE ? "once" : "once", ok: true };
   let ctx = null;
