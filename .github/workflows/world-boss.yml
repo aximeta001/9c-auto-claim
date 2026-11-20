@@ -1,0 +1,204 @@
+name: 9C World Boss 自动战斗 (Heimdall)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# World Boss（WB）自动战斗，提交 raid7 action。策略经用户 2026-11-20/21 确认，
+# 全部来自 Lib9c 源码 + 主网链上表核实：
+#
+#   · 按 boss 等级判定：仅当全球 boss 当前等级 > 你记录的 latestBossLevel 才打。
+#     源码 raid7 击杀奖励唯一触发条件 `if (raiderState.LatestBossLevel < bossState.Level)`，
+#     未升级绝不打（不浪费票）；多升几级源码一次补发。
+#   · 门票：免费票优先（remain>=1 → PayNcg=false），用尽后 NCG 买满 40（PayNcg=true，
+#     买票不扣免费票）。买票前运行时护栏校验 ticket_price=1/additional=0/max=40，
+#     读不到或不符 → 不买（尊重「不是 1NCG 递增就暂不操作」）。
+#   · 首次入场水晶：action 服务端自动扣（entranceFee×level²），脚本不额外构造。
+#   · 只打不领：绝不提交 claim action，击杀奖励由用户自行领取。
+#   · 启动门控：tip < arm_block（默认 12000000，用户要求「12000 区块之后启动」）秒退。
+#     赛季开始不要求抢首层，晚点无妨。
+#
+# 稳定运行架构（复用领奖/无限塔链，已验证）：
+#   前置闸门：每次调度先 curl 查 tip，未到 arm_block 就整个 job 秒退（不 checkout/不装依赖/
+#             不解私钥，成本近零）。进入窗口才拉起 watch。
+#   主力：job 内 world-boss.mjs --watch 常驻，进程内每 60s 轮询一次链上状态，
+#         boss 一升级即提交（不等下一条 cron）。
+#   接力：job 守满预算（默认 5.5h < 6h 上限）打印 {"handoff":"budget_exhausted"}，
+#         末尾 step 用 workflow_dispatch REST API 即时刻下一个 job，concurrency 组串行无缝。
+#   停止：买满 40 / 赛季末 / 已提交未定论 / 交易定论 → 不接力，避免空转浪费 runner。
+#   保险：schedule 每 10 分钟只作「接力链意外断裂时重新点火」。
+#
+# 交易终态只认 SUCCESS / FAILURE / INVALID 且须带 blockIndex（跨节点复核，杜绝伪 INVALID）。
+# 私钥：与领奖/扫货/AB/无限塔共用同一 keystore Secrets，runner 内临时解密，job 结束即销毁。
+# 静默：仅 Actions 日志，不推送任何通知。
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'   # 断链重燃保险 + 启动门控探测
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '默认勾选：只检查不提交（手工验证用）。要真跑请取消勾选'
+        type: boolean
+        default: true
+      season:
+        description: '目标赛季 raidId（默认 37；第37期 start=11889221 end=12040420）'
+        type: string
+        default: '37'
+      arm_block:
+        description: '启动区块门槛（默认 12000000；tip 到达才开打。0=不设门控）'
+        type: string
+        default: '12000000'
+      max_watch_seconds:
+        description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
+
+concurrency:
+  group: 9c-world-boss        # 独立组：不与 claim/market/boss-sweep/infinite-tower 共用
+  cancel-in-progress: false   # 接力的新 run 排队，当前 job 一结束就接上，永不并发
+
+jobs:
+  worldboss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360       # > 5.5h 蹲守预算，< GitHub 单 job 6h 上限
+    steps:
+      # ── 前置闸门：先用一次 curl 查 tip，未到 arm_block 就整个 job 秒退 ──
+      - name: 按启动区块探测是否进入作战窗口
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+        run: |
+          set -o pipefail
+          AB="${ARM_BLOCK:-12000000}"
+          case "$AB" in ''|*[!0-9]*) AB="12000000";; esac
+          echo "arm_block=$AB"
+          if [ "$AB" = "0" ]; then echo "armed=true" >> "$GITHUB_OUTPUT"; echo "门控关闭"; exit 0; fi
+          # 手工演练(dry_run=true)不设闸门，便于随时验证流程
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"; echo "手工演练：跳过区块闸门"; exit 0
+          fi
+          TIP=$(curl -s -m 20 -X POST 'https://heimdall6.9capi.com/graphql' \
+            -H 'Content-Type: application/json' \
+            --data-raw '{"query":"{ nodeStatus { tip { index } } }"}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["nodeStatus"]["tip"]["index"])' 2>/dev/null)
+          echo "当前 tip=$TIP"
+          if [ -z "$TIP" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"; echo "tip 探测失败，放行由脚本层兜底"; exit 0
+          fi
+          if [ "$TIP" -ge "$AB" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"; echo "tip($TIP) 已到启动区块($AB)"
+          else
+            echo "armed=false" >> "$GITHUB_OUTPUT"; echo "tip($TIP) 距启动区块还有 $((AB - TIP)) 块，本次秒退"
+          fi
+
+      - name: 检出代码
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        if: steps.gate.outputs.armed == 'true'
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: 解密 keystore 生成 .env（仅本 runner 内，600 权限）
+        if: steps.gate.outputs.armed == 'true'
+        env:
+          NC_KEYSTORE_JSON: ${{ secrets.NC_KEYSTORE_JSON }}
+          NC_KEYSTORE_PASS: ${{ secrets.NC_KEYSTORE_PASS }}
+          NC_AVATAR: ${{ vars.NC_AVATAR }}
+        run: |
+          set -e
+          if [ -z "$NC_KEYSTORE_JSON" ] || [ -z "$NC_KEYSTORE_PASS" ]; then
+            echo "缺少 NC_KEYSTORE_JSON / NC_KEYSTORE_PASS Secrets"; exit 1
+          fi
+          umask 077
+          trap 'rm -f .keystore.json .kpass' EXIT
+          printf '%s' "$NC_KEYSTORE_JSON" > .keystore.json
+          printf '%s' "$NC_KEYSTORE_PASS" > .kpass
+          ARGS="--keystore .keystore.json --passphrase-file .kpass"
+          if [ -n "$NC_AVATAR" ]; then ARGS="$ARGS --avatar $NC_AVATAR"; fi
+          node import-key.mjs $ARGS
+
+      - name: 纯逻辑自测（不联网）
+        if: steps.gate.outputs.armed == 'true'
+        run: node world-boss.mjs --self-test
+
+      - name: 蹲守并自动战斗（进程内轮询，按 boss 等级判定）
+        if: steps.gate.outputs.armed == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+          SEASON: ${{ inputs.season }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+          WATCH_SEC: ${{ inputs.max_watch_seconds }}
+        run: |
+          set -o pipefail
+          EXTRA="--watch --gap-ms 60000"
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
+            EXTRA="$EXTRA --dry-run"
+          else
+            AB="${ARM_BLOCK:-12000000}"
+            case "$AB" in ''|*[!0-9]*) AB="12000000";; esac
+            EXTRA="$EXTRA --arm-block $AB"
+          fi
+          case "$SEASON" in
+            ''|*[!0-9]*) EXTRA="$EXTRA --season 37" ;;
+            *) EXTRA="$EXTRA --season $SEASON" ;;
+          esac
+          case "$WATCH_SEC" in
+            ''|*[!0-9]*) : ;;
+            *) EXTRA="$EXTRA --max-watch-seconds $WATCH_SEC" ;;
+          esac
+          echo "运行参数: $EXTRA"
+          node world-boss.mjs $EXTRA 2>&1 | tee "$RUNNER_TEMP/world-boss.log"
+          exit ${PIPESTATUS[0]}
+
+      - name: 接力（预算耗尽时触发下一个蹲守 job）
+        if: always() && steps.gate.outputs.armed == 'true'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.NC_DISPATCH_TOKEN || github.token }}
+          RELAY_REPO: ${{ github.repository }}
+          RELAY_REF: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SEASON: ${{ inputs.season }}
+          ARM_BLOCK: ${{ inputs.arm_block }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
+            echo "手动演练模式：不接力"; exit 0
+          fi
+          LOG="$RUNNER_TEMP/world-boss.log"
+          if ! grep -q '"handoff":"budget_exhausted"' "$LOG" 2>/dev/null; then
+            echo "未检测到正常交棒标记（可能已买满/赛季末/定论/异常），不接力"; exit 0
+          fi
+          echo "检测到正常交棒，发起接力…"
+          SEASON_IN="${SEASON:-37}"; case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="37";; esac
+          AB_IN="${ARM_BLOCK:-12000000}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="12000000";; esac
+          CODE=""
+          for i in 1 2 3; do
+            CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\",\"arm_block\":\"$AB_IN\"}}" \
+              "https://api.github.com/repos/$RELAY_REPO/actions/workflows/world-boss.yml/dispatches") || CODE="000"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
+            echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"; sleep 5
+          done
+          echo "接力 dispatch HTTP=$CODE"
+          if [ "$CODE" != "204" ] && [ "$CODE" != "200" ]; then
+            echo "::warning::接力失败 HTTP=$CODE，链将依赖 schedule 重燃"
+            head -c 300 "$RUNNER_TEMP/relay_resp.txt" 2>/dev/null || true
+          fi
+          exit 0
