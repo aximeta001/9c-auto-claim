@@ -16,9 +16,11 @@
  *     （latestBossLevel===0）校验实时装备与 LOADOUT_BASELINE（2026-11-21 链上导出）一致，
  *     不一致则停手；首战通过后 latestBossLevel≥1，后续免检（不换装就一直保持）。
  *     --no-loadout-guard 可完全关闭校验。
- *   · 首战S级通关校验：首场打完读战斗得分 highScore，≥ S_CLEAR_SCORE(18,771,857,028,
- *     = boss全5波HP和，用户截图实测的S级分数)才算通关；未通关立即停手，不买票不继续打。
- *     （highScore 为32位Int，S级分数会溢出；溢出+装备基线一致 → 视为通关。）
+ *   · 首战S级通关校验：首场打完读战斗得分 highScore，必须【精确≥】S_CLEAR_SCORE
+ *     (18,771,857,028 = boss全5波HP和，用户截图实测S级分数)才算通关；否则立即停手。
+ *     得分读自 Mimir(worldBossRaider.highScore=Long 64位，精确)；Heimdall 的 highScore
+ *     是32位Int会溢出，【绝不用"溢出"当通关】——因 wave4 累计67.7亿也溢出，
+ *     会把"打过wave4没过wave5"误判通关。拿不到精确值一律保守停手，不买票不继续。
  *
  * 运行时护栏（防止理解偏差浪费水晶/NCG）：
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
@@ -207,23 +209,52 @@ async function getRaiderState(raiderAddress) {
   const d = await gqlRpc(q, { r: raiderAddress });
   return d.data?.stateQuery?.raiderState || null;
 }
-// 读取战斗得分 highScore。返回：
-//   { ok:true, value:Number, overflow:false }  正常读到（值在 32 位内）
-//   { ok:true, value:null, overflow:true }     溢出（伤害>21.47亿，GraphQL Int 装不下）→ 暗示大伤害
-//   { ok:false, reason }                       状态未初始化/其他错误
-async function readHighScore(raiderAddress) {
-  const q = "query($r:Address!){ stateQuery { raiderState(raiderAddress:$r){ highScore } } }";
-  let lastErr = null;
+// 读取战斗得分 highScore 的【精确 64 位值】。
+//
+// 背景（2026-11-21 源码实测）：
+//   · 链上 RaiderState.HighScore 是 long（64 位），S级得分 18,771,857,028 存得下。
+//   · Heimdall 的 GraphQL `raiderState.highScore` 暴露成 Int（32 位），187亿会溢出——
+//     而打到 wave4（67.7亿）同样溢出，故【绝不能】把"溢出"当作通关信号。
+//   · Mimir 的 `worldBossRaider(avatarAddress).highScore` 暴露成 Long（64 位），可拿真值；
+//     但其 resolver 可能未部署（当前实测报 MetadataRepository 未注册）。
+//
+// 因此按优先级取真值，取不到就明确返回 ok:false（由 judge 保守停手），绝不猜：
+//   来源A：Mimir Long（精确）  → value=完整值
+//   来源B：Heimdall Int（仅当数值在 32 位内可直接采信；若报错/溢出则不采信）
+// 返回：{ ok:true, value:Number(>=0), source } 或 { ok:false, reason, overflow }
+async function readHighScore(raiderAddress, avatarAddress = AVATAR) {
+  const errs = [];
+
+  // —— 来源A：Mimir 64 位 Long（首选，能精确区分 wave4 67亿 与 wave5 187亿）——
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const q = "query($a:Address!){ worldBossRaider(avatarAddress:$a){ highScore } }";
+    try {
+      const d = await gql(CFG.mimir, q, { a: avatarAddress });
+      if (!d.errors && d.data?.worldBossRaider?.highScore != null) {
+        const v = Number(d.data.worldBossRaider.highScore);
+        if (Number.isFinite(v) && v >= 0) return { ok: true, value: v, source: "mimir:Long" };
+      }
+      if (d.errors?.length) errs.push("mimir:" + String(d.errors[0].message).slice(0, 100));
+    } catch (e) { errs.push("mimir:" + String(e.message).slice(0, 100)); }
+    if (attempt === 0) await sleepMs(800);
+  }
+
+  // —— 来源B：Heimdall 32 位 Int（只在读到具体数值时采信；溢出/报错一律不采信）——
+  const q2 = "query($r:Address!){ stateQuery { raiderState(raiderAddress:$r){ highScore } } }";
   for (const url of CFG.rpcUrls) {
     try {
-      const d = await gql(url, q, { r: raiderAddress });
-      if (d.errors && d.errors.length) { lastErr = d.errors[0].message; continue; } // 可能溢出，换节点再试确认
+      const d = await gql(url, q2, { r: raiderAddress });
+      if (d.errors && d.errors.length) { errs.push("heimdall:" + String(d.errors[0].message).slice(0, 80)); continue; }
       const v = d.data?.stateQuery?.raiderState?.highScore;
-      return { ok: true, value: v == null ? null : Number(v), overflow: false, _url: url };
-    } catch (e) { lastErr = e.message; }
+      // Int32 能装下的值（wave1-3，<21.47亿）才是可信真值；S级/wave4 都会溢出到这里读不到。
+      if (v != null && Number.isFinite(Number(v)) && Number(v) >= 0) {
+        return { ok: true, value: Number(v), source: "heimdall:Int", caveat: "32位值，若实际已溢出则不可信" };
+      }
+    } catch (e) { errs.push("heimdall:" + String(e.message).slice(0, 80)); }
   }
-  // 所有节点都返回错误：极可能是 highScore 溢出（大伤害），也可能是状态未初始化。
-  return { ok: true, value: null, overflow: true, reason: String(lastErr || "").slice(0, 120) };
+
+  // 两条路都拿不到精确值——保守返回失败，绝不把"溢出"当通关。
+  return { ok: false, reason: "无法读取精确64位得分（Mimir Long不可用 + Heimdall Int溢出/缺失）", overflow: true, errs };
 }
 async function getWorldBossState(bossAddress) {
   const q = `query($b:Address!){ stateQuery { worldBossState(bossAddress:$b){
@@ -302,20 +333,28 @@ function isFirstBattleOfSeason(latestBossLevel) {
   const n = Number(latestBossLevel || 0);
   return Number.isFinite(n) && n === 0;
 }
-// 判断首场是否达到 S 级通关（战斗得分 ≥ S_CLEAR_SCORE）。
-// hs = readHighScore() 结果。溢出(overflow=true)时：伤害>21.47亿，
-// 结合「首战装备已与S级基线校验一致」，视为通关；否则按数值比较。
+// 判断首场是否达到 S 级通关：战斗得分必须【精确 ≥】S_CLEAR_SCORE。
+//
+// 关键（2026-11-21 修复）：绝不再用"字段溢出"当通关信号——
+//   wave4 累计 67.7亿、wave5 187亿都会让 32 位 Int 溢出，
+//   若"溢出=通关"则"打穿wave4没打过wave5"会被误判通关并继续买票。
+// 现在只认精确 64 位值；读不到（ok:false）一律判未通关 → 保守停手。
 function judgeFirstBattleClear(hs) {
-  if (!hs || hs.ok === false) return { clear: false, reason: "highScore 读取失败，无法确认通关", hs };
-  if (hs.overflow) return {
-    clear: true, reason: `得分字段溢出(>21.47亿, 32位Int装不下)，结合装备基线一致 → 视为S级通关`, hs };
-  if (hs.value == null) return { clear: false, reason: "highScore 未同步（值缺失），暂不判定", hs };
+  if (!hs || hs.ok === false) {
+    return { clear: false, reason: `无法取得精确得分，保守停手（${hs?.reason || "读取失败"}）`, hs };
+  }
+  if (hs.value == null || !Number.isFinite(Number(hs.value))) {
+    return { clear: false, reason: "得分值缺失/非法，保守停手", hs };
+  }
   const v = Number(hs.value);
+  // 26亿～187亿这段若来自 Heimdall Int 是不可信的（其实已被溢出拦截，这里再兜一层）：
+  // 只有 Mimir Long 或 <21.47亿 的 Heimdall Int 才会走到这里。
+  const clear = v >= S_CLEAR_SCORE;
   return {
-    clear: v >= S_CLEAR_SCORE,
-    reason: v >= S_CLEAR_SCORE
-      ? `战斗得分 ${v} ≥ S级门槛 ${S_CLEAR_SCORE}，通关`
-      : `战斗得分 ${v} < S级门槛 ${S_CLEAR_SCORE}，未通关（装备可能错误）`,
+    clear,
+    reason: clear
+      ? `战斗得分 ${v} ≥ S级门槛 ${S_CLEAR_SCORE}，通关（来源 ${hs.source}）`
+      : `战斗得分 ${v} < S级门槛 ${S_CLEAR_SCORE}，未通关（装备可能错误，来源 ${hs.source}）`,
     hs, score: v,
   };
 }
@@ -525,17 +564,17 @@ async function runOnce(ctx, out) {
   if (isFirstBattle && LOADOUT_GUARD) {
     const raiderAddr = derive(AVATAR, String(raidId));
     let judged = null;
+    // 首战成功后链上状态可能尚未同步，轮询到"拿到精确值"为止；始终读不到就保守停手。
     for (let attempt = 0; attempt < CFG.confirmTries; attempt++) {
-      const hs = await readHighScore(raiderAddr);
+      const hs = await readHighScore(raiderAddr, AVATAR);
       judged = judgeFirstBattleClear(hs);
-      // 能读到数值(v>=0)或确认溢出 → 状态已更新，可以判定；否则等节点同步
-      if (hs.value != null || hs.overflow) break;
+      if (hs.ok) break; // 拿到精确值即可判定；ok:false 则继续等节点同步，仍失败就停手
       await sleepMs(CFG.confirmIntervalMs);
     }
     out.firstBattleClear = judged;
     log({ level: "info", msg: "首战S级通关校验", ...judged });
     if (!judged.clear) {
-      out.result = `首战未达S级通关，停手不继续（${judged.reason}）——装备可能错误`;
+      out.result = `首战未达S级通关或无法确认，停手不继续（${judged.reason}）——绝不误判通关`;
       return;
     }
   }
@@ -702,13 +741,20 @@ function selfTest() {
   ok("首战判定 300=否", isFirstBattleOfSeason(300) === false);
   ok("首战判定 字符串0=是", isFirstBattleOfSeason("0") === true);
 
-  // S级通关判定
+  // S级通关判定（精确比较，绝不用溢出当通关）
   ok("S级门槛=全5波HP和", S_CLEAR_SCORE === 18771857028);
-  ok("通关-得分恰好达标", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE, overflow:false }).clear === true);
-  ok("通关-得分超过", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE+1, overflow:false }).clear === true);
-  ok("未通关-得分不足", judgeFirstBattleClear({ ok:true, value:1000000, overflow:false }).clear === false);
-  ok("未通关-得分0", judgeFirstBattleClear({ ok:true, value:0, overflow:false }).clear === false);
-  ok("溢出=视为通关", judgeFirstBattleClear({ ok:true, value:null, overflow:true }).clear === true);
+  ok("门槛=逐波HP累加", [21857028,250000000,1500000000,5000000000,12000000000].reduce((a,b)=>a+b,0) === S_CLEAR_SCORE);
+  ok("通关-得分恰好达标", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE, source:"mimir:Long" }).clear === true);
+  ok("通关-得分超过", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE+1, source:"mimir:Long" }).clear === true);
+  ok("未通关-得分不足", judgeFirstBattleClear({ ok:true, value:1000000, source:"heimdall:Int" }).clear === false);
+  ok("未通关-得分0", judgeFirstBattleClear({ ok:true, value:0, source:"heimdall:Int" }).clear === false);
+  // 关键回归：wave4 累计 67.7亿 < S门槛 —— 即便它已让32位Int溢出，也绝不判通关
+  ok("wave4累计67.7亿未通关", judgeFirstBattleClear({ ok:true, value:6771857028, source:"mimir:Long" }).clear === false);
+  ok("wave3累计17.7亿未通关", judgeFirstBattleClear({ ok:true, value:1771857028, source:"heimdall:Int" }).clear === false);
+  ok("S门槛-1未通关", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE-1, source:"mimir:Long" }).clear === false);
+  // 读不到精确值 → 保守停手
+  ok("溢出读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"Int溢出", overflow:true }).clear === false);
+  ok("值缺失=未通关", judgeFirstBattleClear({ ok:true, value:null }).clear === false);
   ok("读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"err" }).clear === false);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
