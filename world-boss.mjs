@@ -11,7 +11,9 @@
  *   · 首次入场水晶：由 raid7 action 服务端自动扣（entranceFee×level² crystal），脚本不额外构造。
  *   · 只打不领：绝不提交 claim_world_boss_reward / claim_world_boss_kill_reward，
  *     击杀奖励记在 WorldBossKillRewardRecord（false=未领），由用户自行领取。
- *   · 启动门控：tip < --arm-block 秒退（用户要求约 11889221 区块之后启动，赛季内晚点无妨）。
+ *   · 启动门控：tip < --arm-block 秒退（workflow 默认 11889334 = 赛季起点 11889221 + 15分钟）。
+ *   · 装备（用户方案）：用当前冒险模式装备 + 原来的符文槽。每次出手前校验实时装备与
+ *     LOADOUT_BASELINE（2026-11-21 链上导出）完全一致，换过装则停手；--no-loadout-guard 放行。
  *
  * 运行时护栏（防止理解偏差浪费水晶/NCG）：
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
@@ -73,6 +75,22 @@ const ADDITIONAL_PRICE_EXPECT = 0;
 const MAX_PURCHASE_EXPECT = 40;
 // 赛季末保留余量：tip 超过 end - END_BUFFER 就停止开新战斗（避免打空、浪费票）
 const END_BUFFER = 1;
+// ── 装备一致性护栏（用户方案：装备=当前冒险装备，符文=原来的符文）──
+// 基线于 2026-11-21 从链上实时 equipped 导出（.NET Guid 字节序）。
+// 运行时若实时装备与此不一致（例如中途换装），停手不操作，避免用错配置浪费票。
+const LOADOUT_BASELINE = {
+  equipments: [
+    "84afc54e6d44d840948afc3089a24799", "5b14eb0589978444bde7de19f329b8a9",
+    "eba24ec67f4e5c44acf718c40594835b", "2a9b1888b279d449a8864952c3405714",
+    "a44d5b8d516e95418c834092994f8336", "78cc60679f7f1b49992732ed5b090eb7",
+    "15ff826d104458439d02a19bbf2a66fc", "cf5f2258713bc94e943078cfa84e8cbc",
+  ],
+  costumes: [
+    "3c07374778009e42bfa10a16854b5b34", "6619635e7b72d3479fda8675f64a366e",
+  ],
+  // 历史 SUCCESS 模板符文槽（slot:runeId）
+  runeSlots: [[0,10047],[1,30001],[3,10055],[4,10051],[6,10052],[7,10003],[8,10056],[9,10013]],
+};
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
@@ -80,6 +98,8 @@ const ONCE = args.includes("--once");
 const WATCH = args.includes("--watch");
 const SELF_TEST = args.includes("--self-test");
 const BUILD_TEST = args.includes("--build-test");
+// --no-loadout-guard 可在用户主动换装后手动放行（默认开启护栏）
+const LOADOUT_GUARD = !args.includes("--no-loadout-guard");
 const numArg = (flag, def) => {
   const i = args.indexOf(flag);
   if (i < 0) return def;
@@ -278,7 +298,20 @@ async function resolveLoadout() {
   const equipmentIds = (inv.equipments || []).filter(e => e.equipped).map(e => uuidToDotnet(e.itemId));
   const costumeIds = (inv.costumes || []).filter(e => e.equipped).map(e => uuidToDotnet(e.itemId));
   if (!equipmentIds.length) throw new Error("当前无已装备 equipments，拒绝构造以免 FAILURE 浪费票");
-  log({ level: "info", msg: "loadout=实时装备+模板符文槽",
+  // 装备一致性护栏：实时装备必须与基线完全一致（顺序无关），否则停手
+  if (LOADOUT_GUARD) {
+    const eqSet = equipmentIds.map(b => b.toString("hex")).sort();
+    const coSet = costumeIds.map(b => b.toString("hex")).sort();
+    const baseEq = [...LOADOUT_BASELINE.equipments].sort();
+    const baseCo = [...LOADOUT_BASELINE.costumes].sort();
+    const sameSet = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+    if (!sameSet(eqSet, baseEq) || !sameSet(coSet, baseCo)) {
+      const added = eqSet.filter(x => !baseEq.includes(x));
+      const missing = baseEq.filter(x => !eqSet.includes(x));
+      throw new Error(`装备与基线不一致，停手不操作（如需放行加 --no-loadout-guard）。新增=${added.join(",")||"无"} 缺失=${missing.join(",")||"无"}`);
+    }
+  }
+  log({ level: "info", msg: "loadout=实时装备(校验基线一致)+模板符文槽",
         equipments: equipmentIds.length, costumes: costumeIds.length, runeSlots: runeSlotInfos.length });
   return { equipmentIds, costumeIds, runeSlotInfos };
 }
@@ -569,6 +602,17 @@ function selfTest() {
   const t = decodeTemplate();
   ok("模板符文槽=8", t.runeSlotInfos.length === 8);
   ok("符文槽格式[slot,rune]", t.runeSlotInfos.every(x => x.length === 2 && Number.isInteger(x[0]) && Number.isInteger(x[1])));
+
+  // 装备基线护栏
+  ok("装备基线8件", LOADOUT_BASELINE.equipments.length === 8);
+  ok("时装基线2件", LOADOUT_BASELINE.costumes.length === 2);
+  ok("装备基线均为32位hex", LOADOUT_BASELINE.equipments.every(x => /^[0-9a-f]{32}$/.test(x)));
+  const sameSet = (a, b) => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
+  ok("集合比较-顺序无关", sameSet(["a","b"], ["b","a"]) === true);
+  ok("集合比较-新增检测", sameSet(["a","b","c"], ["a","b"]) === false);
+  ok("基线符文=模板符文", sameSet(
+    LOADOUT_BASELINE.runeSlots.map(x => x.join(":")),
+    t.runeSlotInfos.map(x => x.join(":"))));
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
   if (fail > 0) process.exit(1);
