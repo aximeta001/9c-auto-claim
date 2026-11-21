@@ -12,7 +12,9 @@ name: 9C World Boss 自动战斗 (Heimdall)
 #     读不到或不符 → 不买（尊重「不是 1NCG 递增就暂不操作」）。
 #   · 首次入场水晶：action 服务端自动扣（entranceFee×level²），脚本不额外构造。
 #   · 只打不领：绝不提交 claim action，击杀奖励由用户自行领取。
-#   · 启动门控：tip < arm_block（默认 12000000，用户要求「12000 区块之后启动」）秒退。
+#   · 启动门控：tip < arm_block（默认 11889221 = 第37期赛季起点）秒退。
+#     用户原话「再过约12000块启动」是从当时 tip(≈11877408) 起的增量 ≈11889408，
+#     即赛季起点后约25分钟；取赛季起点 11889221 作门控，稍有出入但用户说「晚点无妨」。
 #     赛季开始不要求抢首层，晚点无妨。
 #
 # 稳定运行架构（复用领奖/无限塔链，已验证）：
@@ -44,9 +46,9 @@ on:
         type: string
         default: '37'
       arm_block:
-        description: '启动区块门槛（默认 12000000；tip 到达才开打。0=不设门控）'
+        description: '启动区块门槛（默认 11889221；tip 到达才开打。0=不设门控）'
         type: string
-        default: '12000000'
+        default: '11889221'
       max_watch_seconds:
         description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
         type: string
@@ -74,8 +76,8 @@ jobs:
           ARM_BLOCK: ${{ inputs.arm_block }}
         run: |
           set -o pipefail
-          AB="${ARM_BLOCK:-12000000}"
-          case "$AB" in ''|*[!0-9]*) AB="12000000";; esac
+          AB="${ARM_BLOCK:-11889221}"
+          case "$AB" in ''|*[!0-9]*) AB="11889221";; esac
           echo "arm_block=$AB"
           if [ "$AB" = "0" ]; then echo "armed=true" >> "$GITHUB_OUTPUT"; echo "门控关闭"; exit 0; fi
           # 手工演练(dry_run=true)不设闸门，便于随时验证流程
@@ -148,8 +150,8 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
             EXTRA="$EXTRA --dry-run"
           else
-            AB="${ARM_BLOCK:-12000000}"
-            case "$AB" in ''|*[!0-9]*) AB="12000000";; esac
+            AB="${ARM_BLOCK:-11889221}"
+            case "$AB" in ''|*[!0-9]*) AB="11889221";; esac
             EXTRA="$EXTRA --arm-block $AB"
           fi
           case "$SEASON" in
@@ -184,7 +186,7 @@ jobs:
           fi
           echo "检测到正常交棒，发起接力…"
           SEASON_IN="${SEASON:-37}"; case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="37";; esac
-          AB_IN="${ARM_BLOCK:-12000000}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="12000000";; esac
+          AB_IN="${ARM_BLOCK:-11889221}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="11889221";; esac
           CODE=""
           for i in 1 2 3; do
             CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
