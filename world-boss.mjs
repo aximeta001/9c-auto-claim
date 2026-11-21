@@ -16,6 +16,9 @@
  *     （latestBossLevel===0）校验实时装备与 LOADOUT_BASELINE（2026-11-21 链上导出）一致，
  *     不一致则停手；首战通过后 latestBossLevel≥1，后续免检（不换装就一直保持）。
  *     --no-loadout-guard 可完全关闭校验。
+ *   · 首战S级通关校验：首场打完读战斗得分 highScore，≥ S_CLEAR_SCORE(18,771,857,028,
+ *     = boss全5波HP和，用户截图实测的S级分数)才算通关；未通关立即停手，不买票不继续打。
+ *     （highScore 为32位Int，S级分数会溢出；溢出+装备基线一致 → 视为通关。）
  *
  * 运行时护栏（防止理解偏差浪费水晶/NCG）：
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
@@ -75,6 +78,9 @@ const SEASON_DEFAULT = 37;
 const TICKET_PRICE_EXPECT = 1;
 const ADDITIONAL_PRICE_EXPECT = 0;
 const MAX_PURCHASE_EXPECT = 40;
+// S级通关门槛：boss900001 全5波HP之和（用户截图实测战斗得分，精确匹配）。
+// 首场 highScore >= 此值 = 打穿全部 wave = S级通关；否则视为装备错误，停手。
+const S_CLEAR_SCORE = 18771857028;
 // 赛季末保留余量：tip 超过 end - END_BUFFER 就停止开新战斗（避免打空、浪费票）
 const END_BUFFER = 1;
 // ── 装备一致性护栏（用户方案：装备=当前冒险装备，符文=原来的符文）──
@@ -192,12 +198,32 @@ async function getAgentAddress(avatar) {
   return d.data?.stateQuery?.avatar?.agentAddress || null;
 }
 async function getRaiderState(raiderAddress) {
+  // 注意：highScore/totalScore 是 32 位 Int，S 级得分(187亿)会溢出导致整个查询失败。
+  // 日常逻辑只用小值字段；highScore 由 readHighScore() 单独带溢出感知地读取。
   const q = `query($r:Address!){ stateQuery { raiderState(raiderAddress:$r){
     latestBossLevel remainChallengeCount purchaseCount totalChallengeCount level cp
-    highScore totalScore refillBlockIndex claimedBlockIndex avatarAddress avatarName
+    refillBlockIndex claimedBlockIndex avatarAddress avatarName
   } } }`;
   const d = await gqlRpc(q, { r: raiderAddress });
   return d.data?.stateQuery?.raiderState || null;
+}
+// 读取战斗得分 highScore。返回：
+//   { ok:true, value:Number, overflow:false }  正常读到（值在 32 位内）
+//   { ok:true, value:null, overflow:true }     溢出（伤害>21.47亿，GraphQL Int 装不下）→ 暗示大伤害
+//   { ok:false, reason }                       状态未初始化/其他错误
+async function readHighScore(raiderAddress) {
+  const q = "query($r:Address!){ stateQuery { raiderState(raiderAddress:$r){ highScore } } }";
+  let lastErr = null;
+  for (const url of CFG.rpcUrls) {
+    try {
+      const d = await gql(url, q, { r: raiderAddress });
+      if (d.errors && d.errors.length) { lastErr = d.errors[0].message; continue; } // 可能溢出，换节点再试确认
+      const v = d.data?.stateQuery?.raiderState?.highScore;
+      return { ok: true, value: v == null ? null : Number(v), overflow: false, _url: url };
+    } catch (e) { lastErr = e.message; }
+  }
+  // 所有节点都返回错误：极可能是 highScore 溢出（大伤害），也可能是状态未初始化。
+  return { ok: true, value: null, overflow: true, reason: String(lastErr || "").slice(0, 120) };
 }
 async function getWorldBossState(bossAddress) {
   const q = `query($b:Address!){ stateQuery { worldBossState(bossAddress:$b){
@@ -275,6 +301,23 @@ function ticketSafe(row) {
 function isFirstBattleOfSeason(latestBossLevel) {
   const n = Number(latestBossLevel || 0);
   return Number.isFinite(n) && n === 0;
+}
+// 判断首场是否达到 S 级通关（战斗得分 ≥ S_CLEAR_SCORE）。
+// hs = readHighScore() 结果。溢出(overflow=true)时：伤害>21.47亿，
+// 结合「首战装备已与S级基线校验一致」，视为通关；否则按数值比较。
+function judgeFirstBattleClear(hs) {
+  if (!hs || hs.ok === false) return { clear: false, reason: "highScore 读取失败，无法确认通关", hs };
+  if (hs.overflow) return {
+    clear: true, reason: `得分字段溢出(>21.47亿, 32位Int装不下)，结合装备基线一致 → 视为S级通关`, hs };
+  if (hs.value == null) return { clear: false, reason: "highScore 未同步（值缺失），暂不判定", hs };
+  const v = Number(hs.value);
+  return {
+    clear: v >= S_CLEAR_SCORE,
+    reason: v >= S_CLEAR_SCORE
+      ? `战斗得分 ${v} ≥ S级门槛 ${S_CLEAR_SCORE}，通关`
+      : `战斗得分 ${v} < S级门槛 ${S_CLEAR_SCORE}，未通关（装备可能错误）`,
+    hs, score: v,
+  };
 }
 
 // ---------------- 现场构造 raid7 action ----------------
@@ -476,6 +519,27 @@ async function runOnce(ctx, out) {
     out.result = `交易未成功（${result.txStatus}@block${result.blockIndex}）——停止本轮，不重复提交`;
     return;
   }
+
+  // 首战 S 级通关校验：打完第一场后读战斗得分，判定装备是否正确。
+  // 未通关（得分<S级门槛）→ 立即停手，不买票、不继续打。
+  if (isFirstBattle && LOADOUT_GUARD) {
+    const raiderAddr = derive(AVATAR, String(raidId));
+    let judged = null;
+    for (let attempt = 0; attempt < CFG.confirmTries; attempt++) {
+      const hs = await readHighScore(raiderAddr);
+      judged = judgeFirstBattleClear(hs);
+      // 能读到数值(v>=0)或确认溢出 → 状态已更新，可以判定；否则等节点同步
+      if (hs.value != null || hs.overflow) break;
+      await sleepMs(CFG.confirmIntervalMs);
+    }
+    out.firstBattleClear = judged;
+    log({ level: "info", msg: "首战S级通关校验", ...judged });
+    if (!judged.clear) {
+      out.result = `首战未达S级通关，停手不继续（${judged.reason}）——装备可能错误`;
+      return;
+    }
+  }
+
   out.result = "战斗提交成功（SUCCESS，未领取奖励）";
 }
 
@@ -637,6 +701,15 @@ function selfTest() {
   ok("首战判定 1=否(已打过)", isFirstBattleOfSeason(1) === false);
   ok("首战判定 300=否", isFirstBattleOfSeason(300) === false);
   ok("首战判定 字符串0=是", isFirstBattleOfSeason("0") === true);
+
+  // S级通关判定
+  ok("S级门槛=全5波HP和", S_CLEAR_SCORE === 18771857028);
+  ok("通关-得分恰好达标", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE, overflow:false }).clear === true);
+  ok("通关-得分超过", judgeFirstBattleClear({ ok:true, value:S_CLEAR_SCORE+1, overflow:false }).clear === true);
+  ok("未通关-得分不足", judgeFirstBattleClear({ ok:true, value:1000000, overflow:false }).clear === false);
+  ok("未通关-得分0", judgeFirstBattleClear({ ok:true, value:0, overflow:false }).clear === false);
+  ok("溢出=视为通关", judgeFirstBattleClear({ ok:true, value:null, overflow:true }).clear === true);
+  ok("读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"err" }).clear === false);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
   if (fail > 0) process.exit(1);
