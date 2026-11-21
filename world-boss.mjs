@@ -12,11 +12,15 @@
  *   · 只打不领：绝不提交 claim_world_boss_reward / claim_world_boss_kill_reward，
  *     击杀奖励记在 WorldBossKillRewardRecord（false=未领），由用户自行领取。
  *   · 启动门控：tip < --arm-block 秒退（workflow 默认 11889334 = 赛季起点 11889221 + 15分钟）。
- *   · 装备（用户方案）：装备+时装 一律取 Mimir itemSlot(address,RAID) 实时 RAID 槽。
- *     注：气场(AURA)/魔典(GRIMOIRE) 在游戏里属 equipment(ValidateEquipmentsV3)，
- *     已含在 RAID 槽的 8 件 equipment 内；GraphQL avatar.inventory[equipped] 会漏，故不用。
+ *   · 装备（用户 2026-11-21 最终确认方案）：一律取【当前穿戴装备】= Heimdall
+ *     avatar.inventory 中 equipped=true 的 6 件常规装备(武器/甲/腰带/项链/戒指×2)，
+ *     气场固定取 itemId=10670003 (Barrage Aura, Lv11)，魔典固定取 itemId=10780009
+ *     (SPD Gri(S), grade8) —— 这两件在背包里无 equipped 标记，故按 itemId 取最高等级实例。
+ *     共 8 件 equipment。时装取 inventory.costumes 中 equipped=true 的 2 件。
+ *     注：绝不再用 Mimir itemSlot(RAID) —— 那是旧赛季残留的 Surt 套装（用户实测"6件全错"）。
+ *     气场/魔典 属 equipment(ValidateEquipmentsV3)，非 costume。
  *     符文沿用【上赛季 SUCCESS 模板】槽位——冒险/Raid 两模式符文不通用，绝不用实时冒险符文。
- *     Mimir 读不到装备则保守停手。装备对错的唯一裁决是"首战 S 级通关"：
+ *     任何装备读取不全则保守停手。装备对错的唯一裁决是"首战 S 级通关"：
  *     打不出 S 级即停手（用户："第一次没通关说明装备错了"）。
  *   · 首战S级通关校验：首场打完读战斗得分 highScore，必须【精确≥】S_CLEAR_SCORE
  *     (18,771,857,028 = boss全5波HP和，用户截图实测S级分数)才算通关；否则立即停手。
@@ -98,11 +102,9 @@ const LOADOUT_BASELINE = {
     "a44d5b8d516e95418c834092994f8336", "78cc60679f7f1b49992732ed5b090eb7",
     "15ff826d104458439d02a19bbf2a66fc", "cf5f2258713bc94e943078cfa84e8cbc",
   ],
-  // 上赛季 SUCCESS 模板 costume（含时装/称号/气场/魔典），仅日志参照
+  // 当前穿戴时装 2 件（equipped=true）的 .NET Guid，仅日志参照
   costumes: [
-    "3c07374778009e42bfa10a16854b5b34", "3c07374778009e42bfa10a16854b5b34",
-    "124e4f4bdb116346bd68bcb86b8d301b", "47695f4fb8c7a4449ca7c9b99891790b",
-    "6619635e7b72d3479fda8675f64a366e", "12338ec56f2f2a499c1c1d5d8332666c",
+    "3c07374778009e42bfa10a16854b5b34", "3dbdcb4788e4ea4aa7a8bfc396c12cb9",
   ],
   // 历史 SUCCESS 模板符文槽（slot:runeId）
   runeSlots: [[0,10047],[1,30001],[3,10055],[4,10051],[6,10052],[7,10003],[8,10056],[9,10013]],
@@ -382,30 +384,54 @@ function decodeTemplate() {
   const runeSlotInfos = [...values.get("r")].map(x => [Number(x[0]), Number(x[1])]);
   return { runeSlotInfos };
 }
-// 装备来源（用户确认）：equipment+costume 全部取 Mimir itemSlot(address, RAID) 实时 RAID 槽。
-// 气场(AURA)/魔典(GRIMOIRE) 属 equipment（源码 ValidateEquipmentsV3 验证），已含在 8 件
-// equipment 内；Heimdall avatar.inventory[equipped] 不反映 RAID 槽实际配置 → 不用它。
-// 符文用 decodeTemplate() 上赛季 SUCCESS 模板槽：冒险/Raid 两模式符文不通用，
-// 绝不用实时冒险符文。Mimir 读不到 → 保守停手，绝不拿旧基线/实时冒险符文兜底。
+// 气场 / 魔典在背包里没有 equipped 标记，按 itemId 取最高等级实例（用户 2026-11-21 确认）。
+const AURA_ITEM_ID = 10670003;      // Barrage Aura (grade7, 用户已升到 Lv11)
+const GRIMOIRE_ITEM_ID = 10780009; // SPD Gri(S) (grade8, Lv4) —— 用户明确选 grade8 这件
+// 常规装备槽类型（equipped=true 的这 6 类 = 武器/甲/腰带/项链/戒指×2）。
+const REGULAR_EQUIP_TYPES = new Set(["WEAPON", "ARMOR", "BELT", "NECKLACE", "RING"]);
+// 装备来源（用户 2026-11-21 最终确认）：读【当前穿戴装备】= Heimdall avatar.inventory。
+//   equipment = equipped=true 的常规装备(6) + 气场(id 10670003) + 魔典(id 10780009) = 8 件
+//   costume   = equipped=true 的时装 (2 件)
+//   符文 = decodeTemplate() 上赛季 SUCCESS 模板槽（冒险/Raid 符文不通用，绝不用实时冒险符文）。
+// 绝不再用 Mimir itemSlot(RAID)：那是上赛季残留的 Surt 套装（用户实测"6件全错"）。
+// 任一装备不全 / 读不到 → 保守停手，绝不拿旧基线兜底浪费票。
 async function resolveLoadout() {
   const { runeSlotInfos } = decodeTemplate();
-  // 实时 RAID 槽：equipment[8] + costume(时装+气场+魔典)。UUID → .NET Guid 字节序。
-  const q = `query($a:Address!,$b:BattleType!){ itemSlot(address:$a,battleType:$b){ costumes equipments } }`;
-  let d = null, lastErr = null;
-  for (const ep of [CFG.mimir]) {
+  const q = `query($a:Address!){ stateQuery{ avatar(avatarAddress:$a){ inventory{
+    equipments{ itemId id level grade itemSubType equipped }
+    costumes{ itemId id equipped }
+  } } } }`;
+  let inv = null, lastErr = null;
+  for (const url of CFG.rpcUrls) {
     try {
-      d = await gql(ep, q, { a: AVATAR, b: "RAID" });
-      if (d.errors?.length) { lastErr = d.errors[0].message; d = null; continue; }
-      if (d.data?.itemSlot) break;
-      d = null;
-    } catch (e) { lastErr = e.message; d = null; }
+      const d = await gql(url, q, { a: AVATAR });
+      if (d.errors?.length) { lastErr = d.errors[0].message; continue; }
+      inv = d.data?.stateQuery?.avatar?.inventory;
+      if (inv) break;
+    } catch (e) { lastErr = e.message; }
   }
-  const slot = d?.data?.itemSlot;
-  if (!slot) throw new Error(`Mimir itemSlot(RAID) 读取失败，拒绝构造以免用错装备浪费票：${String(lastErr || "无数据").slice(0, 120)}`);
-  const equipmentIds = (slot.equipments || []).map(uuidToDotnet);
-  const costumeIds = (slot.costumes || []).map(uuidToDotnet);
-  if (!equipmentIds.length) throw new Error("RAID 槽 equipments 为空，拒绝构造以免 FAILURE 浪费票");
-  // 仅记录与上赛季基线的差异供观测，不拦截、不影响构造。
+  if (!inv) throw new Error(`avatar.inventory 读取失败，拒绝构造以免用错装备浪费票：${String(lastErr || "无数据").slice(0, 120)}`);
+
+  const eqs = inv.equipments || [];
+  const cos = inv.costumes || [];
+  // 6 件常规装备：equipped=true 且类型为常规槽（排除 AURA/GRIMOIRE）
+  const regular = eqs.filter(e => e.equipped && REGULAR_EQUIP_TYPES.has(e.itemSubType));
+  const aura = eqs.filter(e => Number(e.id) === AURA_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
+  const grimoire = eqs.filter(e => Number(e.id) === GRIMOIRE_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
+  const costumes = cos.filter(c => c.equipped);
+
+  // 完整性护栏：装备不全则停手（宁可不打，也不用错装备浪费票）
+  const missing = [];
+  if (regular.length !== 6) missing.push(`常规装备=${regular.length}(期望6)`);
+  if (!aura) missing.push(`气场 id=${AURA_ITEM_ID} 缺失`);
+  if (!grimoire) missing.push(`魔典 id=${GRIMOIRE_ITEM_ID} 缺失`);
+  if (costumes.length !== 2) missing.push(`时装=${costumes.length}(期望2)`);
+  if (missing.length) throw new Error(`当前穿戴装备不完整(${missing.join("; ")})，拒绝构造以免用错装备浪费票`);
+
+  // UUID → .NET Guid 字节序（GraphQL itemId 为标准 UUID 字符串）
+  const equipmentIds = [...regular, aura, grimoire].map(e => uuidToDotnet(e.itemId));
+  const costumeIds = costumes.map(c => uuidToDotnet(c.itemId));
+  // 仅记录与已确认基线的差异供观测，不拦截、不影响构造。
   const eqSet = equipmentIds.map(b => b.toString("hex"));
   const coSet = costumeIds.map(b => b.toString("hex"));
   const vsBaseline = {
@@ -414,8 +440,9 @@ async function resolveLoadout() {
     newCostume: coSet.filter(x => !LOADOUT_BASELINE.costumes.includes(x)),
     missingCostume: LOADOUT_BASELINE.costumes.filter(x => !coSet.includes(x)),
   };
-  log({ level: "info", msg: "loadout=Mimir实时RAID槽装备(气场/魔典在equipment内)+上赛季模板符文",
-        equipments: equipmentIds.length, costumes: costumeIds.length, runeSlots: runeSlotInfos.length, vsBaseline });
+  log({ level: "info", msg: "loadout=当前穿戴装备(6常规equipped+气场10670003+魔典10780009)+2时装+上赛季模板符文",
+        equipments: equipmentIds.length, costumes: costumeIds.length, runeSlots: runeSlotInfos.length,
+        aura: { id: aura.id, level: aura.level }, grimoire: { id: grimoire.id, level: grimoire.level }, vsBaseline });
   return { equipmentIds, costumeIds, runeSlotInfos };
 }
 function buildRaidAction(loadout, payNcg) {
@@ -536,7 +563,7 @@ async function runOnce(ctx, out) {
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
 
-  // 装备：一律用当前冒险模式实时装备，不做任何基线拦截（换装属正常）。
+  // 装备：一律用当前穿戴装备（inventory equipped + 指定气场/魔典），不做基线拦截（换装属正常）。
   const isFirstBattle = isFirstBattleOfSeason(raider.latestBossLevel);
   const loadout = await resolveLoadout();
   const actionValue = buildRaidAction(loadout, d.payNcg);
@@ -725,9 +752,13 @@ function selfTest() {
   ok("UUID→.NET Guid 小端", uuidToDotnet("4ec5af84-446d-40d8-948a-fc3089a24799").toString("hex") === "84afc54e6d44d840948afc3089a24799");
   ok("UUID 无连字符同样", uuidToDotnet("4ec5af84446d40d8948afc3089a24799").toString("hex") === "84afc54e6d44d840948afc3089a24799");
   ok("UUID 后8字节不变", uuidToDotnet("4ec5af84-446d-40d8-948a-fc3089a24799").subarray(8).toString("hex") === "948afc3089a24799");
-  // 气场/魔典来自 Mimir RAID 槽(UUID)，验证 UUID→.NET 字节序转换正确（装备/时装/气场/魔典同一转换函数）
-  ok("RAID槽气场(equipment)UUID→.NET序", uuidToDotnet("504c4ff4-1d33-440e-af07-da2c1ca420e3").toString("hex") === "f44f4c50331d0e44af07da2c1ca420e3");
-  ok("RAID槽costume UUID→.NET序", uuidToDotnet("4b4f4e12-11db-4663-bd68-bcb86b8d301b").toString("hex") === "124e4f4bdb116346bd68bcb86b8d301b");
+  // 当前穿戴气场/魔典/时装的 UUID→.NET 字节序转换正确（装备/时装/气场/魔典同一转换函数）。
+  // 这些 GUID 是 2026-11-21 从 avatar.inventory 实测（用户逐件确认）的当前穿戴值。
+  ok("当前气场BarrageAura UUID→.NET序", uuidToDotnet("6d82ff15-4410-4358-9d02-a19bbf2a66fc").toString("hex") === "15ff826d104458439d02a19bbf2a66fc");
+  ok("当前魔典SPDGriS UUID→.NET序", uuidToDotnet("6760cc78-7f9f-491b-9927-32ed5b090eb7").toString("hex") === "78cc60679f7f1b49992732ed5b090eb7");
+  ok("当前时装Title UUID→.NET序", uuidToDotnet("47cbbd3d-e488-4aea-a7a8-bfc396c12cb9").toString("hex") === "3dbdcb4788e4ea4aa7a8bfc396c12cb9");
+  ok("气场itemId常量=10670003", AURA_ITEM_ID === 10670003);
+  ok("魔典itemId常量=10780009", GRIMOIRE_ITEM_ID === 10780009);
 
   // 模板字段完整性
   const t = decodeTemplate();
@@ -736,7 +767,7 @@ function selfTest() {
 
   // 旧基线参照数据（不用于拦截；仅校验数据完整+符文模板未被改动）
   ok("基线装备8件(参照)", LOADOUT_BASELINE.equipments.length === 8);
-  ok("模板costume6件(参照,含气场魔典)", LOADOUT_BASELINE.costumes.length === 6);
+  ok("基线时装2件(参照)", LOADOUT_BASELINE.costumes.length === 2);
   ok("装备基线均为32位hex", LOADOUT_BASELINE.equipments.every(x => /^[0-9a-f]{32}$/.test(x)));
   const sameSet = (a, b) => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
   ok("集合比较-顺序无关", sameSet(["a","b"], ["b","a"]) === true);
