@@ -11,7 +11,7 @@
  *   · 首次入场水晶：由 raid7 action 服务端自动扣（entranceFee×level² crystal），脚本不额外构造。
  *   · 只打不领：绝不提交 claim_world_boss_reward / claim_world_boss_kill_reward，
  *     击杀奖励记在 WorldBossKillRewardRecord（false=未领），由用户自行领取。
- *   · 启动门控：tip < --arm-block 秒退（用户要求约 12000000 区块之后启动，赛季内晚点无妨）。
+ *   · 启动门控：tip < --arm-block 秒退（用户要求约 11889221 区块之后启动，赛季内晚点无妨）。
  *
  * 运行时护栏（防止理解偏差浪费水晶/NCG）：
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
@@ -87,7 +87,7 @@ const numArg = (flag, def) => {
   return Number.isFinite(n) ? n : def;
 };
 const SEASON = Math.max(1, Math.trunc(numArg("--season", SEASON_DEFAULT)));
-// 启动门控：tip 到达 ARM_BLOCK 才真正开始打（用户要求约 12000000 之后）。ARM_BLOCK=0 关闭。
+// 启动门控：tip 到达 ARM_BLOCK 才真正开始打（用户要求约 11889221 之后）。ARM_BLOCK=0 关闭。
 const ARM_BLOCK = Math.max(0, Math.trunc(numArg("--arm-block", 0)));
 // 轮询间隔：按 boss 等级判定，等级由全球玩家推动，无需毫秒级抢；默认 60s。
 const GAP_MS = Math.max(10000, numArg("--gap-ms", 60000));
@@ -518,7 +518,7 @@ async function main() {
 function selfTest() {
   let pass = 0, fail = 0;
   const ok = (name, cond) => { if (cond) { pass++; } else { fail++; console.error("FAIL:", name); } };
-  const base = { tip: 12000000n };
+  const base = { tip: 11889221n };
   const row = { id: 37, start: 11889221, end: 12040420, ticketPrice: 1, additionalPrice: 0, maxPurchase: 40 };
   const raider = (o={}) => ({ latestBossLevel: 5, remainChallengeCount: 2, purchaseCount: 0, ...o });
   const boss = (o={}) => ({ level: 5, ...o });
