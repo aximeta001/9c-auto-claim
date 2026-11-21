@@ -12,8 +12,10 @@
  *   · 只打不领：绝不提交 claim_world_boss_reward / claim_world_boss_kill_reward，
  *     击杀奖励记在 WorldBossKillRewardRecord（false=未领），由用户自行领取。
  *   · 启动门控：tip < --arm-block 秒退（workflow 默认 11889334 = 赛季起点 11889221 + 15分钟）。
- *   · 装备（用户方案）：用当前冒险模式装备 + 原来的符文槽。每次出手前校验实时装备与
- *     LOADOUT_BASELINE（2026-11-21 链上导出）完全一致，换过装则停手；--no-loadout-guard 放行。
+ *   · 装备（用户方案）：用当前冒险模式装备 + 原来的符文槽。仅在赛季首战
+ *     （latestBossLevel===0）校验实时装备与 LOADOUT_BASELINE（2026-11-21 链上导出）一致，
+ *     不一致则停手；首战通过后 latestBossLevel≥1，后续免检（不换装就一直保持）。
+ *     --no-loadout-guard 可完全关闭校验。
  *
  * 运行时护栏（防止理解偏差浪费水晶/NCG）：
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
@@ -269,6 +271,11 @@ function ticketSafe(row) {
     && row.additionalPrice === ADDITIONAL_PRICE_EXPECT
     && row.maxPurchase === MAX_PURCHASE_EXPECT;
 }
+// 赛季首战判定：LatestBossLevel 初值为 0（未打过），打过一场后更新为 boss 等级(≥1)。
+function isFirstBattleOfSeason(latestBossLevel) {
+  const n = Number(latestBossLevel || 0);
+  return Number.isFinite(n) && n === 0;
+}
 
 // ---------------- 现场构造 raid7 action ----------------
 // 实时装备（equipped）优先，符文槽沿用历史 SUCCESS 模板（GraphQL 无法直读 Raid 槽）。
@@ -286,7 +293,8 @@ function decodeTemplate() {
   const runeSlotInfos = [...values.get("r")].map(x => [Number(x[0]), Number(x[1])]);
   return { runeSlotInfos };
 }
-async function resolveLoadout() {
+// checkGuard：是否本次做装备一致性校验（仅赛季首战为 true，后续免检）
+async function resolveLoadout(checkGuard = LOADOUT_GUARD) {
   const { runeSlotInfos } = decodeTemplate();
   const q = `query($a:Address!){ stateQuery { avatar(avatarAddress:$a){
     level
@@ -298,8 +306,9 @@ async function resolveLoadout() {
   const equipmentIds = (inv.equipments || []).filter(e => e.equipped).map(e => uuidToDotnet(e.itemId));
   const costumeIds = (inv.costumes || []).filter(e => e.equipped).map(e => uuidToDotnet(e.itemId));
   if (!equipmentIds.length) throw new Error("当前无已装备 equipments，拒绝构造以免 FAILURE 浪费票");
-  // 装备一致性护栏：实时装备必须与基线完全一致（顺序无关），否则停手
-  if (LOADOUT_GUARD) {
+  // 装备一致性护栏：仅赛季首战执行。实时装备必须与基线完全一致（顺序无关），否则停手。
+  // 首战通过后 latestBossLevel≥1，后续轮次不再校验（用户：不换装就一直保持）。
+  if (checkGuard) {
     const eqSet = equipmentIds.map(b => b.toString("hex")).sort();
     const coSet = costumeIds.map(b => b.toString("hex")).sort();
     const baseEq = [...LOADOUT_BASELINE.equipments].sort();
@@ -311,8 +320,10 @@ async function resolveLoadout() {
       throw new Error(`装备与基线不一致，停手不操作（如需放行加 --no-loadout-guard）。新增=${added.join(",")||"无"} 缺失=${missing.join(",")||"无"}`);
     }
   }
-  log({ level: "info", msg: "loadout=实时装备(校验基线一致)+模板符文槽",
-        equipments: equipmentIds.length, costumes: costumeIds.length, runeSlots: runeSlotInfos.length });
+  log({ level: "info", msg: checkGuard
+        ? "loadout=实时装备(首战已校验基线一致)+模板符文槽"
+        : "loadout=实时装备(非首战免检)+模板符文槽",
+        checked: !!checkGuard, equipments: equipmentIds.length, costumes: costumeIds.length, runeSlots: runeSlotInfos.length });
   return { equipmentIds, costumeIds, runeSlotInfos };
 }
 function buildRaidAction(loadout, payNcg) {
@@ -433,10 +444,15 @@ async function runOnce(ctx, out) {
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
 
-  const loadout = await resolveLoadout();
+  // 装备一致性校验：仅赛季首战（latestBossLevel===0）执行；打过一场后 ≥1，后续免检。
+  const isFirstBattle = isFirstBattleOfSeason(raider.latestBossLevel);
+  const checkGuard = LOADOUT_GUARD && isFirstBattle;
+  const loadout = await resolveLoadout(checkGuard);
   const actionValue = buildRaidAction(loadout, d.payNcg);
-  out.action = { typeId: TYPE_ID, payNcg: d.payNcg, ticketMode: d.ticketMode, build: "live-equip+tmpl-rune" };
-  log({ level: "info", msg: "构造 raid7 action 完成", payNcg: d.payNcg, ticketMode: d.ticketMode });
+  out.action = { typeId: TYPE_ID, payNcg: d.payNcg, ticketMode: d.ticketMode, build: "live-equip+tmpl-rune",
+                 isFirstBattle, loadoutChecked: checkGuard };
+  log({ level: "info", msg: "构造 raid7 action 完成", payNcg: d.payNcg, ticketMode: d.ticketMode,
+        isFirstBattle, loadoutChecked: checkGuard });
 
   if (DRY) { out.result = "dry-run（未提交）"; return; }
   if (!ctx) throw new Error("缺少签名上下文");
@@ -613,6 +629,14 @@ function selfTest() {
   ok("基线符文=模板符文", sameSet(
     LOADOUT_BASELINE.runeSlots.map(x => x.join(":")),
     t.runeSlotInfos.map(x => x.join(":"))));
+
+  // 首战判定（latestBossLevel===0 才校验装备）
+  ok("首战判定 0=是", isFirstBattleOfSeason(0) === true);
+  ok("首战判定 null=是", isFirstBattleOfSeason(null) === true);
+  ok("首战判定 undefined=是", isFirstBattleOfSeason(undefined) === true);
+  ok("首战判定 1=否(已打过)", isFirstBattleOfSeason(1) === false);
+  ok("首战判定 300=否", isFirstBattleOfSeason(300) === false);
+  ok("首战判定 字符串0=是", isFirstBattleOfSeason("0") === true);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
   if (fail > 0) process.exit(1);
