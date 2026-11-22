@@ -125,9 +125,13 @@ const BUILD_TEST = args.includes("--build-test");
 // 首战 S 级通关校验开关（默认开启）。已无"装备基线拦截"，此项只控制首战 S 级实战裁决；
 // --no-loadout-guard 可跳过首战 S 级校验（一般不需要，保留作应急）。
 const LOADOUT_GUARD = !args.includes("--no-loadout-guard");
-// 自动领取击杀等级奖励：默认开启（用户 2026-11-22 要求「打完立即自动领，App 领不了」）。
-// --no-auto-claim 可关闭（应急/调试用）。只在 raid7 SUCCESS 后领，失败不影响战斗判定。
-const AUTO_CLAIM = !args.includes("--no-auto-claim");
+// 自动领取击杀等级奖励：默认【关闭】——2026-11-22 事故后纠正。
+// 真相：raid7 结算时 SetWorldBossKillReward 会自动领掉所有 level<boss.level 的未领记录，
+// 并 add 当前等级 false 作为下一轮的"引子"。IsClaimable(boss.level) 要求存在
+// key<boss.level 且 claimed=false 的记录，否则抛 InvalidClaimException 让【整笔战斗 FAILURE】。
+// 单独用 claim_world_boss_kill_reward 把引子领光 → rewardRecord 全 claimed=true → raid7 永久 FAILURE（死锁）。
+// 因此绝不能主动 claim 击杀奖励；仅保留 --auto-claim 显式开启作应急（赛季末不再打时才可用）。
+const AUTO_CLAIM = args.includes("--auto-claim");
 const numArg = (flag, def) => {
   const i = args.indexOf(flag);
   if (i < 0) return def;
@@ -657,6 +661,23 @@ async function runOnce(ctx, out) {
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
 
+  // ── 死锁保护（2026-11-22 事故）──
+  // raid7 结算要求 IsClaimable(boss.level)=存在 key<boss.level 且 claimed=false 的记录，
+  // 否则抛 InvalidClaimException 让整笔战斗 FAILURE。正常流程 raid7 打完会留一条未领"引子"，
+  // 链式往前推。若 rewardRecord 非空却没有任何可领引子（被引子被单独 claim 领光），
+  // raid7 必 FAILURE——此时跳过提交，绝不每轮白送一笔失败交易浪费 gas。
+  // 赛季初 record 为空走 else 分支（new 空 record）不抛异常，可正常打，故 record.length>0 才判。
+  if (raidId != null) {
+    const record = await getKillRewardRecord(raidId).catch(() => []);
+    const claimable = claimableLevels(record, boss?.level);
+    if (record.length > 0 && claimable.length === 0) {
+      out.result = "skip:reward_deadlock（rewardRecord 全已领、无未领引子，raid7 必 FAILURE）——本赛季无法继续，等下赛季新地址；不提交避免浪费 gas";
+      out.deadlock = { record: record.map(x => `${x.level}${x.claimed ? "✓" : "✗"}`).join(","), bossLevel: boss?.level, latestLevel: raider?.latestBossLevel };
+      log({ level: "warn", msg: "击杀奖励死锁，跳过提交", ...out.deadlock });
+      return;
+    }
+  }
+
   // 装备来源（2026-11-22 用户确认）：本季已手动打过第一次，直接复用那笔 SUCCESS raid7
   // 的 c/e/r/f（= 身上的装备），不再现场构造；仅当 Mimir 模板不可用才回退现场构造。
   const isFirstBattle = isFirstBattleOfSeason(raider.latestBossLevel);
@@ -940,7 +961,7 @@ function selfTest() {
   ok("claim a = 20字节地址", Buffer.from(claimVals.get("a")).length === 20);
   ok("claim id = 16字节", Buffer.from(claimVals.get("id")).length === 16);
   ok("claim a = avatar 地址字节", Buffer.from(claimVals.get("a")).toString("hex") === Buffer.from(Address.fromHex(AVATAR).toBytes()).toString("hex"));
-  ok("自动领取开关默认开启", AUTO_CLAIM === true);
+  ok("自动领取开关默认关闭（事故后纠正）", AUTO_CLAIM === false);
   // IsClaimable 滞后一级逻辑：只领 level < boss.level 的未领记录
   const rec = [{level:195,claimed:false},{level:197,claimed:false},{level:198,claimed:true}];
   ok("claimable 只取低于boss的未领", JSON.stringify(claimableLevels(rec,198)) === JSON.stringify([195,197]));
