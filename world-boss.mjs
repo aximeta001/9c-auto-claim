@@ -79,6 +79,12 @@ const CFG = {
 const MAIN_AVATAR = "0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c";
 const AVATAR = ENV.NC_AVATAR || MAIN_AVATAR;
 const TYPE_ID = "raid7";
+// 击杀等级奖励领取 action（Lib9c ClaimWordBossKillReward，ActionType="claim_world_boss_kill_reward"）。
+// PlainValue 只有一个字段：["a"] = AvatarAddress.Serialize()。一次调用领取 rewardRecord 里
+// 所有 claimed=false 的等级（SetWorldBossKillReward 遍历 !kv.Value）。
+// 校验门槛：IsClaimable(boss.level) 要求存在 key < boss.level 的未领记录——
+// raid7 成功后 boss 等级刚刷新上去，紧接着领天然满足（未领等级必然 < 当前 boss.level）。
+const CLAIM_TYPE_ID = "claim_world_boss_kill_reward";
 // Lib9c Addresses.GetWorldBossAddress 派生用的常量地址（0x...15）
 const RAID_CONST = "0x0000000000000000000000000000000000000015";
 // 主网第37期：start=11889221, end=12040420, fee=1, ticket=1, add=0, max=40
@@ -119,6 +125,9 @@ const BUILD_TEST = args.includes("--build-test");
 // 首战 S 级通关校验开关（默认开启）。已无"装备基线拦截"，此项只控制首战 S 级实战裁决；
 // --no-loadout-guard 可跳过首战 S 级校验（一般不需要，保留作应急）。
 const LOADOUT_GUARD = !args.includes("--no-loadout-guard");
+// 自动领取击杀等级奖励：默认开启（用户 2026-11-22 要求「打完立即自动领，App 领不了」）。
+// --no-auto-claim 可关闭（应急/调试用）。只在 raid7 SUCCESS 后领，失败不影响战斗判定。
+const AUTO_CLAIM = !args.includes("--no-auto-claim");
 const numArg = (flag, def) => {
   const i = args.indexOf(flag);
   if (i < 0) return def;
@@ -509,6 +518,18 @@ function buildRaidAction(loadout, payNcg) {
   ]);
 }
 
+// 构造击杀等级奖励领取 action：ClaimWordBossKillReward。
+// 源码 PlainValueInternal = { ["a"] = AvatarAddress.Serialize() }，无其他字段。
+function buildClaimAction() {
+  const values = new BencodexDictionary([
+    ["a", Buffer.from(Address.fromHex(AVATAR).toBytes())],
+  ]);
+  return new BencodexDictionary([
+    ["type_id", CLAIM_TYPE_ID],
+    ["values", values],
+  ]);
+}
+
 // ---------------- 交易提交与确认 ----------------
 async function getNonce(signerStr) {
   const d = await gqlRpc("query($a:Address!){ transaction { nextTxNonce(address:$a) } }", { a: signerStr });
@@ -673,7 +694,35 @@ async function runOnce(ctx, out) {
     }
   }
 
-  out.result = "战斗提交成功（SUCCESS，未领取奖励）";
+  // ── 自动领取击杀等级奖励（用户 2026-11-22 要求：App 领不了，打完立即自动领）──
+  // 紧跟 raid7 SUCCESS 之后提交 claim_world_boss_kill_reward。nonce 用 raid7 的 +1
+  // （本地递增，绝不重读链上 nextTxNonce——raid7 刚 stage 可能尚未反映，重读会 nonce 冲突）。
+  // 领取失败不影响战斗 SUCCESS 判定，只记录到 out.claim，绝不因领奖失败停手或重打。
+  if (AUTO_CLAIM) {
+    try {
+      const claimAction = buildClaimAction();
+      const claimNonce = nonce + 1n;
+      const claimTxId = await submitTx({ ...ctx, nonce: claimNonce, actionValue: claimAction });
+      out.claim = { submitted: true, txId: claimTxId, nonce: String(claimNonce), typeId: CLAIM_TYPE_ID };
+      log({ level: "info", msg: "已自动提交击杀奖励领取", txId: claimTxId, nonce: String(claimNonce) });
+      const claimResult = await confirmTxAcrossNodes(claimTxId);
+      out.claim.result = claimResult;
+      log({ level: "info", msg: "领取交易终态", txId: claimTxId, ...claimResult });
+      if (isConfirmedTerminal(claimResult) && claimResult.txStatus === "SUCCESS") {
+        out.claim.ok = true;
+        out.result = "战斗提交成功（SUCCESS，已自动领取奖励）";
+      } else {
+        out.claim.ok = false;
+        out.result = `战斗提交成功（SUCCESS，领取未成功：${claimResult.txStatus}）——战斗已成立，不重打`;
+      }
+    } catch (e) {
+      out.claim = { submitted: false, ok: false, error: e.message };
+      log({ level: "warn", msg: "自动领取异常（不影响战斗 SUCCESS）", detail: e.message });
+      out.result = "战斗提交成功（SUCCESS，领取异常）——战斗已成立，不重打";
+    }
+  } else {
+    out.result = "战斗提交成功（SUCCESS，未领取奖励，--no-auto-claim）";
+  }
 }
 
 async function makeCtx() {
@@ -857,6 +906,16 @@ function selfTest() {
   ok("溢出读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"Int溢出", overflow:true }).clear === false);
   ok("值缺失=未通关", judgeFirstBattleClear({ ok:true, value:null }).clear === false);
   ok("读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"err" }).clear === false);
+
+  // claim_world_boss_kill_reward 构造校验（自动领取）
+  const claimAction = buildClaimAction();
+  ok("claim type_id 正确", String(claimAction.get("type_id")) === "claim_world_boss_kill_reward");
+  const claimVals = claimAction.get("values");
+  ok("claim values 是字典", claimVals instanceof BencodexDictionary);
+  ok("claim 只有一个字段 a", [...claimVals.keys()].length === 1 && [...claimVals.keys()][0] === "a");
+  ok("claim a = 20字节地址", Buffer.from(claimVals.get("a")).length === 20);
+  ok("claim a = avatar 地址字节", Buffer.from(claimVals.get("a")).toString("hex") === Buffer.from(Address.fromHex(AVATAR).toBytes()).toString("hex"));
+  ok("自动领取开关默认开启", AUTO_CLAIM === true);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
   if (fail > 0) process.exit(1);
