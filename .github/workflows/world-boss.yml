@@ -11,7 +11,9 @@ name: 9C World Boss 自动战斗 (Heimdall)
 #     买票不扣免费票）。买票前运行时护栏校验 ticket_price=1/additional=0/max=40，
 #     读不到或不符 → 不买（尊重「不是 1NCG 递增就暂不操作」）。
 #   · 首次入场水晶：action 服务端自动扣（entranceFee×level²），脚本不额外构造。
-#   · 只打不领：绝不提交 claim action，击杀奖励由用户自行领取。
+#   · 打完立即自动领：raid7 SUCCESS 后紧跟一笔 claim_world_boss_kill_reward
+#     （Gas=1，领取全部未领等级），nonce 用 raid7+1 本地递增，绝不重读链上避免 nonce 冲突。
+#     领取失败只记录、不影响战斗 SUCCESS、不重打。可用 --no-auto-claim 关闭。
 #   · 启动门控：tip < arm_block（默认 11889334 = 赛季起点 11889221 + 15分钟）秒退。
 #     赛季第37期起点 11889221；用户要求「赛季开始后约15分钟启动」，
 #     按 8秒/块 ≈ 113块 → 11889334。赛季开始不要求抢首层，晚点无妨。
@@ -19,12 +21,13 @@ name: 9C World Boss 自动战斗 (Heimdall)
 # 稳定运行架构（复用领奖/无限塔链，已验证）：
 #   前置闸门：每次调度先 curl 查 tip，未到 arm_block 就整个 job 秒退（不 checkout/不装依赖/
 #             不解私钥，成本近零）。进入窗口才拉起 watch。
-#   主力：job 内 world-boss.mjs --watch 常驻，进程内每 60s 轮询一次链上状态，
-#         boss 一升级即提交（不等下一条 cron）。
+#   主力：job 内 world-boss.mjs --watch 常驻，进程内每 15s 轮询一次链上状态，
+#         boss 一升级即提交（不等下一条 cron）。15s 为防跳级：boss 常一次跳多级，
+#         轮询越密越能一级一级紧跟，减少 rewardRecord 只记当前级、跳过中间级的损失。
 #   接力：job 守满预算（默认 5.5h < 6h 上限）打印 {"handoff":"budget_exhausted"}，
 #         末尾 step 用 workflow_dispatch REST API 即时刻下一个 job，concurrency 组串行无缝。
 #   停止：买满 40 / 赛季末 / 已提交未定论 / 交易定论 → 不接力，避免空转浪费 runner。
-#   保险：schedule 每 10 分钟只作「接力链意外断裂时重新点火」。
+#   保险：schedule 每 5 分钟只作「接力链意外断裂时重新点火」，默认走漏洞模式。
 #
 # 交易终态只认 SUCCESS / FAILURE / INVALID 且须带 blockIndex（跨节点复核，杜绝伪 INVALID）。
 # 私钥：与领奖/扫货/AB/无限塔共用同一 keystore Secrets，runner 内临时解密，job 结束即销毁。
@@ -33,7 +36,7 @@ name: 9C World Boss 自动战斗 (Heimdall)
 
 on:
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'   # 断链重燃保险 + 启动门控探测
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'   # 每5分钟：断链重燃保险 + 启动门控探测
   workflow_dispatch:
     inputs:
       dry_run:
@@ -150,8 +153,10 @@ jobs:
           NC_ONLY: ${{ inputs.ncg_only }}
         run: |
           set -o pipefail
-          EXTRA="--watch --gap-ms 60000"
-          if [ "$NC_ONLY" = "true" ]; then EXTRA="$EXTRA --ncg-only"; fi
+          EXTRA="--watch --gap-ms 15000"
+          # 漏洞模式：dispatch 遵循勾选；schedule 断链重燃默认走漏洞模式（NCG买票 p=true），
+          # 否则重燃的 job 退回免费票优先会破坏 p=true 免扣费的既定打法，浪费免费票。
+          if [ "$NC_ONLY" = "true" ] || [ "$EVENT" = "schedule" ]; then EXTRA="$EXTRA --ncg-only"; fi
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
             EXTRA="$EXTRA --dry-run"
           else
@@ -181,6 +186,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           SEASON: ${{ inputs.season }}
           ARM_BLOCK: ${{ inputs.arm_block }}
+          NC_ONLY: ${{ inputs.ncg_only }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN" = "true" ]; then
             echo "手动演练模式：不接力"; exit 0
@@ -192,13 +198,15 @@ jobs:
           echo "检测到正常交棒，发起接力…"
           SEASON_IN="${SEASON:-37}"; case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="37";; esac
           AB_IN="${ARM_BLOCK:-11889334}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="11889334";; esac
+          # 继承漏洞模式：接力的新 run 必须带上 ncg_only，否则会退回免费票优先、破坏 p=true 漏洞攻击
+          NC_ONLY_IN="${NC_ONLY:-false}"
           CODE=""
           for i in 1 2 3; do
             CODE=$(curl -sS -m 30 -o "$RUNNER_TEMP/relay_resp.txt" -w "%{http_code}" -X POST \
               -H "Authorization: Bearer $DISPATCH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\",\"arm_block\":\"$AB_IN\"}}" \
+              -d "{\"ref\":\"$RELAY_REF\",\"inputs\":{\"dry_run\":\"false\",\"season\":\"$SEASON_IN\",\"arm_block\":\"$AB_IN\",\"ncg_only\":\"$NC_ONLY_IN\"}}" \
               "https://api.github.com/repos/$RELAY_REPO/actions/workflows/world-boss.yml/dispatches") || CODE="000"
             if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then break; fi
             echo "接力第 $i 次返回 HTTP=$CODE，5s 后重试"; sleep 5
