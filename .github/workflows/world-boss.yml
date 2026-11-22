@@ -11,12 +11,12 @@ name: 9C World Boss 自动战斗 (Heimdall)
 #     买票不扣免费票）。买票前运行时护栏校验 ticket_price=1/additional=0/max=40，
 #     读不到或不符 → 不买（尊重「不是 1NCG 递增就暂不操作」）。
 #   · 首次入场水晶：action 服务端自动扣（entranceFee×level²），脚本不额外构造。
-#   · 打完立即自动领：raid7 SUCCESS 后紧跟一笔 claim_world_boss_kill_reward
-#     （Gas=1，领取全部未领等级），nonce 用 raid7+1 本地递增，绝不重读链上避免 nonce 冲突。
-#     领取失败只记录、不影响战斗 SUCCESS、不重打。可用 --no-auto-claim 关闭。
-#   · 启动门控：tip < arm_block（默认 11889334 = 赛季起点 11889221 + 15分钟）秒退。
-#     赛季第37期起点 11889221；用户要求「赛季开始后约15分钟启动」，
-#     按 8秒/块 ≈ 113块 → 11889334。赛季开始不要求抢首层，晚点无妨。
+#   · 只打不领（2026-11-22 事故后铁律，脚本内已无任何 claim 代码）：击杀奖励由 raid7
+#     战斗结算内部自动领取。切勿单独 claim——会领光"引子"导致 rewardRecord 全已领，
+#     下次 raid7 结算 IsClaimable=false 抛 InvalidClaimException → 整笔战斗永久 FAILURE。
+#     本赛季37已因此死锁，务必杜绝重演。
+#   · 赛季跟随：默认自动跟随链上当前 raidId，跨赛季无需改代码；season 输入留空/auto 即跟随。
+#   · 启动门控：tip < arm_block 秒退；跟随模式下留空或填 0 关闭门控（或填一个已过的历史块）。
 #
 # 稳定运行架构（复用领奖/无限塔链，已验证）：
 #   前置闸门：每次调度先 curl 查 tip，未到 arm_block 就整个 job 秒退（不 checkout/不装依赖/
@@ -44,13 +44,13 @@ on:
         type: boolean
         default: true
       season:
-        description: '目标赛季 raidId（默认 37；第37期 start=11889221 end=12040420）'
+        description: '目标赛季 raidId（默认 auto=自动跟随链上当前赛季；仅应急才填数字锁定某季）'
         type: string
-        default: '37'
+        default: 'auto'
       arm_block:
-        description: '启动区块门槛（默认 11889334 = 赛季起点11889221+15分钟；tip 到达才开打。0=不设门控）'
+        description: '启动区块门槛（默认 0=不设门控；跟随模式下跨赛季无需固定起点。仅应急调试才填具体块）'
         type: string
-        default: '11889334'
+        default: '0'
       max_watch_seconds:
         description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
         type: string
@@ -82,10 +82,10 @@ jobs:
           ARM_BLOCK: ${{ inputs.arm_block }}
         run: |
           set -o pipefail
-          AB="${ARM_BLOCK:-11889334}"
-          case "$AB" in ''|*[!0-9]*) AB="11889334";; esac
+          AB="${ARM_BLOCK:-0}"
+          case "$AB" in ''|*[!0-9]*) AB="0";; esac
           echo "arm_block=$AB"
-          if [ "$AB" = "0" ]; then echo "armed=true" >> "$GITHUB_OUTPUT"; echo "门控关闭"; exit 0; fi
+          if [ "$AB" = "0" ]; then echo "armed=true" >> "$GITHUB_OUTPUT"; echo "门控关闭（跟随模式）"; exit 0; fi
           # 手工演练(dry_run=true)不设闸门，便于随时验证流程
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
             echo "armed=true" >> "$GITHUB_OUTPUT"; echo "手工演练：跳过区块闸门"; exit 0
@@ -160,12 +160,14 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
             EXTRA="$EXTRA --dry-run"
           else
-            AB="${ARM_BLOCK:-11889334}"
-            case "$AB" in ''|*[!0-9]*) AB="11889334";; esac
+            AB="${ARM_BLOCK:-0}"
+            case "$AB" in ''|*[!0-9]*) AB="0";; esac
             EXTRA="$EXTRA --arm-block $AB"
           fi
+          # 赛季：默认 auto=不传 --season，脚本自动跟随链上 raidId（跨赛季免改）。
+          # 仅显式数字才锁定该赛季（应急/调试）。
           case "$SEASON" in
-            ''|*[!0-9]*) EXTRA="$EXTRA --season 37" ;;
+            ''|auto|AUTO|*[!0-9]*) : ;;
             *) EXTRA="$EXTRA --season $SEASON" ;;
           esac
           case "$WATCH_SEC" in
@@ -196,8 +198,9 @@ jobs:
             echo "未检测到正常交棒标记（可能已买满/赛季末/定论/异常），不接力"; exit 0
           fi
           echo "检测到正常交棒，发起接力…"
-          SEASON_IN="${SEASON:-37}"; case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="37";; esac
-          AB_IN="${ARM_BLOCK:-11889334}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="11889334";; esac
+          # 赛季继承：跟随模式传 auto（新 job 自动跟随链上 raidId，跨赛季无缝）；显式数字原样继承。
+          SEASON_IN="${SEASON:-auto}"; case "$SEASON_IN" in ''|*[!0-9]*) SEASON_IN="auto";; esac
+          AB_IN="${ARM_BLOCK:-0}"; case "$AB_IN" in ''|*[!0-9]*) AB_IN="0";; esac
           # 继承漏洞模式：接力的新 run 必须带上 ncg_only，否则会退回免费票优先、破坏 p=true 漏洞攻击
           NC_ONLY_IN="${NC_ONLY:-false}"
           CODE=""
