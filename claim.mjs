@@ -48,8 +48,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import net from "node:net";
-import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { RawPrivateKey, Address } from "@planetarium/account";
 import { signTx, encodeSignedTx } from "@planetarium/tx";
@@ -244,23 +242,6 @@ const SWEEP_CP_FALLBACK_STEP = Math.max(0, Math.trunc(numArg("--sweep-cp-fallbac
 const SWEEP_MIN_STAGE = Math.max(1, Math.trunc(numArg("--sweep-min-stage", 400)));
 // 同一 stage 因「非装备/非CP」原因失败的最大重试次数（避免未知异常无限空转）。
 const SWEEP_MAX_SAME_STAGE_RETRY = Math.max(1, Math.trunc(numArg("--sweep-same-stage-retry", 2)));
-
-// ---- 告警邮件配置（凭证只从环境变量/Secrets 读，绝不落盘、不写日志）----
-// 用 Node 原生 tls 实现最小 SMTP 客户端，无第三方依赖。端口默认 465(implicit TLS)；
-// 若用 587(STARTTLS) 设 NC_SMTP_STARTTLS=1。任一必填项缺失则跳过发信、仅记日志。
-const ALERT = {
-  host: ENV.NC_SMTP_HOST || "",
-  port: Math.trunc(Number(ENV.NC_SMTP_PORT || 465)),
-  user: ENV.NC_SMTP_USER || "",
-  pass: ENV.NC_SMTP_PASS || "",
-  to: ENV.NC_SMTP_TO || "",
-  from: ENV.NC_SMTP_FROM || ENV.NC_SMTP_USER || "",
-  starttls: /^(1|true|yes)$/i.test(ENV.NC_SMTP_STARTTLS || ""),
-  enabled: !args.includes("--no-alert"),
-};
-function alertConfigured() {
-  return ALERT.enabled && !!(ALERT.host && ALERT.user && ALERT.pass && ALERT.to);
-}
 
 // ---------------- 工具 ----------------
 async function gql(url, query, variables = {}, timeoutMs = 45000) {
@@ -766,136 +747,46 @@ async function confirmTx(txId, tries = CFG.confirmTries) {
   return { txStatus: "PENDING" };
 }
 
-// ---------------- 告警邮件（sweep 穷尽修复仍失败时） ----------------
-// 用 Node 原生 net/tls 实现最小 SMTP 客户端，零第三方依赖；凭证只从环境变量
-// （GitHub Secrets 注入）读取，绝不落盘、不写日志。DRY/未配置时静默跳过。
-function mimeHeader(s) {
-  // 邮件头防止 CRLF 注入（主题里的异常名来自链上，理论上可控，做基本清洗）
-  return String(s).replace(/[\r\n]+/g, " ");
-}
-function buildAlertMail(subject, body) {
-  const lines = [
-    `From: ${mimeHeader(ALERT.from)}`,
-    `To: ${mimeHeader(ALERT.to)}`,
-    `Subject: =?UTF-8?B?${Buffer.from(mimeHeader(subject), "utf8").toString("base64")}?=`,
-    "MIME-Version: 1.0",
-    "Content-Type: text/plain; charset=UTF-8",
-    "Content-Transfer-Encoding: base64",
-    "",
-    Buffer.from(body, "utf8").toString("base64"),
-  ];
-  return lines.join("\r\n") + "\r\n.\r\n";
-}
-
-// 极简 SMTP 会话：EHLO → (STARTTLS) → AUTH LOGIN → MAIL FROM → RCPT TO → DATA → QUIT。
-// 465 用隐式 TLS 直连；587 先明文 EHLO 再 STARTTLS 升级。用闭包统一 handler，
-// 升级 TLS 时把 data/error/close 监听从旧 socket 迁到新 socket，避免误判提前关闭。
-function smtpSend(subject, body) {
-  return new Promise((resolve, reject) => {
-    let sock, buffer = "", phase = "greeting", finished = false, timer;
-    let needStarttls = ALERT.starttls;   // 局部副本，STARTTLS 升级后清零，不改全局配置
-    const authUser = Buffer.from(ALERT.user).toString("base64");
-    const authPass = Buffer.from(ALERT.pass).toString("base64");
-    const done = (err) => {
-      if (finished) return; finished = true;
-      clearTimeout(timer);
-      try { sock && sock.destroy(); } catch (_) {}
-      err ? reject(err) : resolve();
-    };
-    const send = (line) => { sock.write(line + "\r\n"); };
-    const onData = (chunk) => {
-      buffer += chunk.toString("utf8");
-      let nl;
-      while ((nl = buffer.indexOf("\r\n")) >= 0) {
-        const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 2);
-        const code = line.slice(0, 3);
-        if (phase === "greeting") {
-          if (code !== "220") return done(new Error("SMTP greeting " + line));
-          send(`EHLO ${ALERT.host}`); phase = "ehlo";
-        } else if (phase === "ehlo") {
-          if (needStarttls && code === "250") { send("STARTTLS"); phase = "starttls"; }
-          else if (/^250/.test(code)) { send("AUTH LOGIN"); phase = "auth_user"; }
-          else return done(new Error("SMTP EHLO " + line));
-        } else if (phase === "starttls") {
-          if (code !== "220") return done(new Error("SMTP STARTTLS " + line));
-          detach(sock);
-          const secured = tls.connect({ socket: sock, servername: ALERT.host }, () => {
-            attach(secured); send(`EHLO ${ALERT.host}`); phase = "ehlo"; needStarttls = false;
-          });
-          secured.on("error", e => done(e));
-          return;
-        } else if (phase === "auth_user") {
-          if (code !== "334") return done(new Error("SMTP AUTH user " + line));
-          send(authUser); phase = "auth_pass";
-        } else if (phase === "auth_pass") {
-          if (code !== "334") return done(new Error("SMTP AUTH pass " + line));
-          send(authPass); phase = "auth_ok";
-        } else if (phase === "auth_ok") {
-          if (!/^235/.test(code)) return done(new Error("SMTP AUTH failed " + line));
-          send(`MAIL FROM:<${ALERT.user}>`); phase = "mail_from";
-        } else if (phase === "mail_from") {
-          if (code !== "250") return done(new Error("SMTP MAIL FROM " + line));
-          send(`RCPT TO:<${ALERT.to}>`); phase = "rcpt_to";
-        } else if (phase === "rcpt_to") {
-          if (!/^(250|251)/.test(code)) return done(new Error("SMTP RCPT TO " + line));
-          send("DATA"); phase = "data";
-        } else if (phase === "data") {
-          if (code !== "354") return done(new Error("SMTP DATA " + line));
-          sock.write(buildAlertMail(subject, body), "utf8", () => { send("QUIT"); phase = "quit"; });
-        } else if (phase === "quit") {
-          return done(null);
-        }
-      }
-    };
-    const onErr = (e) => done(e);
-    const onClose = () => { if (!finished) done(new Error("SMTP 连接提前关闭")); };
-    const attach = (s) => { s.setEncoding("utf8"); s.on("data", onData); s.on("error", onErr); s.on("close", onClose); };
-    const detach = (s) => { if (s) { s.removeListener("data", onData); s.removeListener("error", onErr); s.removeListener("close", onClose); } };
-    sock = needStarttls
-      ? net.connect(ALERT.port, ALERT.host)
-      : tls.connect({ host: ALERT.host, port: ALERT.port, servername: ALERT.host });
-    attach(sock);
-    timer = setTimeout(() => done(new Error("SMTP 超时")), 20000);
-  });
-}
-
-// 组装 sweep 失败告警正文并发送。任何失败只记日志，绝不影响日常领取主流程。
+// ---------------- sweep 失败告警（写入 GitHub Actions Step Summary） ----------------
+// 用户 2026-11-23 决定：不用邮件，改为零配置告警 —— 穷尽修复仍失败时把结果写进
+// GITHUB_STEP_SUMMARY（GitHub 自动提供该环境变量，指向 job 内临时文件），
+// 告警会自动显示在那次 Actions 运行页顶部；本地运行则只落 error 日志。
+// 无需任何邮箱/SMTP 凭证，不落盘到仓库。告警绝不影响日常领取主流程。
 async function sendSweepAlert(info, ctx) {
-  if (DRY) { log({ level: "info", msg: "演练：跳过告警邮件" }); return; }
-  if (!alertConfigured()) {
-    log({ level: "warn", msg: "sweep 失败但告警邮件未配置（缺 NC_SMTP_HOST/USER/PASS/TO），仅记录日志",
-          stopReason: info.stopReason || "attempts_exhausted" });
-    return;
-  }
   const attemptRows = (info.attemptLog || []).map(a =>
-    `  - 第${a.attempt}次 stage=${a.stage ?? "-"} world=${a.world ?? "-"} ` +
-    `status=${a.txStatus ?? "-"} 异常=${(a.exceptionNames || []).filter(Boolean).join(",") || "-"} ` +
-    `诊断=${a.diagnosis?.action ?? "-"} tx=${a.txId || "-"}`).join("\n");
-  const body = [
-    `9C 自动领奖：AP 消耗 sweep 多次修复后仍失败（需人工关注）`,
+    `| ${a.attempt} | ${a.stage ?? "-"} | ${a.world ?? "-"} | ${a.txStatus ?? "-"} ` +
+    `| ${(a.exceptionNames || []).filter(Boolean).join(",") || "-"} | ${a.diagnosis?.action ?? "-"} | ${a.txId || "-"} |`
+  ).join("\n");
+  const md = [
+    `## ⚠️ SWEEP 失败告警（AP 未消耗，需人工关注）`,
     ``,
-    `时间：${new Date().toISOString()}`,
-    `角色：${ACTIVE.label || ""} ${activeAddress()}`,
-    `尝试次数：${info.attempts} / ${info.maxAttempts}`,
-    `停止原因：${info.stopReason || "attempts_exhausted"}`,
-    `最终关卡：stage ${ctx.stage ?? info.stage ?? "-"}（world ${info.world ?? "-"}）`,
-    `当前 AP：${ctx.ap ?? "-"}`,
-    `最后异常：${(info.exceptionNames || []).filter(Boolean).join(",") || "-"}`,
+    `- 时间：${new Date().toISOString()}`,
+    `- 角色：${ACTIVE.label || ""} ${activeAddress()}`,
+    `- 尝试：${info.attempts} / ${info.maxAttempts}，停止原因：${info.stopReason || "attempts_exhausted"}`,
+    `- 最终关卡：stage ${ctx.stage ?? info.stage ?? "-"}（world ${info.world ?? "-"}），当前 AP：${ctx.ap ?? "-"}`,
+    `- 最后异常：${(info.exceptionNames || []).filter(Boolean).join(",") || "-"}`,
+    `- 现场装备：${ctx.loadout?.equipCount ?? "-"} 件 / 时装 ${ctx.loadout?.costumeCount ?? "-"} 件 / 符文槽 ${(ctx.template?.runeSlots || []).length}`,
     ``,
-    `逐次尝试：`,
-    attemptRows || "  （无）",
+    `| 次数 | stage | world | 状态 | 异常 | 诊断 | txId |`,
+    `|---|---|---|---|---|---|---|`,
+    attemptRows || "| - | - | - | - | - | - | - |",
     ``,
-    `现场装备：${ctx.loadout?.equipCount ?? "-"} 件 / 时装 ${ctx.loadout?.costumeCount ?? "-"} 件 / 符文槽 ${(ctx.template?.runeSlots || []).length}`,
-    `说明：装备/时装已改为现场读取当前穿戴，若仍报 ItemDoesNotExist 请检查是否有装备被锁定或刚刚变动。`,
-    `日常奖励不受影响，已照常领取。`,
+    `> 装备/时装已现场读取当前穿戴；若仍报 ItemDoesNotExist 请检查装备是否被锁定/刚变动。日常奖励不受影响，已照常领取。`,
+    ``,
   ].join("\n");
-  const subject = `[9C告警] sweep 失败 stage${ctx.stage ?? info.stage ?? "-"} ${attemptRows ? "" : ""}`.slice(0, 120);
-  try {
-    await smtpSend(subject, body);
-    log({ level: "info", msg: "sweep 失败告警邮件已发送", to: ALERT.to });
-  } catch (e) {
-    log({ level: "error", msg: "sweep 失败告警邮件发送失败", detail: String(e.message) });
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!DRY && summaryPath) {
+    try {
+      fs.appendFileSync(summaryPath, "\n" + md + "\n", "utf8");
+      log({ level: "info", msg: "sweep 失败告警已写入 GitHub Step Summary" });
+    } catch (e) {
+      log({ level: "error", msg: "写入 Step Summary 失败，仅保留日志告警", detail: String(e.message) });
+    }
   }
+  // 无论是否 GitHub 环境，都用醒目的 error 日志再记一次（CI 日志/daemon.log 都能看到）。
+  log({ level: "error", msg: `SWEEP_ALERT stage=${ctx.stage ?? info.stage ?? "-"} ` +
+    `attempts=${info.attempts} stop=${info.stopReason || "attempts_exhausted"} ` +
+    `exception=${(info.exceptionNames || []).filter(Boolean).join(",") || "-"}` });
 }
 
 // ---------------- 蹲守模式（--watch） ----------------
