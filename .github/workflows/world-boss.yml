@@ -52,6 +52,10 @@ on:
         description: '仅调试：本次蹲守预算秒数，留空=默认 5.5h；填 60 可一分钟验证交棒'
         type: string
         default: ''
+      ncg_only:
+        description: '勾选后自动化的买票攻击只用 NCG、跳过免费票（免费票由你自己在游戏里打）。默认关闭=免费票优先'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -143,9 +147,11 @@ jobs:
           SEASON: ${{ inputs.season }}
           ARM_BLOCK: ${{ inputs.arm_block }}
           WATCH_SEC: ${{ inputs.max_watch_seconds }}
+          NC_ONLY: ${{ inputs.ncg_only }}
         run: |
           set -o pipefail
           EXTRA="--watch --gap-ms 60000"
+          if [ "$NC_ONLY" = "true" ]; then EXTRA="$EXTRA --ncg-only"; fi
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY" = "true" ]; then
             EXTRA="$EXTRA --dry-run"
           else
