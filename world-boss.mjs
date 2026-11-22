@@ -3,16 +3,19 @@
  * 9C World Boss (WB) 自动战斗 —— Heimdall，deployed to GitHub Actions.
  *
  * 策略（经用户 2026-11-20/21 确认，全部来自 Lib9c 源码 + 主网链上表核实）：
- *   · 按 boss 等级判定：仅当「全球 boss 当前等级 > 你记录的 latestBossLevel」才打。
- *     源码 raid7 里击杀奖励的唯一触发条件就是 `if (raiderState.LatestBossLevel < bossState.Level)`，
- *     发完把 latestBossLevel 更新为当前 boss 等级；多升几级源码一次补发。未升级绝不打（不浪费票）。
- *   · 扫货链（2026-11-22 用户要求，替代旧"打一笔就停等5分钟"）：进入 --watch 后进程内
- *     每 GAP_MS（默认 15s）轮询 boss 等级，一升级立刻打；打完 SUCCESS 不退出，继续蹲下一级，
- *     全程不断链，直到 300 级 / 赛季末 / 买满 / 死锁 / 装备首战未通关才停。漏洞模式 p=true
- *     不扣票/NCG，多打无所谓，重点是别让 boss 跳级漏掉击杀奖励。本地水位 handledLevel 防止
- *     链上状态滞后导致重复打同一级；预算耗尽 normal 交棒，concurrency 排队无缝续接。
- *   · 门票：免费票优先（remainChallengeCount>=1 → PayNcg=false），用尽后 NCG 买满 40
- *     （PayNcg=true；买票不扣免费票；上限 MaxPurchaseCount=40）。
+ *   · 两阶段策略（用户 2026-11-22 定，RANK_PHASE_LEVEL=300）：
+ *     [kill] boss < 300 —— 击杀奖励阶段：源码 raid7 击杀奖励唯一触发条件
+ *       `if (raiderState.LatestBossLevel < bossState.Level)`，发完把 latestBossLevel 更新到当前级。
+ *       故盯 boss 等级，一升级立刻打、打完继续蹲下一级（扫货链），保证每级奖励不漏。
+ *     [rank] boss >= 300 —— 伤害占比奖励阶段：奖励按伤害占比分，打得越多占比越高。
+ *       不再判断等级、每轮连续打（连 boss 没升级也打），叠加水位不参与此阶段。
+ *   · 扫货链（替代旧"打一笔就停等5分钟"）：进入 --watch 后进程内每 GAP_MS（默认 15s）轮询，
+ *     打完 SUCCESS 不退出、全程不断链。漏洞模式 p=true 不扣票/NCG，多打无所谓；本地水位
+ *     handledLevel 只在 kill 阶段防链上滞后重复打同一级；预算耗尽 normal 交棒无缝续接。
+ *     硬停止仅四类：赛季末 / 空档 / 死锁 / 装备首战未通关（买满40已删，见下）。
+ *   · 门票：免费票优先（remainChallengeCount>=1 → PayNcg=false），用尽后 NCG 买票（PayNcg=true）。
+ *     【不再有"买满40停止"】——漏洞模式 p=true 根本不扣 NCG，买满无意义，rank 阶段更需持续打；
+ *     票价护栏（读不到表/票价异常不买票）保留作安全网，防止漏洞万一失效时按异常票价扣费。
  *   · 首次入场水晶：由 raid7 action 服务端自动扣（entranceFee×level² crystal），脚本不额外构造。
  *   · 只打不领（2026-11-22 事故后铁律）：绝不提交任何 claim action——既不手动 claim
  *     击杀奖励，也不 claim 排名奖励。真相：raid7 战斗结算内部 SetWorldBossKillReward
@@ -149,6 +152,9 @@ const MAX_WATCH_MS = Math.max(10, numArg("--max-watch-seconds", 330 * 60)) * 100
 // 扫货链：同一 boss 等级连续战斗失败(FAILURE/INVALID)达此次数就跳过该级、等下次升级，
 // 防止漏洞模式下对同一级无限重刷失败交易（虽不扣票/NCG，仍白耗 gas 与 runner 时间）。
 const MAX_LEVEL_RETRY = Math.max(1, Math.trunc(numArg("--max-level-retry", 3)));
+// 两阶段分界（用户 2026-11-22 定）：boss < 300 击杀奖励阶段（盯 boss 升级才打，保证每级奖励）；
+// boss >= 300 伤害占比阶段（不判断等级、连续打，打得越多伤害占比越高、分得排名奖励）。
+const RANK_PHASE_LEVEL = Math.max(1, Math.trunc(numArg("--rank-phase-level", 300)));
 
 // 历史 raid7 SUCCESS 模板（block 11704772，第35期；含符文槽配置——GraphQL 无法直读 Raid 槽）
 const TEMPLATE_RAW = "6475373a747970655f696475353a726169643775363a76616c7565736475313a6132303aac9d450c69df27ee290c90ec61c4b76154b0a21c75313a636c31363a3c07374778009e42bfa10a16854b5b3431363a3c07374778009e42bfa10a16854b5b3431363a124e4f4bdb116346bd68bcb86b8d301b31363a47695f4fb8c7a4449ca7c9b99891790b31363a6619635e7b72d3479fda8675f64a366e31363a12338ec56f2f2a499c1c1d5d8332666c6575313a656c31363a84afc54e6d44d840948afc3089a2479931363aeba24ec67f4e5c44acf718c40594835b31363a2a9b1888b279d449a8864952c340571431363aa44d5b8d516e95418c834092994f833631363a656ba3105d2d53419c2709151d1877c131363a78cc60679f7f1b49992732ed5b090eb731363a10279dce80a38b4390bbc01ab03ba71431363acf5f2258713bc94e943078cfa84e8cbc6575313a666c6575323a696431363a00af215d8453a9469c5196779a95bdd475313a706675313a726c6c75313a3075353a3130303437656c75313a3175353a3330303031656c75313a3375353a3130303535656c75313a3475353a3130303531656c75313a3675353a3130303532656c75313a3775353a3130303033656c75313a3875353a3130303536656c75313a3975353a313030313365656565";
@@ -194,8 +200,9 @@ function isConfirmedTerminal(r) {
 // 干净拆成纯函数便于离线自测，防止又把"打一笔就停"的旧逻辑带回来。
 function watchStopCode(result) {
   const r = result || "";
-  // 赛季级终态：买满 / 赛季末 / 赛季空档 / 赛季不符 / 死锁 —— 停，不接力
-  if (/^(skip:(purchase_cap|season_end|season_mismatch|gap)|skip:reward_deadlock)/.test(r)) return "season_stop";
+  // 赛季级终态：赛季末 / 赛季空档 / 赛季不符 / 死锁 —— 停，不接力。
+  // 注意："买满40"(purchase_cap) 已删除——漏洞模式不扣 NCG，且 rank 阶段需持续打。
+  if (/^(skip:(season_end|season_mismatch|gap)|skip:reward_deadlock)/.test(r)) return "season_stop";
   // 装备首战没打穿 S 级：装备错，停手（用户铁律，绝不硬打）
   if (r.startsWith("首战未达S级")) return "first_battle_not_clear";
   // 手工演练 / dry-run：不接力
@@ -610,17 +617,23 @@ function decide({ raidId, row, raider, boss, tip, season = SEASON, handledLevel 
   if (row && row.end && tip >= BigInt(row.end - END_BUFFER)) return {
     ok: false, reason: `赛季临近结束（tip=${tip} ≥ end-buffer=${row.end - END_BUFFER}），停止开新战斗`, code: "season_end" };
 
-  // 按 boss 等级判定：只有 boss 等级高于「已记录等级」才打（保证击杀奖励）。
-  // 扫货链：叠加本地水位 handledLevel——本 job 内已提交过的等级即使链上 latestBossLevel
-  // 尚未同步，也不会重复提交同一级（等链上确认后再放开）。
   const bossLv = Number(boss.level);
   const chainLv = Number(raider.latestBossLevel || 0);
+  // ── 两阶段策略（用户 2026-11-22 定）──
+  // kill 阶段（boss < RANK_PHASE_LEVEL）：盯 boss 升级才打，保证每一级的击杀奖励不漏。
+  //   扫货链水位 handledLevel：本 job 内已提交过的等级即使链上 latestBossLevel 尚未同步，
+  //   也不重复提交同一级（等链上确认后再放开）。
+  // rank 阶段（boss >= RANK_PHASE_LEVEL）：伤害占比奖励，打得越多占比越高。不判断等级，
+  //   每轮连续打（连 boss 没升级也打），叠加水位会拦住连续打，故 rank 阶段不走等级门。
+  const phase = Number.isFinite(bossLv) && bossLv >= RANK_PHASE_LEVEL ? "rank" : "kill";
   const latestLv = Math.max(chainLv, Number(handledLevel) || 0);
-  if (!Number.isFinite(bossLv) || bossLv <= latestLv) return {
-    ok: false, reason: `boss 未升级（boss.level=${bossLv}, 链上latest=${chainLv}, 本地水位=${handledLevel}），等待`, code: "no_level_up",
-    bossLv, latestLv, chainLv };
+  if (phase === "kill" && (!Number.isFinite(bossLv) || bossLv <= latestLv)) return {
+    ok: false, reason: `击杀奖励阶段 boss 未升级（boss.level=${bossLv}, 链上latest=${chainLv}, 本地水位=${handledLevel}），等待`, code: "no_level_up",
+    bossLv, latestLv, chainLv, phase };
 
-  // 门票策略：默认免费票优先；--ncg-only 时忽略免费票只用 NCG（用户自己打免费票）
+  // 门票策略：默认免费票优先；--ncg-only 时忽略免费票只用 NCG（漏洞模式 p=true 不扣票/NCG）。
+  // 票价护栏保留作安全网（读不到表/票价异常 → 不买票），但【不再有"买满40停止"】：
+  // 漏洞模式根本不消耗 NCG，买满无意义；rank 阶段更需要持续打，不能因 purchaseCount 停。
   const remain = Number(raider.remainChallengeCount || 0);
   const purchased = Number(raider.purchaseCount || 0);
   let payNcg, ticketMode;
@@ -628,13 +641,14 @@ function decide({ raidId, row, raider, boss, tip, season = SEASON, handledLevel 
     payNcg = false; ticketMode = "free";
   } else {
     if (!ticketSafe(row)) return {
-      ok: false, reason: `免费票用尽但票价护栏未通过（ticket_price=${row?.ticketPrice}, additional=${row?.additionalPrice}, max=${row?.maxPurchase}），不买票`, code: "ticket_unsafe" };
-    if (purchased >= Number(row.maxPurchase)) return {
-      ok: false, reason: `已达买票上限（purchaseCount=${purchased} ≥ ${row.maxPurchase}），停止`, code: "purchase_cap" };
+      ok: false, reason: `票价护栏未通过（ticket_price=${row?.ticketPrice}, additional=${row?.additionalPrice}, max=${row?.maxPurchase}），不买票`, code: "ticket_unsafe", phase };
     payNcg = true; ticketMode = "ncg";
   }
   return {
-    ok: true, reason: `命中：boss ${latestLv}→${bossLv} 升级，${ticketMode}票`, code: "hit",
+    ok: true, phase, code: "hit",
+    reason: phase === "rank"
+      ? `命中：伤害占比阶段 boss ${bossLv}≥${RANK_PHASE_LEVEL}，连续打（不看等级），${ticketMode}票`
+      : `命中：击杀奖励阶段 boss ${latestLv}→${bossLv} 升级，${ticketMode}票`,
     bossLv, latestLv, remain, purchased, payNcg, ticketMode,
   };
 }
@@ -804,13 +818,15 @@ async function main() {
 
   if (WATCH) {
     const started = Date.now();
-    log({ level: "info", msg: "进入 WB 扫货链蹲守（进程内高频轮询 boss 等级，一升级就打，打完继续蹲不退出）",
-          season: SEASON > 0 ? SEASON : "follow", gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000) });
+    log({ level: "info", msg: "进入 WB 两阶段蹲守（kill: boss<300 盯升级打；rank: boss≥300 连续打不看等级）",
+          season: SEASON > 0 ? SEASON : "follow", gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000),
+          rankPhaseLevel: RANK_PHASE_LEVEL });
     let rounds = 0;
-    let handledLevel = 0;             // 本地水位：本 job 已提交过的最高 boss 等级，防链上状态滞后重复打同一级
+    let handledLevel = 0;             // 本地水位：kill 阶段已提交过的最高 boss 等级，防链上状态滞后重复打同一级
     let activeRaidId = null;          // 赛季切换后水位必须归零（新赛季 boss 从 1 级起，否则被旧水位永久卡住）
     let lastAttemptLevel = null;      // 上一轮尝试的 boss 等级 + 赛季，用于统计同一级连续失败
     let consecutiveFails = 0;
+    let announcedPhase = null;        // 阶段切换只播报一次（kill→rank）
     while (Date.now() - started < MAX_WATCH_MS) {
       rounds++; out.round = rounds;
       // 每轮重置易变字段，避免上一轮残留污染本轮判定。
@@ -827,6 +843,15 @@ async function main() {
         }
 
         const bossNow = Number(out.status?.bossLevel || 0);
+        const phase = out.decision?.phase || (Number.isFinite(bossNow) && bossNow >= RANK_PHASE_LEVEL ? "rank" : "kill");
+        out.phase = phase;
+        if (announcedPhase !== phase) {
+          log({ level: "info", msg: phase === "rank"
+                ? `进入伤害占比阶段（boss ${bossNow}≥${RANK_PHASE_LEVEL}）：不再判断等级，连续打`
+                : `击杀奖励阶段（boss ${bossNow}<${RANK_PHASE_LEVEL}）：盯 boss 升级逐級打`,
+                bossLevel: bossNow, phase });
+          announcedPhase = phase;
+        }
         const stop = watchStopCode(out.result);
         if (stop) {
           out.handoff = "none"; out.stopReason = stop;
@@ -834,13 +859,14 @@ async function main() {
           break;
         }
 
-        // 战斗 SUCCESS：把该等级写入本地水位，下一轮只追更高的 boss 等级。
-        // 这样即使链上 latestBossLevel 尚未同步，也不会重复提交同一级、更不会空窗等 5 分钟。
+        // 战斗 SUCCESS：kill 阶段把该等级写入本地水位，下一轮只追更高的 boss 等级；
+        // rank 阶段不靠水位（decide 在 rank 阶段不看等级），连续打、每轮都提交。
         if (out.result === "战斗提交成功（SUCCESS）") {
-          if (Number.isFinite(bossNow) && bossNow > handledLevel) handledLevel = bossNow;
+          if (phase === "kill" && Number.isFinite(bossNow) && bossNow > handledLevel) handledLevel = bossNow;
           out.handledLevel = handledLevel;
           lastAttemptLevel = `${raidNow}:${bossNow}`; consecutiveFails = 0;
-          log({ level: "info", msg: "战斗成功，继续蹲守下一级（扫货链不退出）", bossLevel: bossNow, handledLevel });
+          log({ level: "info", msg: phase === "rank" ? "伤害占比阶段连续攻击成功，继续打（不看等级）" : "击杀奖励阶段战斗成功，继续蹲守下一级",
+                phase, bossLevel: bossNow, handledLevel });
         } else if (out.result && (out.result.startsWith("交易未成功") || out.result.startsWith("首战未达S级"))) {
           // 同一级连续失败计数，达到上限后抬水位跳过该级，避免无限重刷失败交易。
           const key = `${raidNow}:${bossNow}`;
@@ -911,13 +937,35 @@ function selfTest() {
   const dNcg = decide({ ...base, raidId: 37, row, raider: raider({ remainChallengeCount: 0, purchaseCount: 3 }), boss: boss({ level: 6 }) });
   ok("免票用尽买票payNcg=true", dNcg.ok === true && dNcg.payNcg === true && dNcg.ticketMode === "ncg");
   const dCap = decide({ ...base, raidId: 37, row, raider: raider({ remainChallengeCount: 0, purchaseCount: 40 }), boss: boss({ level: 6 }) });
-  ok("买满40停止", dCap.ok === false && dCap.code === "purchase_cap");
+  ok("买满40不再停止(漏洞不扣NCG)", dCap.ok === true && dCap.payNcg === true && dCap.code === "hit");
   const dUnsafe = decide({ ...base, raidId: 37, row: { ...row, additionalPrice: 1 }, raider: raider({ remainChallengeCount: 0 }), boss: boss({ level: 6 }) });
   ok("票价不安全不买票", dUnsafe.ok === false && dUnsafe.code === "ticket_unsafe");
   const dEnd = decide({ ...base, tip: BigInt(row.end), raidId: 37, row, raider: raider(), boss: boss({ level: 6 }) });
   ok("赛季末停止", dEnd.ok === false && dEnd.code === "season_end");
   const dMulti = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 3 }), boss: boss({ level: 7 }) });
   ok("boss多级也命中", dMulti.ok === true && dMulti.bossLv === 7 && dMulti.latestLv === 3);
+
+  // ── 两阶段（RANK_PHASE_LEVEL=300）──
+  ok("分界常量=300", RANK_PHASE_LEVEL === 300);
+  // kill 阶段：boss<300 必须升级才打，未升级 waiting。
+  const dKill = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 299 }), boss: boss({ level: 299 }) });
+  ok("kill阶段-未升级不打", dKill.ok === false && dKill.code === "no_level_up" && dKill.phase === "kill");
+  const dKillUp = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 298 }), boss: boss({ level: 299 }) });
+  ok("kill阶段-升级命中", dKillUp.ok === true && dKillUp.phase === "kill" && dKillUp.bossLv === 299);
+  // rank 阶段：boss>=300 不看等级——即使 latestBossLevel==boss.level（未升级）也连续打。
+  const dRankSame = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 300 }), boss: boss({ level: 300 }) });
+  ok("rank阶段-未升级也连续打", dRankSame.ok === true && dRankSame.phase === "rank" && dRankSame.code === "hit");
+  const dRankHigh = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 305 }), boss: boss({ level: 300 }) });
+  ok("rank阶段-等级反超也打", dRankHigh.ok === true && dRankHigh.phase === "rank");
+  // rank 阶段本地水位不参与：handledLevel 高于 boss 仍连续打。
+  const dRankHandled = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 300 }), boss: boss({ level: 300 }), handledLevel: 300 });
+  ok("rank阶段-水位不拦连续打", dRankHandled.ok === true && dRankHandled.phase === "rank");
+  // rank 阶段买满 40 也照打（买满停止已删）。
+  const dRankCap = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 300, remainChallengeCount: 0, purchaseCount: 40 }), boss: boss({ level: 300 }) });
+  ok("rank阶段-买满40照打", dRankCap.ok === true && dRankCap.phase === "rank");
+  // rank 阶段票价护栏仍是安全网。
+  const dRankUnsafe = decide({ ...base, raidId: 37, row: { ...row, additionalPrice: 1 }, raider: raider({ latestBossLevel: 300, remainChallengeCount: 0 }), boss: boss({ level: 300 }) });
+  ok("rank阶段-票价异常不买票", dRankUnsafe.ok === false && dRankUnsafe.code === "ticket_unsafe");
 
   // ── 扫货链（2026-11-22）：本地水位防重复打同一级 ──
   const dHandled = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 5 }), boss: boss({ level: 6 }), handledLevel: 6 });
@@ -934,7 +982,7 @@ function selfTest() {
   ok("watch-未升级继续", watchStopCode("skip:no_level_up") === null);
   ok("watch-票价护栏继续", watchStopCode("skip:ticket_unsafe") === null);
   ok("watch-状态未初始化继续", watchStopCode("skip:uninit") === null);
-  ok("watch-买满硬停", watchStopCode("skip:purchase_cap") === "season_stop");
+  ok("watch-买满40不再硬停", watchStopCode("skip:purchase_cap") === null);
   ok("watch-赛季末硬停", watchStopCode("skip:season_end") === "season_stop");
   ok("watch-赛季空档硬停", watchStopCode("skip:gap") === "season_stop");
   ok("watch-死锁硬停", watchStopCode("skip:reward_deadlock（...）") === "season_stop");
