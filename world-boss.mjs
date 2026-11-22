@@ -289,6 +289,22 @@ async function getWorldBossState(bossAddress) {
   const d = await gqlRpc(q, { b: bossAddress });
   return d.data?.stateQuery?.worldBossState || null;
 }
+// 读取击杀等级奖励记录：[{ level, claimed }]。地址 = avatar.Derive(`reward_info_${raidId}`)。
+async function getKillRewardRecord(raidId) {
+  const killAddr = derive(AVATAR, `reward_info_${raidId}`);
+  const q = "query($a:Address!){ stateQuery { worldBossKillRewardRecord(worldBossKillRewardRecordAddress:$a){ map { bossLevel claimed } } } }";
+  const d = await gqlRpc(q, { a: killAddr });
+  const map = d.data?.stateQuery?.worldBossKillRewardRecord?.map || [];
+  return map.map(x => ({ level: Number(x.bossLevel), claimed: !!x.claimed }))
+           .filter(x => Number.isFinite(x.level));
+}
+// 判断当前是否有「可领」的击杀等级奖励：
+// Lib9c IsClaimable(boss.level) 要求存在 key < boss.level 且 claimed=false 的记录。
+// 刚打完当级（只记录当级）时领不了，必须等 boss 再升一级——故领取天然滞后一级。
+function claimableLevels(record, bossLevel) {
+  const b = Number(bossLevel || 0);
+  return record.filter(x => !x.claimed && x.level < b).map(x => x.level);
+}
 // 已链上核实的赛季表快照（cachedSheet(WorldBossListSheet) 实测读取，2026-11-20）。
 // 仅作「价格护栏」兜底：当实时表因节点抽风读不到时，若目标 raidId 在快照内，用快照校验票价。
 // 严格按 raidId 匹配，绝不用其他赛季的值冒充；快照值与护栏常量一致才采信。
@@ -519,10 +535,15 @@ function buildRaidAction(loadout, payNcg) {
 }
 
 // 构造击杀等级奖励领取 action：ClaimWordBossKillReward。
-// 源码 PlainValueInternal = { ["a"] = AvatarAddress.Serialize() }，无其他字段。
+// 主网实跑版本（旧 Lib9c）的 GameAction PlainValue 里带 id 字段：
+// 链上历史 claim_world_boss_kill_reward 的 values = { a: <20B地址>, id: <16B> }。
+// 2026-11-22 事故：只带 a 时 actionLoader.LoadAction 反序列化抛异常 →
+// BlockPolicySource.IsObsolete catch 后判 obsolete → staging 报 "Transaction is obsolete"，
+// 从不上链。必须带随机 id（与 raid7 同构）才能被节点加载。
 function buildClaimAction() {
   const values = new BencodexDictionary([
     ["a", Buffer.from(Address.fromHex(AVATAR).toBytes())],
+    ["id", randomBytes(16)],
   ]);
   return new BencodexDictionary([
     ["type_id", CLAIM_TYPE_ID],
@@ -627,6 +648,10 @@ async function runOnce(ctx, out) {
     remainTickets: raider?.remainChallengeCount ?? null, purchaseCount: raider?.purchaseCount ?? null,
     ticket: row ? { price: row.ticketPrice, additional: row.additionalPrice, max: row.maxPurchase } : null,
   };
+  // 每轮攻击判定前先领取「滞后一级」的击杀奖励（见 runClaimIfPossible 注释）。
+  // 领取可能占用一个 nonce 并提交一笔交易；随后的攻击 getNonce 在其之后读取，不会冲突。
+  await runClaimIfPossible(ctx, raidId, boss?.level, out);
+
   const d = decide({ raidId, row, raider, boss, tip });
   out.decision = d;
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
@@ -694,34 +719,33 @@ async function runOnce(ctx, out) {
     }
   }
 
-  // ── 自动领取击杀等级奖励（用户 2026-11-22 要求：App 领不了，打完立即自动领）──
-  // 紧跟 raid7 SUCCESS 之后提交 claim_world_boss_kill_reward。nonce 用 raid7 的 +1
-  // （本地递增，绝不重读链上 nextTxNonce——raid7 刚 stage 可能尚未反映，重读会 nonce 冲突）。
-  // 领取失败不影响战斗 SUCCESS 判定，只记录到 out.claim，绝不因领奖失败停手或重打。
-  if (AUTO_CLAIM) {
-    try {
-      const claimAction = buildClaimAction();
-      const claimNonce = nonce + 1n;
-      const claimTxId = await submitTx({ ...ctx, nonce: claimNonce, actionValue: claimAction });
-      out.claim = { submitted: true, txId: claimTxId, nonce: String(claimNonce), typeId: CLAIM_TYPE_ID };
-      log({ level: "info", msg: "已自动提交击杀奖励领取", txId: claimTxId, nonce: String(claimNonce) });
-      const claimResult = await confirmTxAcrossNodes(claimTxId);
-      out.claim.result = claimResult;
-      log({ level: "info", msg: "领取交易终态", txId: claimTxId, ...claimResult });
-      if (isConfirmedTerminal(claimResult) && claimResult.txStatus === "SUCCESS") {
-        out.claim.ok = true;
-        out.result = "战斗提交成功（SUCCESS，已自动领取奖励）";
-      } else {
-        out.claim.ok = false;
-        out.result = `战斗提交成功（SUCCESS，领取未成功：${claimResult.txStatus}）——战斗已成立，不重打`;
-      }
-    } catch (e) {
-      out.claim = { submitted: false, ok: false, error: e.message };
-      log({ level: "warn", msg: "自动领取异常（不影响战斗 SUCCESS）", detail: e.message });
-      out.result = "战斗提交成功（SUCCESS，领取异常）——战斗已成立，不重打";
-    }
-  } else {
-    out.result = "战斗提交成功（SUCCESS，未领取奖励，--no-auto-claim）";
+  out.result = "战斗提交成功（SUCCESS）";
+}
+
+// ── 自动领取击杀等级奖励（滞后一级领取）──
+// 用户 2026-11-22 要求（App 领不了）。Lib9c 的 IsClaimable(boss.level) 要求存在
+// key < boss.level 的未领记录：刚打完当级（只记录当级）时领不了，必须等 boss 再升一级。
+// 故在每轮【攻击判定之前】先扫描：若有 level < 当前boss等级的未领记录，提交一笔
+// claim_world_boss_kill_reward 一次领掉全部（SetWorldBossKillReward 遍历 !claim）。
+// 领取走独立 getNonce（此时无本轮 raid 在途），与战斗互不占用 nonce。
+async function runClaimIfPossible(ctx, raidId, bossLevel, out) {
+  if (!AUTO_CLAIM || !ctx || raidId == null) return;
+  try {
+    const record = await getKillRewardRecord(raidId);
+    const claimable = claimableLevels(record, bossLevel);
+    if (!claimable.length) { out.claim = { skipped: "no_claimable", bossLevel }; return; }
+    const claimAction = buildClaimAction();
+    const nonce = await getNonce(ctx.signer.toString());
+    const claimTxId = await submitTx({ ...ctx, nonce, actionValue: claimAction });
+    out.claim = { submitted: true, txId: claimTxId, nonce: String(nonce), levels: claimable };
+    log({ level: "info", msg: "自动提交击杀奖励领取", txId: claimTxId, nonce: String(nonce), levels: claimable });
+    const result = await confirmTxAcrossNodes(claimTxId);
+    out.claim.result = result;
+    out.claim.ok = isConfirmedTerminal(result) && result.txStatus === "SUCCESS";
+    log({ level: "info", msg: "领取交易终态", txId: claimTxId, ...result, ok: out.claim.ok });
+  } catch (e) {
+    out.claim = { submitted: false, ok: false, error: e.message };
+    log({ level: "warn", msg: "自动领取异常（不影响战斗）", detail: e.message });
   }
 }
 
@@ -912,10 +936,17 @@ function selfTest() {
   ok("claim type_id 正确", String(claimAction.get("type_id")) === "claim_world_boss_kill_reward");
   const claimVals = claimAction.get("values");
   ok("claim values 是字典", claimVals instanceof BencodexDictionary);
-  ok("claim 只有一个字段 a", [...claimVals.keys()].length === 1 && [...claimVals.keys()][0] === "a");
+  ok("claim values 有 a+id 两字段", [...claimVals.keys()].length === 2 && [...claimVals.keys()].includes("a") && [...claimVals.keys()].includes("id"));
   ok("claim a = 20字节地址", Buffer.from(claimVals.get("a")).length === 20);
+  ok("claim id = 16字节", Buffer.from(claimVals.get("id")).length === 16);
   ok("claim a = avatar 地址字节", Buffer.from(claimVals.get("a")).toString("hex") === Buffer.from(Address.fromHex(AVATAR).toBytes()).toString("hex"));
   ok("自动领取开关默认开启", AUTO_CLAIM === true);
+  // IsClaimable 滞后一级逻辑：只领 level < boss.level 的未领记录
+  const rec = [{level:195,claimed:false},{level:197,claimed:false},{level:198,claimed:true}];
+  ok("claimable 只取低于boss的未领", JSON.stringify(claimableLevels(rec,198)) === JSON.stringify([195,197]));
+  ok("claimable boss=195时无领(195<195不成立)", claimableLevels([{level:195,claimed:false}],195).length === 0);
+  ok("claimable 已领的不重复领", claimableLevels([{level:190,claimed:true}],198).length === 0);
+  ok("claimable 空记录返回空", claimableLevels([],198).length === 0);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
   if (fail > 0) process.exit(1);
