@@ -9,9 +9,14 @@
  *   · 门票：免费票优先（remainChallengeCount>=1 → PayNcg=false），用尽后 NCG 买满 40
  *     （PayNcg=true；买票不扣免费票；上限 MaxPurchaseCount=40）。
  *   · 首次入场水晶：由 raid7 action 服务端自动扣（entranceFee×level² crystal），脚本不额外构造。
- *   · 只打不领：绝不提交 claim_world_boss_reward / claim_world_boss_kill_reward，
- *     击杀奖励记在 WorldBossKillRewardRecord（false=未领），由用户自行领取。
- *   · 启动门控：tip < --arm-block 秒退（workflow 默认 11889334 = 赛季起点 11889221 + 15分钟）。
+ *   · 只打不领（2026-11-22 事故后铁律）：绝不提交任何 claim action——既不手动 claim
+ *     击杀奖励，也不 claim 排名奖励。真相：raid7 战斗结算内部 SetWorldBossKillReward
+ *     已【自动】领掉所有 level<boss.level 的击杀奖励，并留下一条未领"引子"。
+ *     单独 claim 会把引子领光 → rewardRecord 全 claimed=true → 下次 raid7 结算
+ *     IsClaimable(boss.level)=false → 抛 InvalidClaimException → 整笔战斗永久 FAILURE（死锁）。
+ *     本赛季37已因此死锁。故本脚本永远只提交 raid7，一个 claim 都不发。
+ *   · 赛季：默认自动跟随链上当前 raidId（跨赛季无需改代码）；仅显式 --season N 才锁定。
+ *   · 启动门控：tip < --arm-block 秒退（0=关闭门控）。
  *   · 装备（用户 2026-11-21 最终确认方案）：一律取【当前穿戴装备】= Heimdall
  *     avatar.inventory 中 equipped=true 的 6 件常规装备(武器/甲/腰带/项链/戒指×2)，
  *     气场固定取 itemId=10670003 (Barrage Aura, Lv11)，魔典固定取 itemId=10780009
@@ -32,7 +37,7 @@
  *   · cachedSheet(WorldBossListSheet) 校验当前赛季 ticket_price=1、additional=0、max=40 才允许买票；
  *     读不到或不符 → 只打免费票，不买（尊重「不是 1NCG 递增就暂不操作」）。
  *   · GameConfig 校验战斗间隔 worldboss_required_interval。
- *   · 赛季空档 / raidId 读不到 / 非目标赛季 → 跳过，绝不盲打。
+ *   · 赛季空档 / raidId 读不到 → 跳过，绝不盲打；显式锁定赛季时非目标赛季也跳过。
  *   · 私钥 signer 必须等于 avatar 的 agentAddress。
  *   · 交易终态只认 SUCCESS / FAILURE / INVALID，且须带 blockIndex（跨节点复核，杜绝伪 INVALID）。
  *
@@ -79,16 +84,11 @@ const CFG = {
 const MAIN_AVATAR = "0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c";
 const AVATAR = ENV.NC_AVATAR || MAIN_AVATAR;
 const TYPE_ID = "raid7";
-// 击杀等级奖励领取 action（Lib9c ClaimWordBossKillReward，ActionType="claim_world_boss_kill_reward"）。
-// PlainValue 只有一个字段：["a"] = AvatarAddress.Serialize()。一次调用领取 rewardRecord 里
-// 所有 claimed=false 的等级（SetWorldBossKillReward 遍历 !kv.Value）。
-// 校验门槛：IsClaimable(boss.level) 要求存在 key < boss.level 的未领记录——
-// raid7 成功后 boss 等级刚刷新上去，紧接着领天然满足（未领等级必然 < 当前 boss.level）。
-const CLAIM_TYPE_ID = "claim_world_boss_kill_reward";
 // Lib9c Addresses.GetWorldBossAddress 派生用的常量地址（0x...15）
 const RAID_CONST = "0x0000000000000000000000000000000000000015";
-// 主网第37期：start=11889221, end=12040420, fee=1, ticket=1, add=0, max=40
-const SEASON_DEFAULT = 37;
+// 赛季跟随：默认 0 = 自动跟随链上当前 raidId（2026-11-23 起，跨赛季无需改代码）。
+// 仅当显式传 --season N（N>0）时才锁定到指定赛季（应急/调试用）。
+const SEASON_DEFAULT = 0;
 const TICKET_PRICE_EXPECT = 1;
 const ADDITIONAL_PRICE_EXPECT = 0;
 const MAX_PURCHASE_EXPECT = 40;
@@ -125,20 +125,16 @@ const BUILD_TEST = args.includes("--build-test");
 // 首战 S 级通关校验开关（默认开启）。已无"装备基线拦截"，此项只控制首战 S 级实战裁决；
 // --no-loadout-guard 可跳过首战 S 级校验（一般不需要，保留作应急）。
 const LOADOUT_GUARD = !args.includes("--no-loadout-guard");
-// 自动领取击杀等级奖励：默认【关闭】——2026-11-22 事故后纠正。
-// 真相：raid7 结算时 SetWorldBossKillReward 会自动领掉所有 level<boss.level 的未领记录，
-// 并 add 当前等级 false 作为下一轮的"引子"。IsClaimable(boss.level) 要求存在
-// key<boss.level 且 claimed=false 的记录，否则抛 InvalidClaimException 让【整笔战斗 FAILURE】。
-// 单独用 claim_world_boss_kill_reward 把引子领光 → rewardRecord 全 claimed=true → raid7 永久 FAILURE（死锁）。
-// 因此绝不能主动 claim 击杀奖励；仅保留 --auto-claim 显式开启作应急（赛季末不再打时才可用）。
-const AUTO_CLAIM = args.includes("--auto-claim");
+// 2026-11-22 事故后：自动领取代码已【彻底删除】，脚本永不提交任何 claim action。
+// 击杀奖励由 raid7 战斗结算内部自动领取；单独 claim 会领光引子导致永久死锁（详见文件头）。
 const numArg = (flag, def) => {
   const i = args.indexOf(flag);
   if (i < 0) return def;
   const n = Number(args[i + 1]);
   return Number.isFinite(n) ? n : def;
 };
-const SEASON = Math.max(1, Math.trunc(numArg("--season", SEASON_DEFAULT)));
+// SEASON=0 表示跟随链上 raidId；>0 表示显式锁定该赛季。
+const SEASON = Math.max(0, Math.trunc(numArg("--season", SEASON_DEFAULT)));
 // 启动门控：tip 到达 ARM_BLOCK 才真正开始打（用户要求约 11889221 之后）。ARM_BLOCK=0 关闭。
 const ARM_BLOCK = Math.max(0, Math.trunc(numArg("--arm-block", 0)));
 // 轮询间隔：按 boss 等级判定，等级由全球玩家推动，无需毫秒级抢；默认 60s。
@@ -538,23 +534,6 @@ function buildRaidAction(loadout, payNcg) {
   ]);
 }
 
-// 构造击杀等级奖励领取 action：ClaimWordBossKillReward。
-// 主网实跑版本（旧 Lib9c）的 GameAction PlainValue 里带 id 字段：
-// 链上历史 claim_world_boss_kill_reward 的 values = { a: <20B地址>, id: <16B> }。
-// 2026-11-22 事故：只带 a 时 actionLoader.LoadAction 反序列化抛异常 →
-// BlockPolicySource.IsObsolete catch 后判 obsolete → staging 报 "Transaction is obsolete"，
-// 从不上链。必须带随机 id（与 raid7 同构）才能被节点加载。
-function buildClaimAction() {
-  const values = new BencodexDictionary([
-    ["a", Buffer.from(Address.fromHex(AVATAR).toBytes())],
-    ["id", randomBytes(16)],
-  ]);
-  return new BencodexDictionary([
-    ["type_id", CLAIM_TYPE_ID],
-    ["values", values],
-  ]);
-}
-
 // ---------------- 交易提交与确认 ----------------
 async function getNonce(signerStr) {
   const d = await gqlRpc("query($a:Address!){ transaction { nextTxNonce(address:$a) } }", { a: signerStr });
@@ -598,10 +577,11 @@ async function confirmTxAcrossNodes(txId, tries = CFG.confirmTries) {
 }
 
 // ---------------- 判定：本轮是否打、用什么票 ----------------
-function decide({ raidId, row, raider, boss, tip }) {
+function decide({ raidId, row, raider, boss, tip, season = SEASON }) {
   if (raidId == null) return { ok: false, reason: "赛季空档期（raidId 读不到），跳过", code: "gap" };
-  if (raidId !== SEASON) return {
-    ok: false, reason: `当前 raidId=${raidId} ≠ 目标赛季 ${SEASON}，跳过`, code: "season_mismatch", raidId };
+  // season=0 → 自动跟随链上当前 raidId（不校验赛季号）；>0 → 仅打显式锁定的赛季。
+  if (season > 0 && raidId !== season) return {
+    ok: false, reason: `当前 raidId=${raidId} ≠ 锁定赛季 ${season}，跳过`, code: "season_mismatch", raidId };
   if (!raider || !boss) return {
     ok: false, reason: `链上状态未初始化（raider=${!!raider}, boss=${!!boss}），赛季刚开始稍候`, code: "uninit" };
   if (row && row.end && tip >= BigInt(row.end - END_BUFFER)) return {
@@ -652,13 +632,9 @@ async function runOnce(ctx, out) {
     remainTickets: raider?.remainChallengeCount ?? null, purchaseCount: raider?.purchaseCount ?? null,
     ticket: row ? { price: row.ticketPrice, additional: row.additionalPrice, max: row.maxPurchase } : null,
   };
-  // 每轮攻击判定前先领取「滞后一级」的击杀奖励（见 runClaimIfPossible 注释）。
-  // 领取可能占用一个 nonce 并提交一笔交易；随后的攻击 getNonce 在其之后读取，不会冲突。
-  await runClaimIfPossible(ctx, raidId, boss?.level, out);
-
   const d = decide({ raidId, row, raider, boss, tip });
   out.decision = d;
-  log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
+  log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON > 0 ? SEASON : "follow:" + raidId, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
 
   // ── 死锁保护（2026-11-22 事故）──
@@ -743,33 +719,6 @@ async function runOnce(ctx, out) {
   out.result = "战斗提交成功（SUCCESS）";
 }
 
-// ── 自动领取击杀等级奖励（滞后一级领取）──
-// 用户 2026-11-22 要求（App 领不了）。Lib9c 的 IsClaimable(boss.level) 要求存在
-// key < boss.level 的未领记录：刚打完当级（只记录当级）时领不了，必须等 boss 再升一级。
-// 故在每轮【攻击判定之前】先扫描：若有 level < 当前boss等级的未领记录，提交一笔
-// claim_world_boss_kill_reward 一次领掉全部（SetWorldBossKillReward 遍历 !claim）。
-// 领取走独立 getNonce（此时无本轮 raid 在途），与战斗互不占用 nonce。
-async function runClaimIfPossible(ctx, raidId, bossLevel, out) {
-  if (!AUTO_CLAIM || !ctx || raidId == null) return;
-  try {
-    const record = await getKillRewardRecord(raidId);
-    const claimable = claimableLevels(record, bossLevel);
-    if (!claimable.length) { out.claim = { skipped: "no_claimable", bossLevel }; return; }
-    const claimAction = buildClaimAction();
-    const nonce = await getNonce(ctx.signer.toString());
-    const claimTxId = await submitTx({ ...ctx, nonce, actionValue: claimAction });
-    out.claim = { submitted: true, txId: claimTxId, nonce: String(nonce), levels: claimable };
-    log({ level: "info", msg: "自动提交击杀奖励领取", txId: claimTxId, nonce: String(nonce), levels: claimable });
-    const result = await confirmTxAcrossNodes(claimTxId);
-    out.claim.result = result;
-    out.claim.ok = isConfirmedTerminal(result) && result.txStatus === "SUCCESS";
-    log({ level: "info", msg: "领取交易终态", txId: claimTxId, ...result, ok: out.claim.ok });
-  } catch (e) {
-    out.claim = { submitted: false, ok: false, error: e.message };
-    log({ level: "warn", msg: "自动领取异常（不影响战斗）", detail: e.message });
-  }
-}
-
 async function makeCtx() {
   if (!CFG.privateKey) return null;
   const hex = CFG.privateKey.trim().replace(/^0x/i, "");
@@ -829,7 +778,7 @@ async function main() {
 
   if (WATCH) {
     const started = Date.now();
-    log({ level: "info", msg: "进入 WB 蹲守（进程内轮询，按 boss 等级判定）", season: SEASON, gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000) });
+    log({ level: "info", msg: "进入 WB 蹲守（进程内轮询，按 boss 等级判定）", season: SEASON > 0 ? SEASON : "follow", gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000) });
     let rounds = 0;
     while (Date.now() - started < MAX_WATCH_MS) {
       rounds++; out.round = rounds;
@@ -882,7 +831,12 @@ function selfTest() {
   ok("票价护栏 无表拒绝", ticketSafe(null) === false);
 
   ok("赛季空档跳过", decide({ ...base, raidId: null, row, raider: raider(), boss: boss() }).code === "gap");
-  ok("赛季号不符跳过", decide({ ...base, raidId: 36, row, raider: raider(), boss: boss() }).code === "season_mismatch");
+  // 默认跟随（season=0）：任意 raidId 都不因赛季号被跳过；下赛季无需改代码即可续打。
+  ok("跟随模式-任意赛季都打", decide({ ...base, raidId: 36, season: 0, row, raider: raider(), boss: boss({ level: 6 }) }).ok === true);
+  ok("跟随模式-38赛季也打", decide({ ...base, raidId: 38, season: 0, row, raider: raider(), boss: boss({ level: 6 }) }).ok === true);
+  // 显式锁定（season>0）：非目标赛季跳过。
+  ok("锁定赛季-不符跳过", decide({ ...base, raidId: 36, season: 37, row, raider: raider(), boss: boss() }).code === "season_mismatch");
+  ok("锁定赛季-相符放行", decide({ ...base, raidId: 37, season: 37, row, raider: raider(), boss: boss({ level: 6 }) }).ok === true);
   ok("状态未初始化跳过", decide({ ...base, raidId: 37, row, raider: null, boss: boss() }).code === "uninit");
   const dNoUp = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 5 }), boss: boss({ level: 5 }) });
   ok("boss未升级不打", dNoUp.ok === false && dNoUp.code === "no_level_up");
@@ -952,21 +906,19 @@ function selfTest() {
   ok("值缺失=未通关", judgeFirstBattleClear({ ok:true, value:null }).clear === false);
   ok("读取失败=未通关", judgeFirstBattleClear({ ok:false, reason:"err" }).clear === false);
 
-  // claim_world_boss_kill_reward 构造校验（自动领取）
-  const claimAction = buildClaimAction();
-  ok("claim type_id 正确", String(claimAction.get("type_id")) === "claim_world_boss_kill_reward");
-  const claimVals = claimAction.get("values");
-  ok("claim values 是字典", claimVals instanceof BencodexDictionary);
-  ok("claim values 有 a+id 两字段", [...claimVals.keys()].length === 2 && [...claimVals.keys()].includes("a") && [...claimVals.keys()].includes("id"));
-  ok("claim a = 20字节地址", Buffer.from(claimVals.get("a")).length === 20);
-  ok("claim id = 16字节", Buffer.from(claimVals.get("id")).length === 16);
-  ok("claim a = avatar 地址字节", Buffer.from(claimVals.get("a")).toString("hex") === Buffer.from(Address.fromHex(AVATAR).toBytes()).toString("hex"));
-  ok("自动领取开关默认关闭（事故后纠正）", AUTO_CLAIM === false);
-  // IsClaimable 滞后一级逻辑：只领 level < boss.level 的未领记录
+  // 2026-11-22 事故后铁律：脚本内不得再有任何 claim action 构造函数/开关。
+  // 若未来有人重新引入自动领取，这两条静态断言会立刻失败，防止死锁重演。
+  const src = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+  // 用拼接构造被检索词，避免断言字符串本身被当成"残留"自我匹配。
+  const forbidden = ["build" + "ClaimAction", "AUTO" + "_CLAIM", "claim_" + "world_boss_kill_reward"];
+  ok("无自动领取函数/开关残留", forbidden.every(w => !src.includes(w)));
+  ok("TYPE_ID 常量就是 raid7", TYPE_ID === "raid7");
+  ok("默认跟随赛季 SEASON=0", SEASON === 0);
+  // 死锁检测仍依赖 IsClaimable 逻辑：只认 level < boss.level 的未领记录当"引子"。
   const rec = [{level:195,claimed:false},{level:197,claimed:false},{level:198,claimed:true}];
   ok("claimable 只取低于boss的未领", JSON.stringify(claimableLevels(rec,198)) === JSON.stringify([195,197]));
-  ok("claimable boss=195时无领(195<195不成立)", claimableLevels([{level:195,claimed:false}],195).length === 0);
-  ok("claimable 已领的不重复领", claimableLevels([{level:190,claimed:true}],198).length === 0);
+  ok("claimable boss=195时无引子(195<195不成立)", claimableLevels([{level:195,claimed:false}],195).length === 0);
+  ok("claimable 已领的不算引子", claimableLevels([{level:190,claimed:true}],198).length === 0);
   ok("claimable 空记录返回空", claimableLevels([],198).length === 0);
 
   console.log(JSON.stringify({ selfTest: { pass, fail, ok: fail === 0 } }));
