@@ -43,7 +43,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { RawPrivateKey, Address } from "@planetarium/account";
 import { signTx, encodeSignedTx } from "@planetarium/tx";
 import { encode, decode, BencodexDictionary } from "@planetarium/bencodex";
@@ -171,12 +171,15 @@ function isConfirmedTerminal(r) {
   return r.blockIndex != null && r.blockIndex !== "";
 }
 
-// Lib9c Address.Derive(string): SHA256(addressBytes + utf8(s))，取末 20 字节
+// Lib9c Nekoyume.Action.AddressExtension.Derive(address, string):
+//   HMACSHA1(key=utf8(s), data=addressBytes) -> new Address(20 bytes)。
+// 2026-11-22 关键修复：旧实现误用 SHA256(addr+string)，派生出的 boss/raider 地址
+// 全部错误 → 链上状态读 null → 被误判为「赛季空档期 skip:gap」，整个赛季一次没打。
+// 现按 Lib9c 源码改为 HMACSHA1（key 是字符串，data 是地址字节）。
 function derive(addrHex, s) {
   const a = Address.fromHex(addrHex).toBytes();
-  const sb = Buffer.from(s, "utf8");
-  const h = createHash("sha256").update(Buffer.concat([Buffer.from(a), sb])).digest();
-  return "0x" + h.subarray(h.length - 20).toString("hex");
+  const h = createHmac("sha1", Buffer.from(s, "utf8")).update(a).digest();
+  return "0x" + h.subarray(0, 20).toString("hex");
 }
 // UUID (带/不带连字符) → .NET Guid.ToByteArray()：前 4/2/2 字节小端，后 8 不变
 function uuidToDotnet(hex) {
@@ -197,8 +200,10 @@ async function getTip() {
 // raidId 由区块号决定；赛季空档期会返回错误 → 返回 null
 async function getRaidId(blockIndex) {
   try {
+    // 2026-11-22 修复：blockIndex 必须作为 Long 传入（数字/BigInt），
+    // 旧代码传 String 导致 GraphQL "Unable to convert to Long" 报错 → null → 误判赛季空档。
     const d = await gql(CFG.statusRpc,
-      "query($b:Long!){ stateQuery { raidId(blockIndex:$b) } }", { b: String(blockIndex) });
+      "query($b:Long!){ stateQuery { raidId(blockIndex:$b) } }", { b: Number(blockIndex) });
     if (d.errors) return null;
     const v = d.data?.stateQuery?.raidId;
     return v == null ? null : Number(v);
@@ -211,8 +216,10 @@ async function getAgentAddress(avatar) {
 async function getRaiderState(raiderAddress) {
   // 注意：highScore/totalScore 是 32 位 Int，S 级得分(187亿)会溢出导致整个查询失败。
   // 日常逻辑只用小值字段；highScore 由 readHighScore() 单独带溢出感知地读取。
+  // 2026-11-22 修复：cp 字段是 BigInteger，Heimdall GraphQL 暴露时 OVERFLOW 会
+  // 让整条查询失败（连 latestBossLevel 都读不到）。日常判定不需要 cp，去掉它。
   const q = `query($r:Address!){ stateQuery { raiderState(raiderAddress:$r){
-    latestBossLevel remainChallengeCount purchaseCount totalChallengeCount level cp
+    latestBossLevel remainChallengeCount purchaseCount totalChallengeCount level
     refillBlockIndex claimedBlockIndex avatarAddress avatarName
   } } }`;
   const d = await gqlRpc(q, { r: raiderAddress });
@@ -266,8 +273,9 @@ async function readHighScore(raiderAddress, avatarAddress = AVATAR) {
   return { ok: false, reason: "无法读取精确64位得分（Mimir Long不可用 + Heimdall Int溢出/缺失）", overflow: true, errs };
 }
 async function getWorldBossState(bossAddress) {
+  // 2026-11-22 修复：WorldBossStateType 无 totalDamage 字段，带上它会让整条查询失败 → null。
   const q = `query($b:Address!){ stateQuery { worldBossState(bossAddress:$b){
-    id level currentHp startedBlockIndex endedBlockIndex totalDamage
+    id level currentHp startedBlockIndex endedBlockIndex
   } } }`;
   const d = await gqlRpc(q, { b: bossAddress });
   return d.data?.stateQuery?.worldBossState || null;
@@ -384,6 +392,43 @@ function decodeTemplate() {
   const runeSlotInfos = [...values.get("r")].map(x => [Number(x[0]), Number(x[1])]);
   return { runeSlotInfos };
 }
+
+// 2026-11-22 用户要求：既然本季已手动打过第一次（装备/时装/符文已被链上验证），
+// 后续买票攻击【直接复用那笔 SUCCESS raid7 交易里的 c/e/r/f】，不再现场构造：
+//   · 100% 与"身上的装备"一致，杜绝装备/气场/魔典/符文现场拼装出错；
+//   · 每笔只改 p（是否 NCG 买票）与 id（16 随机字节），其余字节级沿用，链上校验必过。
+// 从 Mimir 取本角色最近一笔 SUCCESS 的 raid7 原始交易做模板（与 sweep-boss 同款做法）。
+const USE_SUCCESS_TEMPLATE = !args.includes("--no-success-template");
+// 2026-11-22：用户本季免费票（2 张）自己打，自动化这边只负责 NCG 买票部分。
+// --ncg-only 强制忽略剩余免费票，直接走 NCG 买票分支，避免与用户手动操作抢免费票/重复提交。
+const NCG_ONLY = args.includes("--ncg-only");
+async function resolveLoadoutFromMimir() {
+  const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:60){
+    items { blockIndex object { txStatus actions { typeId raw } } } } }`;
+  const d = await gql(CFG.mimir, q, { a: AVATAR });
+  if (d.errors?.length) throw new Error("Mimir 交易查询失败: " + d.errors[0].message.slice(0, 120));
+  const items = d.data?.transactions?.items || [];
+  for (const it of items) {
+    if (it.object?.txStatus !== "SUCCESS") continue;
+    const ac = (it.object?.actions || []).find(x => x.typeId === TYPE_ID && x.raw);
+    if (!ac) continue;
+    let action;
+    try { action = decode(Buffer.from(ac.raw, "hex")); } catch (_) { continue; }
+    if (!(action instanceof BencodexDictionary)) continue;
+    const v = action.get("values");
+    if (!(v instanceof BencodexDictionary)) continue;
+    const mine = Buffer.from(Address.fromHex(AVATAR).toBytes());
+    const a = v.get("a");
+    if (!Buffer.isBuffer(a) || !a.equals(mine)) continue;   // 必须是本角色
+    const e = [...v.get("e")], c = [...v.get("c")], r = [...v.get("r")];
+    const f = v.get("f") != null ? [...v.get("f")] : [];
+    if (e.length < 1 || c.length < 1 || r.length < 1) continue;
+    log({ level: "info", msg: "装备模板=复用本角色最近一笔 SUCCESS raid7（身上装备，未现场构造）",
+          block: Number(it.blockIndex), equipments: e.length, costumes: c.length, runeSlots: r.length });
+    return { equipmentIds: e, costumeIds: c, runeSlotInfos: r.map(x => [Number(x[0]), Number(x[1])]), foodIds: f };
+  }
+  throw new Error("未找到本角色 SUCCESS raid7 交易作装备模板，拒绝用错装备浪费票");
+}
 // 气场 / 魔典在背包里没有 equipped 标记，按 itemId 取最高等级实例（用户 2026-11-21 确认）。
 const AURA_ITEM_ID = 10670003;      // Barrage Aura (grade7, 用户已升到 Lv11)
 const GRIMOIRE_ITEM_ID = 10780009; // SPD Gri(S) (grade8, Lv4) —— 用户明确选 grade8 这件
@@ -450,10 +495,13 @@ function buildRaidAction(loadout, payNcg) {
     ["a", Buffer.from(Address.fromHex(AVATAR).toBytes())],
     ["c", loadout.costumeIds],
     ["e", loadout.equipmentIds],
-    ["f", []],
+    ["f", loadout.foodIds || []],
     ["id", randomBytes(16)],
     ["p", !!payNcg],
-    ["r", loadout.runeSlotInfos.map(([s, rid]) => [s, rid])],
+    // 2026-11-22 修复：Bencodex 不接受 JS number（浮点），而 Lib9c RuneSlotInfo 用
+    // ToInteger() 读值——String（如 u5:0/u5:10047）与 Integer 都能读。原 SUCCESS 模板
+    // 里 slot/runeId 是 String，故统一输出 String，做到与该模板字节级一致、链上校验必过。
+    ["r", loadout.runeSlotInfos.map(([s, rid]) => [String(s), String(rid)])],
   ]);
   return new BencodexDictionary([
     ["type_id", TYPE_ID],
@@ -520,11 +568,11 @@ function decide({ raidId, row, raider, boss, tip }) {
     ok: false, reason: `boss 未升级（boss.level=${bossLv}, latestBossLevel=${latestLv}），等待`, code: "no_level_up",
     bossLv, latestLv };
 
-  // 门票策略：免费票优先；用尽后走 NCG（受 ticketSafe 护栏约束）
+  // 门票策略：默认免费票优先；--ncg-only 时忽略免费票只用 NCG（用户自己打免费票）
   const remain = Number(raider.remainChallengeCount || 0);
   const purchased = Number(raider.purchaseCount || 0);
   let payNcg, ticketMode;
-  if (remain >= 1) {
+  if (remain >= 1 && !NCG_ONLY) {
     payNcg = false; ticketMode = "free";
   } else {
     if (!ticketSafe(row)) return {
@@ -563,11 +611,21 @@ async function runOnce(ctx, out) {
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
 
-  // 装备：一律用当前穿戴装备（inventory equipped + 指定气场/魔典），不做基线拦截（换装属正常）。
+  // 装备来源（2026-11-22 用户确认）：本季已手动打过第一次，直接复用那笔 SUCCESS raid7
+  // 的 c/e/r/f（= 身上的装备），不再现场构造；仅当 Mimir 模板不可用才回退现场构造。
   const isFirstBattle = isFirstBattleOfSeason(raider.latestBossLevel);
-  const loadout = await resolveLoadout();
+  let loadout, buildMode;
+  if (USE_SUCCESS_TEMPLATE) {
+    try {
+      loadout = await resolveLoadoutFromMimir();
+      buildMode = "reuse-last-success-raid7";
+    } catch (e) {
+      log({ level: "warn", msg: "SUCCESS 模板不可用，回退现场构造（当前穿戴装备）", detail: e.message });
+    }
+  }
+  if (!loadout) { loadout = await resolveLoadout(); buildMode = "live-equip+tmpl-rune"; }
   const actionValue = buildRaidAction(loadout, d.payNcg);
-  out.action = { typeId: TYPE_ID, payNcg: d.payNcg, ticketMode: d.ticketMode, build: "live-equip+tmpl-rune",
+  out.action = { typeId: TYPE_ID, payNcg: d.payNcg, ticketMode: d.ticketMode, build: buildMode,
                  isFirstBattle };
   log({ level: "info", msg: "构造 raid7 action 完成", payNcg: d.payNcg, ticketMode: d.ticketMode,
         isFirstBattle });
