@@ -23,13 +23,18 @@
  *
  * AP 满时先 Sweep：链上 daily_reward7 并无「AP 满不能领」检查，AP 满时领取照样
  * SUCCESS，但它只把 AP 补满到 120（ActionPointMax），等于零收益且白耗一个冷却周期。
- * 故提交日常奖励前，若链上 actionPoint 已满，先复用一笔已验证成功的
- * hack_and_slash_sweep10 消耗掉 AP，再领，才能真正拿到 120 AP。巡逻奖励不涉 AP，不触发。
+ * 故提交日常奖励前，若链上 actionPoint 已满，先发一笔 hack_and_slash_sweep10
+ * 消耗掉 AP，再领，才能真正拿到 120 AP。巡逻奖励不涉 AP，不触发。
  *
- * Sweep 失败重试：sweep 提交后若失败 / 超时(PENDING) / 异常，最多再重试 5 次
- * （共 6 笔），每笔换新 action id + 重新取 nonce。每次重试前先复核链上 AP：
- * 已消耗就说明此前某笔其实成功了，立即收手，绝不重复提交。6 次都未确认成功
- * 才降级照常领日常 —— 链上本无 AP 门槛，绝不因可选步骤阻塞领取、错失冷却窗口。
+ * Sweep 现场构造（2026-11-23 重写，替换旧的「套用历史 SUCCESS 模板」）：
+ *  装备/时装每笔都从链上 avatar.inventory 的【当前穿戴】实时读取，绝不套旧模板 ——
+ *  旧模板的装备 GUID 会被换装弄失效，链上报 ItemDoesNotExistException，反复重试
+ *  永远失败（2026-11-22 赛季中就因套旧模板连续失败 30 笔无人知晓）。符文槽因
+ *  GraphQL 读不到装配关系，沿用最近 SUCCESS sweep 模板的槽位并用 runes 列表校验。
+ *  战场只认链上终态：失败后读 transactionResult.exceptionNames 诊断根因，
+ *  装备失效→刷新穿戴装备重试；CP 不足→关卡降 10 级（worldId 重算）重试；
+ *  其余→有限重试。每笔换新 id + nonce，重试前复核链上 AP 防重复提交。
+ *  穷尽修复仍失败则发邮件告警（含异常/关卡/装备差异），且照常领日常（不阻塞冷却）。
  *
  * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
  * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
@@ -43,6 +48,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import net from "node:net";
+import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { RawPrivateKey, Address } from "@planetarium/account";
 import { signTx, encodeSignedTx } from "@planetarium/tx";
@@ -225,26 +232,35 @@ const SWEEP_CONFIRM_TRIES = Math.max(1, Math.min(CFG.confirmTries,
 // 到点无论结果如何都降级照常领日常，绝不因可选步骤拖过领取窗口。
 // 注：每轮 confirmTx 最多 12×5s=60s，实际只在交易迟迟不出终态时才会跑满。
 const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 480)) * 1000;
-// 兜底模板：block 11749808（已 SUCCESS）的 sweep action 原始 Bencodex hex，
-// world9/stage446、actionPoint=120、apStoneCount=0，无入场材料字段。
-// 正常运行时不用它 —— 每轮都从 Mimir 取「本角色最近一笔 SUCCESS 的 sweep」
-// 原始字节，自动跟随装备/符文/关卡变化；仅当 Mimir 拉取失败时回退到这里。
-const FALLBACK_SWEEP_RAW =
-  "6475373a747970655f69647532323a6861636b5f616e645f736c6173685f7377656570" +
-  "313075363a76616c756573647531313a616374696f6e506f696e7475333a3132307531" +
-  "323a617053746f6e65436f756e7475313a307531333a61766174617241646472657373" +
-  "32303aac9d450c69df27ee290c90ec61c4b76154b0a21c75383a636f7374756d65736c" +
-  "31363a3c07374778009e42bfa10a16854b5b3431363a6619635e7b72d3479fda8675f64" +
-  "a366e657531303a65717569706d656e74736c31363a656ba3105d2d53419c2709151d1877" +
-  "c131363a84afc54e6d44d840948afc3089a2479931363acf5f2258713bc94e943078cfa8" +
-  "4e8cbc31363a78cc60679f7f1b49992732ed5b090eb731363a2a9b1888b279d449a88649" +
-  "52c340571431363aa44d5b8d516e95418c834092994f833631363aeba24ec67f4e5c44acf" +
-  "718c40594835b31363a10279dce80a38b4390bbc01ab03ba7146575323a696431363ab4db" +
-  "042fe813b34da2424b51fa230c5075393a72756e65496e666f736c6c75313a3075353a3130" +
-  "303536656c75313a3175353a3130303437656c75313a3375353a3130303531656c75313a" +
-  "3475353a3130303133656c75313a3675353a3330303031656c75313a3775353a31303032" +
-  "31656c75313a3875353a3130303532656c75313a3975353a3130303535656575373a7374" +
-  "616765496475333a34343675373a776f726c64496475313a396565";
+// ---- sweep 现场构造配置（2026-11-23）----
+// 起始扫荡关卡：优先取「本角色最近一笔 SUCCESS sweep」的 stageId/worldId（跟随养成），
+// 拿不到时用这里的默认。CP 不足时逐级下调（见 SWEEP_CP_FALLBACK_STEP）。
+const SWEEP_DEFAULT_STAGE = Math.max(1, Math.trunc(numArg("--sweep-stage", 446)));
+// stage→world：WorldSheet 里每 50 关一个 world（1-50→1, 401-450→9, 451-500→10…）
+function worldOfStage(stage) { return Math.ceil(Number(stage) / 50); }
+// CP 不足时每次下调的关卡数（worldId 由 worldOfStage 重算）。0=不降级，只重试。
+const SWEEP_CP_FALLBACK_STEP = Math.max(0, Math.trunc(numArg("--sweep-cp-fallback-step", 10)));
+// 允许的最低关卡（防止一路降到 stage1 低收益区）；默认 400（world 8 起）。
+const SWEEP_MIN_STAGE = Math.max(1, Math.trunc(numArg("--sweep-min-stage", 400)));
+// 同一 stage 因「非装备/非CP」原因失败的最大重试次数（避免未知异常无限空转）。
+const SWEEP_MAX_SAME_STAGE_RETRY = Math.max(1, Math.trunc(numArg("--sweep-same-stage-retry", 2)));
+
+// ---- 告警邮件配置（凭证只从环境变量/Secrets 读，绝不落盘、不写日志）----
+// 用 Node 原生 tls 实现最小 SMTP 客户端，无第三方依赖。端口默认 465(implicit TLS)；
+// 若用 587(STARTTLS) 设 NC_SMTP_STARTTLS=1。任一必填项缺失则跳过发信、仅记日志。
+const ALERT = {
+  host: ENV.NC_SMTP_HOST || "",
+  port: Math.trunc(Number(ENV.NC_SMTP_PORT || 465)),
+  user: ENV.NC_SMTP_USER || "",
+  pass: ENV.NC_SMTP_PASS || "",
+  to: ENV.NC_SMTP_TO || "",
+  from: ENV.NC_SMTP_FROM || ENV.NC_SMTP_USER || "",
+  starttls: /^(1|true|yes)$/i.test(ENV.NC_SMTP_STARTTLS || ""),
+  enabled: !args.includes("--no-alert"),
+};
+function alertConfigured() {
+  return ALERT.enabled && !!(ALERT.host && ALERT.user && ALERT.pass && ALERT.to);
+}
 
 // ---------------- 工具 ----------------
 async function gql(url, query, variables = {}, timeoutMs = 45000) {
@@ -402,6 +418,35 @@ function sweepDecision({ txStatus, chainAp, attempt, maxAttempts }) {
   return "retry";
 }
 
+// 失败根因诊断（2026-11-23）：把 exceptionNames 映射为具体修复动作，代替过去
+// 「无脑重试同一笔」的死循环。只按链上回执的异常名判断，不臆测。
+//   refresh_loadout — 装备/符文 GUID 失效（换装/分解）→ 重新现场读穿戴装备再打
+//   lower_stage     — CP 不足 → 关卡下调一级（worldId 重算）
+//   retry           — 其它/未知异常 → 同参数有限重试
+//   stop            — 明确不可恢复（如关卡锁/AP 逻辑冲突）→ 停止并告警
+function diagnoseSweepFailure(exceptionNames) {
+  const names = (exceptionNames || []).filter(Boolean).map(String);
+  const joined = names.join("|");
+  // 装备/符文不在背包：换装后旧 GUID 失效，正是 2026-11-22 连败的根因。
+  if (/ItemDoesNotExist|Equipment.*NotFound|Rune.*NotFound|InvalidEquipment|InvalidRune/i.test(joined)) {
+    return { action: "refresh_loadout", reason: "装备/符文 GUID 已失效（可能刚换装）", names };
+  }
+  // CP 不够：降关卡是唯一可靠解（读不到实时 CP，只能靠链上异常反馈逐级试）。
+  if (/NotEnoughCombatPoint|CombatPoint/i.test(joined)) {
+    return { action: "lower_stage", reason: "CP 不足，需降低扫荡关卡", names };
+  }
+  // 关卡/世界不合法：可能 stage 超过了已解锁，降一级通常也能解。
+  if (/InvalidStage|Stage.*Not.*Unlock|InvalidWorld|World.*Not.*Unlock/i.test(joined)) {
+    return { action: "lower_stage", reason: "关卡/世界校验失败", names };
+  }
+  // 入场材料不足（高关需要门票材料）：降关卡到无入场材料区。
+  if (/NotEnoughMaterial|InsufficientMaterial|NotEnoughItem/i.test(joined)) {
+    return { action: "lower_stage", reason: "入场材料不足", names };
+  }
+  if (!names.length) return { action: "retry", reason: "无异常名（超时/PENDING）", names };
+  return { action: "retry", reason: "其它异常", names };
+}
+
 // 重试前复核链上 AP（只认链上权威值）。读不到返回 null —— 不臆测为成功，
 // 让重试/降级兜底，绝不因为一次 RPC 抖动就误判。
 async function readChainApQuiet() {
@@ -411,8 +456,21 @@ async function readChainApQuiet() {
   } catch (_) { return null; }
 }
 
-// 取「本角色最近一笔 SUCCESS 的 sweep」原始 action hex 作模板，自动跟随装备/
-// 符文/关卡变化。Mimir 不可用时回退到内置模板（同样是一笔已成功的交易）。
+// UUID 字符串 → .NET Guid.ToByteArray() 字节序（Lib9c Equipment ItemId 的序列化格式）。
+// 与 world-boss.mjs 的 uuidToDotnet 一致：前 3 段小端、后 2 段大端。
+function uuidToDotnet(u) {
+  const h = String(u).replace(/-/g, "").toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(h)) throw new Error(`装备 GUID 格式非法: ${u}`);
+  return Buffer.from(
+    h.slice(6, 8) + h.slice(4, 6) + h.slice(2, 4) + h.slice(0, 2) +
+    h.slice(10, 12) + h.slice(8, 10) +
+    h.slice(14, 16) + h.slice(12, 14) + h.slice(16), "hex");
+}
+
+// 取「本角色最近一笔 SUCCESS sweep」的符文槽（runeInfos）与起点关卡。
+// GraphQL 只能读到 avatar.runes（拥有哪些符文、等级），读不到「装到哪个槽」，
+// 所以符文槽沿用历史 SUCCESS sweep 的槽位，再用 runes 列表校验每个 runeId 是否仍拥有。
+// 装备/时装绝不从这里取 —— 那是 2026-11-22 连败 30 笔的根因，改为现场读穿戴。
 async function fetchSweepTemplate() {
   const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:40){
     items { blockIndex object { txStatus actions { typeId raw } } } } }`;
@@ -425,113 +483,134 @@ async function fetchSweepTemplate() {
       for (const a of o.actions || []) {
         if (a.typeId === SWEEP_TYPE_ID && a.raw &&
             /^[0-9a-fA-F]+$/.test(a.raw) && a.raw.length % 2 === 0) {
-          return { raw: a.raw, source: `mimir@${it.blockIndex}` };
+          const action = decode(Buffer.from(a.raw, "hex"));
+          const v = action?.get?.("values");
+          if (!(v instanceof BencodexDictionary)) continue;
+          // 归属校验：必须是本角色
+          const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
+          const av = v.get("avatarAddress");
+          if (!Buffer.isBuffer(av) || !av.equals(mine)) continue;
+          const runeSlots = [...v.get("runeInfos")].map(slot => [...slot].map(x => String(x)));
+          const stageId = Number(String(v.get("stageId")));
+          const worldId = Number(String(v.get("worldId")));
+          return { runeSlots, stageId, worldId, source: `mimir@${it.blockIndex}` };
         }
       }
     }
   } catch (e) {
-    log({ level: "warn", msg: "拉取历史 sweep 模板失败", detail: String(e.message) });
+    log({ level: "warn", msg: "拉取历史 sweep 符文槽失败（将用空符文槽现场构造）", detail: String(e.message) });
   }
-  // 内置兜底模板是主角色 bnb 的一笔已成功交易，只对主角色有效。其它角色
-  // 若 Mimir 没返回自己的 SUCCESS sweep，绝不能套用别人的模板（buildSweepAction
-  // 会校验 avatarAddress 并抛错）—— 直接报错让 sweep 降级，领取本身不受影响。
-  if (ACTIVE.address.toLowerCase() === CFG.avatarAddress.toLowerCase()) {
-    return { raw: FALLBACK_SWEEP_RAW, source: "fallback@11749808" };
-  }
-  throw new Error("本角色无可用 sweep 模板：Mimir 未返回历史交易，且内置模板属于主角色");
+  // 找不到 SUCCESS 模板：符文槽用空（Lib9c 允许不装符文），关卡用默认——
+  // 装备仍现场读，所以不会重蹈「套旧装备」覆辙；只是少了符文加成，CP 可能不够触发降级。
+  return { runeSlots: [], stageId: SWEEP_DEFAULT_STAGE,
+           worldId: worldOfStage(SWEEP_DEFAULT_STAGE), source: "default" };
 }
 
-// 复用已验证成功的 sweep action 字节：只强制改写三个字段——
-//   1) GameAction.Id 换成新的 16 字节（每笔必须不同）；
-//   2) actionPoint 覆盖为 SWEEP_AP_TARGET(120)，确保把 AP 全部用掉；
-//   3) apStoneCount 覆盖为 0，确保不消耗背包 AP 药水、playCount 恒为 30。
-// 之所以要锁死 2)3)：模板来源是「本角色最近一笔 SUCCESS sweep」，用户随时可能
-// 手动做一次 80AP 的 sweep、或勾了 AP 药水，那两个值就会被带进模板。
-//   · Lib9c HackAndSlashSweep.cs: playCount = (120/costAp)*apStoneCount + actionPoint/costAp
-//     → apStoneCount=N 会让次数变 30+30N，且 Execute 会 RemoveFungibleItem 真扣药水；
-//     药水不足则 NotEnoughMaterialException → FAILURE → 白丢一轮 sweep 收益。
-// 其余字段（关卡/装备/符文/入场材料声明）一字不改：这样 CP、装备列表等链上校验
-// 与那笔「最近 SUCCESS」交易完全一致，自动跟随角色养成，不冻结旧模板。
-// 覆盖时保持模板原值类型（HackAndSlashSweep10 用 Unicode Text，如 "80"/"0"），
-// 编码类型不变、字段集合不变，字节级零类型风险。
-function buildSweepAction(rawHex) {
-  const action = decode(Buffer.from(rawHex, "hex"));
-  if (!(action instanceof BencodexDictionary) || String(action.get("type_id")) !== SWEEP_TYPE_ID) {
-    throw new Error("sweep 模板 type_id 校验失败");
+// 现场读取当前穿戴装备/时装 + 拥有符文列表（权威链上状态），构造 sweep 的装备字段。
+// 这是本次改造的核心：装备/时装每次都实时读，换装后自动跟上，绝不再套旧模板 GUID。
+async function resolveLiveLoadout() {
+  const q = `query($a:Address!){ stateQuery{ avatar(avatarAddress:$a){
+    inventory{ equipments{ itemId id level itemSubType equipped } costumes{ itemId equipped } }
+    runes{ runeId level }
+  } } }`;
+  let av = null, lastErr = null;
+  for (const url of CFG.rpcUrls) {
+    try {
+      const d = await gql(url, q, { a: activeAddress() });
+      if (d.errors?.length) { lastErr = d.errors[0].message; continue; }
+      av = d.data?.stateQuery?.avatar;
+      if (av?.inventory) break;
+    } catch (e) { lastErr = e.message; }
   }
-  const values = action.get("values");
-  if (!(values instanceof BencodexDictionary)) {
-    throw new Error("sweep 模板 values 结构校验失败");
+  if (!av?.inventory) {
+    throw new Error(`avatar.inventory 读取失败，拒绝构造以免用错装备：${String(lastErr || "无数据").slice(0, 140)}`);
   }
-  // 归属校验：模板里的 avatarAddress 必须就是本角色，防止误用他人参数
-  const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
-  const tmpl = values.get("avatarAddress");
-  if (!tmpl || !Buffer.isBuffer(tmpl) || !tmpl.equals(mine)) {
-    throw new Error("sweep 模板 avatarAddress 与本角色不符");
+  const eqs = av.inventory.equipments || [];
+  const cos = av.inventory.costumes || [];
+  // 当前穿戴的常规装备（equipped=true）。Lib9c 校验的是「背包里存在这些 GUID」，
+  // 因此 tuned 后装/换装都能通过；只要 equipped 标记可靠即可。
+  const equippedEq = eqs.filter(e => e.equipped);
+  const equippedCo = cos.filter(c => c.equipped);
+  if (!equippedEq.length) {
+    throw new Error("当前无 equipped 装备，拒绝构造（宁可不 sweep 也不用空装备浪费 AP）");
   }
-  const entries = [];
-  for (const k of values.keys()) {
-    const key = String(k);
-    if (key === "id") {
-      entries.push([k, randomBytes(16)]);       // 每笔换新，避免被判重复交易
-      continue;
-    }
-    if (key === "actionPoint" || key === "apStoneCount") {
-      const orig = values.get(k);
-      const target = key === "actionPoint" ? SWEEP_AP_TARGET : 0;
-      entries.push([k, typeof orig === "bigint" ? BigInt(target) : String(target)]);
-      continue;
-    }
-    entries.push([k, values.get(k)]);
-  }
-  return new BencodexDictionary([
-    ["type_id", action.get("type_id")],
-    ["values", new BencodexDictionary(entries)],
+  const equipmentIds = equippedEq.map(e => uuidToDotnet(e.itemId));
+  const costumeIds = equippedCo.map(c => uuidToDotnet(c.itemId));
+  const ownedRuneIds = new Set((av.runes || []).map(r => Number(r.runeId)));
+  return { equipmentIds, costumeIds, ownedRuneIds,
+           equipCount: equipmentIds.length, costumeCount: costumeIds.length };
+}
+
+// 用现场装备 + 符文槽 + 指定关卡，从零构造一个 hack_and_slash_sweep10 action。
+// 字段类型严格对齐 TMPL 那笔 SUCCESS sweep（都用 Unicode Text 表示数字）：
+//   actionPoint / apStoneCount / stageId / worldId = Text；runeInfos = [[Text,Text],...]
+//   equipments / costumes = List[Bytes(16)]；avatarAddress = Bytes(20)；id = Bytes(16)
+function buildSweepActionLive(loadout, template, stageId) {
+  const stage = Math.max(1, Math.trunc(Number(stageId)));
+  const world = worldOfStage(stage);
+  // 符文槽：过滤掉「已不拥有」的符文（换符文/分解后 runeId 失效会报 ItemDoesNotExist）。
+  const runeInfos = (template.runeSlots || [])
+    .filter(([slot, rid]) => loadout.ownedRuneIds.size === 0 || loadout.ownedRuneIds.has(Number(rid)))
+    .map(([slot, rid]) => [String(slot), String(rid)]);
+  const values = new BencodexDictionary([
+    ["actionPoint", String(SWEEP_AP_TARGET)],  // 一次用满 120 AP
+    ["apStoneCount", "0"],                       // 不消耗 AP 药水
+    ["avatarAddress", Buffer.from(Address.fromHex(activeAddress()).toBytes())],
+    ["costumes", loadout.costumeIds],
+    ["equipments", loadout.equipmentIds],
+    ["id", randomBytes(16)],                     // 每笔换新，避免重复交易
+    ["runeInfos", runeInfos],
+    ["stageId", String(stage)],
+    ["worldId", String(world)],
   ]);
+  return { action: new BencodexDictionary([["type_id", SWEEP_TYPE_ID], ["values", values]]),
+           stage, world, runeCount: runeInfos.length };
 }
 
-// 提交 sweep 消耗 AP，失败/超时/异常时最多重试 SWEEP_MAX_ATTEMPTS 次，
-// 全部失败才降级照常领日常。这是「收益优化」而非领取前置条件：链上
-// daily_reward7 本就没有 AP 门槛，所以无论 sweep 结果如何都绝不阻塞领取。
-//
-// 每一轮都贯彻「只认链上」：
-//  · 每笔都换新的 GameAction.Id（randomBytes(16)）、重新 getNonce，避免撞 id/nonce
-//  · 重试前先复核链上 actionPoint：AP 已降说明此前某笔其实成功了（典型是
-//    confirmTx 超时但其实 SUCCESS），立即收手，绝不重复提交、绝不误判失败
-//  · 链上幂等兜底：即便多笔 sweep 先后上链，最多一笔能扣掉 120 AP，其余
-//    因 AP 不足 FAILURE，不会重复消耗 AP
-//  · 总耗时有硬上限，sweep 绝不拖过领取窗口
+// 提交 sweep 消耗 AP（2026-11-23 重写）：现场构造 + 失败诊断自适应修复。
+// 与旧版「重试同一笔 6 次然后静默降级」的本质区别：
+//  1. 装备/时装每轮都现场读当前穿戴（换装自动跟上），不再套旧 GUID；
+//  2. 失败后读链上 exceptionNames 诊断根因，针对性修复后再打：
+//       装备失效 → 强制刷新 loadout；CP/关卡/材料不足 → stage 下调一级；
+//  3. 穷尽修复仍失败 → 发邮件告警（含异常名/关卡/装备变化/txId），照常领日常。
+// 每一轮仍贯彻「只认链上」：每笔新 id + nonce；重试前复核链上 AP，已消耗立即收手；
+// 总耗时硬上限，绝不拖过领取窗口。daily_reward7 无 AP 门槛，sweep 失败不阻塞领取。
 async function spendApBySweep(ctx, ap) {
   const started = Date.now();
   const MAX = SWEEP_MAX_ATTEMPTS;
   const info = {
     triggered: true, ap, targetAp: SWEEP_AP_TARGET, status: "skipped",
-    maxAttempts: MAX, attempts: 0, attemptLog: [],
+    maxAttempts: MAX, attempts: 0, attemptLog: [], stage: null,
   };
   if (DRY) {
     info.status = "would_sweep";
-    info.msg = `演练：AP 已满，本应最多 ${MAX} 次尝试 sweep 消耗 ${SWEEP_AP_TARGET} AP 后再领日常（未提交任何交易）`;
+    info.msg = `演练：AP 已满，本应现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（最多 ${MAX} 次）后再领日常（未提交任何交易）`;
     log({ level: "info", reward: "daily", msg: info.msg, ap, maxAttempts: MAX });
     return info;
   }
 
-  let tpl = null;          // 模板只拉一次；每次 build 都换新 id
-  let lastStatus = null;   // 上一笔的 txStatus（供下一轮决策）
+  // 现场资源：符文槽/起点关卡拉一次；装备/时装每轮重读。
+  let template = null;
+  let loadout = null;
+  let stage = SWEEP_DEFAULT_STAGE;
+  let sameStageFails = 0;       // 同一关卡「非装备/非CP」失败计数，防止未知异常空转
+  let lastStatus = null;
+  let lastDiag = null;
+
   for (let attempt = 1; attempt <= MAX; attempt++) {
-    // 预算保护：sweep 可有可无，绝不因它拖过领取窗口
+    // 预算保护
     if (Date.now() - started > SWEEP_BUDGET_MS) {
       log({ level: "warn", reward: "daily",
-            msg: "sweep 重试累计耗时达到上限，降级照常领日常（不阻塞冷却）",
+            msg: "sweep 累计耗时达到上限，转告警并照常领日常",
             elapsedMs: Date.now() - started, attempts: info.attempts });
+      info.stopReason = "budget_exhausted";
       break;
     }
 
-    // 非首轮：先只认链上复核 AP。已消耗 = 此前某笔其实成功了，立刻收手。
+    // 非首轮：复核链上 AP，已消耗说明此前某笔其实成功了，立即收手。
     let chainAp = null;
     if (attempt > 1) {
-      if (SWEEP_RETRY_GAP_MS > 0) {
-        await new Promise((r) => setTimeout(r, SWEEP_RETRY_GAP_MS));
-      }
+      if (SWEEP_RETRY_GAP_MS > 0) await new Promise(r => setTimeout(r, SWEEP_RETRY_GAP_MS));
       chainAp = await readChainApQuiet();
       info.chainAp = chainAp;
     }
@@ -539,7 +618,7 @@ async function spendApBySweep(ctx, ap) {
     if (pre === "success") {
       info.status = "swept";
       info.confirmedBy = "chain_ap";
-      info.msg = `重试前复核链上 AP=${chainAp} 已被消耗，此前 sweep 已生效，继续领日常`;
+      info.msg = `复核链上 AP=${chainAp} 已消耗，此前 sweep 已生效，继续领日常`;
       log({ level: "info", reward: "daily", msg: info.msg, attempts: info.attempts, chainAp });
       return info;
     }
@@ -548,17 +627,28 @@ async function spendApBySweep(ctx, ap) {
     const one = { attempt };
     info.attemptLog.push(one);
     try {
-      if (!tpl) tpl = await fetchSweepTemplate();
-      one.template = tpl.source;
-      const actionValue = buildSweepAction(tpl.raw);      // 每轮换新 id
-      const nonce = await getNonce(ctx.signer.toString()); // 每轮重新取 nonce
+      // 符文槽/关卡模板：首轮拉一次（仅取符文槽，装备绝不取模板）。
+      if (!template) template = await fetchSweepTemplate();
+      if (stage === SWEEP_DEFAULT_STAGE && Number.isFinite(template.stageId)) {
+        stage = Math.max(SWEEP_MIN_STAGE, Math.trunc(template.stageId));
+      }
+      // 装备/时装每轮现场重读 —— 换装后立刻跟上（修复根因）。
+      loadout = await resolveLiveLoadout();
+      const built = buildSweepActionLive(loadout, template, stage);
+      one.stage = built.stage; one.world = built.world;
+      one.equipCount = loadout.equipCount; one.costumeCount = loadout.costumeCount;
+      one.runeCount = built.runeCount;
+      info.stage = built.stage; info.world = built.world;
+
+      const nonce = await getNonce(ctx.signer.toString());
       one.nonce = Number(nonce);
-      const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue });
-      one.txId = txId;
-      info.txId = txId;
+      const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue: built.action });
+      one.txId = txId; info.txId = txId;
       log({ level: "info", reward: "daily",
-            msg: `AP 已满：提交 sweep 消耗 ${SWEEP_AP_TARGET} AP（第 ${attempt}/${MAX} 次尝试）`,
-            txId, ap, targetAp: SWEEP_AP_TARGET, attempt, maxAttempts: MAX, template: tpl.source });
+            msg: `AP 已满：现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（第 ${attempt}/${MAX} 次）`,
+            txId, stage: built.stage, world: built.world, equip: loadout.equipCount,
+            costume: loadout.costumeCount, rune: built.runeCount, attempt, maxAttempts: MAX });
+
       const r = await confirmTx(txId, SWEEP_CONFIRM_TRIES);
       one.txStatus = r.txStatus;
       one.exceptionNames = r.exceptionNames ?? null;
@@ -570,13 +660,42 @@ async function spendApBySweep(ctx, ap) {
       if (post === "success") {
         info.status = "swept";
         info.confirmedBy = "tx_status";
-        info.msg = `sweep 成功（第 ${attempt} 次尝试），AP 已消耗，继续领日常`;
-        log({ level: "info", reward: "daily", msg: info.msg, txId, attempts: info.attempts, ap });
+        info.msg = `sweep 成功（第 ${attempt} 次，stage ${stage}），AP 已消耗，继续领日常`;
+        log({ level: "info", reward: "daily", msg: info.msg, txId, attempts: info.attempts, stage });
         return info;
       }
+
+      // 未成功：诊断根因，决定下一轮怎么修。
+      const diag = diagnoseSweepFailure(r.exceptionNames);
+      lastDiag = diag; one.diagnosis = diag;
       log({ level: "warn", reward: "daily",
-            msg: `sweep 第 ${attempt}/${MAX} 次未确认成功（${r.txStatus}），复查链上状态后重试`,
-            txId, txStatus: r.txStatus, attempt, ap });
+            msg: `sweep 第 ${attempt}/${MAX} 次未成功：${r.txStatus} / ${diag.action} / ${diag.reason}`,
+            txId, stage, names: diag.names, attempt });
+
+      if (diag.action === "lower_stage") {
+        // CP/关卡/材料不足：下调关卡（worldId 随之重算），同关卡计数清零。
+        if (SWEEP_CP_FALLBACK_STEP > 0 && stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
+          const from = stage;
+          stage -= SWEEP_CP_FALLBACK_STEP;
+          sameStageFails = 0;
+          log({ level: "info", reward: "daily", msg: `sweep 关卡降级 ${from}→${stage}（world ${worldOfStage(stage)}），下轮重试` });
+        } else {
+          // 已到最低关卡仍不够 → 无路可降，停止后续尝试。
+          info.stopReason = "stage_floor";
+          break;
+        }
+      } else if (diag.action === "refresh_loadout") {
+        // 装备失效：下一轮强制重读穿戴（本实现本就每轮重读，这里显式记一次）。
+        sameStageFails = 0;
+        one.willRefreshLoadout = true;
+      } else {
+        // 其它/未知异常：同参数有限重试，超过就停。
+        sameStageFails += 1;
+        if (sameStageFails >= SWEEP_MAX_SAME_STAGE_RETRY) {
+          info.stopReason = "repeated_unknown_failure";
+          break;
+        }
+      }
       if (post === "degrade") break;                     // 次数用尽
     } catch (e) {
       one.error = String(e.message);
@@ -588,11 +707,13 @@ async function spendApBySweep(ctx, ap) {
     }
   }
 
-  // 次数用尽 / 预算耗尽 / 全部异常：一律降级照常领日常
+  // 穷尽修复仍未成功：发告警邮件（不阻塞日常领取）。
   info.status = "sweep_unconfirmed";
-  info.msg = `sweep 连续 ${info.attempts} 次尝试均未确认成功，降级照常领日常（不阻塞冷却）`;
-  log({ level: "warn", reward: "daily", msg: info.msg,
-        attempts: info.attempts, lastTxStatus: info.txStatus ?? null, ap });
+  info.msg = `sweep 经 ${info.attempts} 次尝试仍未成功（停止原因=${info.stopReason || "attempts_exhausted"}），已告警并照常领日常`;
+  log({ level: "error", reward: "daily", msg: info.msg,
+        attempts: info.attempts, lastTxStatus: info.txStatus ?? null,
+        lastDiag, stage, ap });
+  await sendSweepAlert(info, { ap, stage, loadout, template, lastDiag });
   return info;
 }
 
@@ -643,6 +764,138 @@ async function confirmTx(txId, tries = CFG.confirmTries) {
     if (i < tries - 1) await new Promise((r) => setTimeout(r, CFG.confirmIntervalMs));
   }
   return { txStatus: "PENDING" };
+}
+
+// ---------------- 告警邮件（sweep 穷尽修复仍失败时） ----------------
+// 用 Node 原生 net/tls 实现最小 SMTP 客户端，零第三方依赖；凭证只从环境变量
+// （GitHub Secrets 注入）读取，绝不落盘、不写日志。DRY/未配置时静默跳过。
+function mimeHeader(s) {
+  // 邮件头防止 CRLF 注入（主题里的异常名来自链上，理论上可控，做基本清洗）
+  return String(s).replace(/[\r\n]+/g, " ");
+}
+function buildAlertMail(subject, body) {
+  const lines = [
+    `From: ${mimeHeader(ALERT.from)}`,
+    `To: ${mimeHeader(ALERT.to)}`,
+    `Subject: =?UTF-8?B?${Buffer.from(mimeHeader(subject), "utf8").toString("base64")}?=`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.from(body, "utf8").toString("base64"),
+  ];
+  return lines.join("\r\n") + "\r\n.\r\n";
+}
+
+// 极简 SMTP 会话：EHLO → (STARTTLS) → AUTH LOGIN → MAIL FROM → RCPT TO → DATA → QUIT。
+// 465 用隐式 TLS 直连；587 先明文 EHLO 再 STARTTLS 升级。用闭包统一 handler，
+// 升级 TLS 时把 data/error/close 监听从旧 socket 迁到新 socket，避免误判提前关闭。
+function smtpSend(subject, body) {
+  return new Promise((resolve, reject) => {
+    let sock, buffer = "", phase = "greeting", finished = false, timer;
+    let needStarttls = ALERT.starttls;   // 局部副本，STARTTLS 升级后清零，不改全局配置
+    const authUser = Buffer.from(ALERT.user).toString("base64");
+    const authPass = Buffer.from(ALERT.pass).toString("base64");
+    const done = (err) => {
+      if (finished) return; finished = true;
+      clearTimeout(timer);
+      try { sock && sock.destroy(); } catch (_) {}
+      err ? reject(err) : resolve();
+    };
+    const send = (line) => { sock.write(line + "\r\n"); };
+    const onData = (chunk) => {
+      buffer += chunk.toString("utf8");
+      let nl;
+      while ((nl = buffer.indexOf("\r\n")) >= 0) {
+        const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 2);
+        const code = line.slice(0, 3);
+        if (phase === "greeting") {
+          if (code !== "220") return done(new Error("SMTP greeting " + line));
+          send(`EHLO ${ALERT.host}`); phase = "ehlo";
+        } else if (phase === "ehlo") {
+          if (needStarttls && code === "250") { send("STARTTLS"); phase = "starttls"; }
+          else if (/^250/.test(code)) { send("AUTH LOGIN"); phase = "auth_user"; }
+          else return done(new Error("SMTP EHLO " + line));
+        } else if (phase === "starttls") {
+          if (code !== "220") return done(new Error("SMTP STARTTLS " + line));
+          detach(sock);
+          const secured = tls.connect({ socket: sock, servername: ALERT.host }, () => {
+            attach(secured); send(`EHLO ${ALERT.host}`); phase = "ehlo"; needStarttls = false;
+          });
+          secured.on("error", e => done(e));
+          return;
+        } else if (phase === "auth_user") {
+          if (code !== "334") return done(new Error("SMTP AUTH user " + line));
+          send(authUser); phase = "auth_pass";
+        } else if (phase === "auth_pass") {
+          if (code !== "334") return done(new Error("SMTP AUTH pass " + line));
+          send(authPass); phase = "auth_ok";
+        } else if (phase === "auth_ok") {
+          if (!/^235/.test(code)) return done(new Error("SMTP AUTH failed " + line));
+          send(`MAIL FROM:<${ALERT.user}>`); phase = "mail_from";
+        } else if (phase === "mail_from") {
+          if (code !== "250") return done(new Error("SMTP MAIL FROM " + line));
+          send(`RCPT TO:<${ALERT.to}>`); phase = "rcpt_to";
+        } else if (phase === "rcpt_to") {
+          if (!/^(250|251)/.test(code)) return done(new Error("SMTP RCPT TO " + line));
+          send("DATA"); phase = "data";
+        } else if (phase === "data") {
+          if (code !== "354") return done(new Error("SMTP DATA " + line));
+          sock.write(buildAlertMail(subject, body), "utf8", () => { send("QUIT"); phase = "quit"; });
+        } else if (phase === "quit") {
+          return done(null);
+        }
+      }
+    };
+    const onErr = (e) => done(e);
+    const onClose = () => { if (!finished) done(new Error("SMTP 连接提前关闭")); };
+    const attach = (s) => { s.setEncoding("utf8"); s.on("data", onData); s.on("error", onErr); s.on("close", onClose); };
+    const detach = (s) => { if (s) { s.removeListener("data", onData); s.removeListener("error", onErr); s.removeListener("close", onClose); } };
+    sock = needStarttls
+      ? net.connect(ALERT.port, ALERT.host)
+      : tls.connect({ host: ALERT.host, port: ALERT.port, servername: ALERT.host });
+    attach(sock);
+    timer = setTimeout(() => done(new Error("SMTP 超时")), 20000);
+  });
+}
+
+// 组装 sweep 失败告警正文并发送。任何失败只记日志，绝不影响日常领取主流程。
+async function sendSweepAlert(info, ctx) {
+  if (DRY) { log({ level: "info", msg: "演练：跳过告警邮件" }); return; }
+  if (!alertConfigured()) {
+    log({ level: "warn", msg: "sweep 失败但告警邮件未配置（缺 NC_SMTP_HOST/USER/PASS/TO），仅记录日志",
+          stopReason: info.stopReason || "attempts_exhausted" });
+    return;
+  }
+  const attemptRows = (info.attemptLog || []).map(a =>
+    `  - 第${a.attempt}次 stage=${a.stage ?? "-"} world=${a.world ?? "-"} ` +
+    `status=${a.txStatus ?? "-"} 异常=${(a.exceptionNames || []).filter(Boolean).join(",") || "-"} ` +
+    `诊断=${a.diagnosis?.action ?? "-"} tx=${a.txId || "-"}`).join("\n");
+  const body = [
+    `9C 自动领奖：AP 消耗 sweep 多次修复后仍失败（需人工关注）`,
+    ``,
+    `时间：${new Date().toISOString()}`,
+    `角色：${ACTIVE.label || ""} ${activeAddress()}`,
+    `尝试次数：${info.attempts} / ${info.maxAttempts}`,
+    `停止原因：${info.stopReason || "attempts_exhausted"}`,
+    `最终关卡：stage ${ctx.stage ?? info.stage ?? "-"}（world ${info.world ?? "-"}）`,
+    `当前 AP：${ctx.ap ?? "-"}`,
+    `最后异常：${(info.exceptionNames || []).filter(Boolean).join(",") || "-"}`,
+    ``,
+    `逐次尝试：`,
+    attemptRows || "  （无）",
+    ``,
+    `现场装备：${ctx.loadout?.equipCount ?? "-"} 件 / 时装 ${ctx.loadout?.costumeCount ?? "-"} 件 / 符文槽 ${(ctx.template?.runeSlots || []).length}`,
+    `说明：装备/时装已改为现场读取当前穿戴，若仍报 ItemDoesNotExist 请检查是否有装备被锁定或刚刚变动。`,
+    `日常奖励不受影响，已照常领取。`,
+  ].join("\n");
+  const subject = `[9C告警] sweep 失败 stage${ctx.stage ?? info.stage ?? "-"} ${attemptRows ? "" : ""}`.slice(0, 120);
+  try {
+    await smtpSend(subject, body);
+    log({ level: "info", msg: "sweep 失败告警邮件已发送", to: ALERT.to });
+  } catch (e) {
+    log({ level: "error", msg: "sweep 失败告警邮件发送失败", detail: String(e.message) });
+  }
 }
 
 // ---------------- 蹲守模式（--watch） ----------------
@@ -699,79 +952,79 @@ function selfTest() {
     console.log(`  shouldSweep(${rw}, ${String(apv)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
-  // sweep 模板重建：只换 id，其余字段与已 SUCCESS 的交易逐字节保持
+  // 现场构造：buildSweepActionLive 用传入的当前装备/符文槽从零拼 action，
+  // 字段类型严格对齐（数字用 Text，装备/符文 GUID 用 Bytes）。
   total++;
   try {
-    const a = buildSweepAction(FALLBACK_SWEEP_RAW);
-    const hex = Buffer.from(encode(a)).toString("hex");
-    const v = a.get("values");
-    const idOk = Buffer.isBuffer(v.get("id")) && v.get("id").length === 16;
-    const ok = hex.length === FALLBACK_SWEEP_RAW.length &&
-      String(a.get("type_id")) === SWEEP_TYPE_ID &&
-      String(v.get("stageId")) === "446" &&
-      String(v.get("actionPoint")) === "120" &&
-      String(v.get("apStoneCount")) === "0" && idOk;
-    console.log(`  buildSweepAction 重建(type=446,ap=120,只换id) = ${ok}  ${ok ? "OK" : "FAIL"}`);
-    if (ok) pass++;
-  } catch (e) {
-    console.log(`  buildSweepAction 重建 FAIL ${e.message}`);
-  }
-  // 核心修复：模板里 actionPoint=80 时必须覆盖成 120，否则只消耗 80AP、
-  // 剩 40AP 被 daily 补回 = 白丢 40AP 的 sweep 收益。验证覆盖后字段集合、
-  // 值类型全部不变（只有数值变化），杜绝编码类型漂移。
-  total++;
-  try {
-    const base = decode(Buffer.from(FALLBACK_SWEEP_RAW, "hex"));
-    const bv = base.get("values");
-    const es = [];
-    for (const k of bv.keys()) {
-      es.push([k, String(k) === "actionPoint" ? "80" : bv.get(k)]);
-    }
-    const raw80 = Buffer.from(encode(new BencodexDictionary([
-      ["type_id", base.get("type_id")], ["values", new BencodexDictionary(es)],
-    ]))).toString("hex");
-    const a = buildSweepAction(raw80);
-    const v = a.get("values");
-    const keySet = (d) => [...d.keys()].map(String).sort().join(",");
-    const typeSeq = (d) => [...d.keys()].map((k) => typeof d.get(k)).join(",");
-    const ok = String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) &&
-      typeof v.get("actionPoint") === "string" &&
-      String(v.get("stageId")) === "446" &&
+    const eq = Buffer.from("11".repeat(16), "hex");
+    const co = Buffer.from("22".repeat(16), "hex");
+    const loadout = { equipmentIds: [eq], costumeIds: [co], ownedRuneIds: new Set([10056, 10047]) };
+    const tpl = { runeSlots: [["0", "10056"], ["1", "10047"], ["3", "99999"]], stageId: 446, worldId: 9 };
+    const built = buildSweepActionLive(loadout, tpl, 446);
+    const v = built.action.get("values");
+    const ok = String(built.action.get("type_id")) === SWEEP_TYPE_ID &&
+      String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) &&
       String(v.get("apStoneCount")) === "0" &&
-      keySet(v) === keySet(bv) && typeSeq(v) === typeSeq(bv) &&
-      Buffer.isBuffer(v.get("id")) && v.get("id").length === 16;
-    console.log(`  buildSweepAction 80→${SWEEP_AP_TARGET} 覆盖(类型/字段不变) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+      String(v.get("stageId")) === "446" && String(v.get("worldId")) === "9" &&
+      typeof v.get("actionPoint") === "string" &&
+      Buffer.isBuffer(v.get("id")) && v.get("id").length === 16 &&
+      [...v.get("equipments")][0].equals(eq) &&
+      // 不在 ownedRuneIds 的 99999 必须被过滤掉（换符文后失效）
+      [...v.get("runeInfos")].length === 2;
+    console.log(`  现场构造 action(装备/符文/字段类型) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   } catch (e) {
-    console.log(`  buildSweepAction 80→120 覆盖 FAIL ${e.message}`);
+    console.log(`  现场构造 action FAIL ${e.message}`);
   }
-  // 手动 sweep 污染场景：模板同时带 80AP 和 apStoneCount=2（手动勾了 AP 药水）
-  // 时，脚本必须把两者都锁死为 120 / 0，否则会真扣药水且次数变 30+60。
+  // stage→world 派生：401-450→9, 451-500→10, 1-50→1（降级时 worldId 必须跟着变）
+  total++;
+  {
+    const cases = [[446, 9], [450, 9], [451, 10], [400, 8], [1, 1], [50, 1], [51, 2]];
+    const ok = cases.every(([s, w]) => worldOfStage(s) === w);
+    console.log(`  worldOfStage 派生(446→9,451→10,1→1) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // CP 降级场景：stage 下调后 buildSweepActionLive 的 worldId 必须重算
   total++;
   try {
-    const base = decode(Buffer.from(FALLBACK_SWEEP_RAW, "hex"));
-    const bv = base.get("values");
-    const es = [];
-    for (const k of bv.keys()) {
-      const key = String(k);
-      es.push([k, key === "actionPoint" ? "80" : key === "apStoneCount" ? "2" : bv.get(k)]);
-    }
-    const dirty = Buffer.from(encode(new BencodexDictionary([
-      ["type_id", base.get("type_id")], ["values", new BencodexDictionary(es)],
-    ]))).toString("hex");
-    const a = buildSweepAction(dirty);
-    const v = a.get("values");
-    const keySet = (d) => [...d.keys()].map(String).sort().join(",");
-    const typeSeq = (d) => [...d.keys()].map((k) => typeof d.get(k)).join(",");
-    const ok = String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) &&
-      String(v.get("apStoneCount")) === "0" &&
-      typeof v.get("actionPoint") === "string" &&
-      typeof v.get("apStoneCount") === "string" &&
-      keySet(v) === keySet(bv) && typeSeq(v) === typeSeq(bv);
-    console.log(`  手动 sweep 污染(80AP+2药水)仍锁死 ${SWEEP_AP_TARGET}AP/0药水 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    const loadout = { equipmentIds: [Buffer.from("11".repeat(16), "hex")], costumeIds: [], ownedRuneIds: new Set() };
+    const b1 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446);
+    const b2 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 430 }, 430);
+    const b3 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 450 }, 450);
+    const b4 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 451 }, 451);
+    const ok = String(b1.action.get("values").get("worldId")) === "9" &&
+      String(b2.action.get("values").get("worldId")) === "9" &&
+      String(b3.action.get("values").get("worldId")) === "9" &&
+      String(b4.action.get("values").get("worldId")) === "10";
+    console.log(`  CP 降关卡后 worldId 重算(450→9,451→10) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   } catch (e) {
-    console.log(`  手动 sweep 污染用例 FAIL ${e.message}`);
+    console.log(`  CP 降关卡 worldId 重算 FAIL ${e.message}`);
+  }
+  // 失败诊断：不同异常名映射到正确修复动作
+  total++;
+  {
+    const dc = [
+      [["Nekoyume.Action.ItemDoesNotExistException"], "refresh_loadout"],
+      [[null, "Nekoyume.Action.NotEnoughCombatPointException", null], "lower_stage"],
+      [["Nekoyume.Action.InvalidStageException"], "lower_stage"],
+      [["Nekoyume.Action.NotEnoughMaterialException"], "lower_stage"],
+      [[], "retry"],
+      [["SomeWeirdException"], "retry"],
+    ];
+    const ok = dc.every(([ex, want]) => diagnoseSweepFailure(ex).action === want);
+    console.log(`  diagnoseSweepFailure 异常→修复映射 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // actionPoint 恒为 120 / apStoneCount 恒为 0（不因现场装备变化而漂移）
+  total++;
+  {
+    const loadout = { equipmentIds: [Buffer.from("ab".repeat(16), "hex")], costumeIds: [], ownedRuneIds: new Set() };
+    const built = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446);
+    const v = built.action.get("values");
+    const ok = String(v.get("actionPoint")) === String(SWEEP_AP_TARGET) && String(v.get("apStoneCount")) === "0";
+    console.log(`  现场构造锁死 ${SWEEP_AP_TARGET}AP/0药水 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
   }
   // sweep 重试决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
   // 次数未满 retry，次数用尽 degrade（降级照常领日常）。只认链上 + 有界重试。
@@ -800,20 +1053,21 @@ function selfTest() {
     console.log(`  ${tag} = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
-  // 每笔 sweep 必须换新 action id，否则重试会被链上判重复交易；其余字段保持一致
+  // 每笔现场构造的 action 必须换新 id，否则重试会被链上判重复交易；其余字段保持一致
   total++;
   try {
-    const a1 = buildSweepAction(FALLBACK_SWEEP_RAW);
-    const a2 = buildSweepAction(FALLBACK_SWEEP_RAW);
-    const id1 = Buffer.from(a1.get("values").get("id")).toString("hex");
-    const id2 = Buffer.from(a2.get("values").get("id")).toString("hex");
+    const loadout = { equipmentIds: [Buffer.from("11".repeat(16), "hex")], costumeIds: [], ownedRuneIds: new Set() };
+    const b1 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446).action;
+    const b2 = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446).action;
+    const id1 = Buffer.from(b1.get("values").get("id")).toString("hex");
+    const id2 = Buffer.from(b2.get("values").get("id")).toString("hex");
     const ok = id1 !== id2 && id1.length === 32 && id2.length === 32 &&
-      String(a1.get("values").get("stageId")) === String(a2.get("values").get("stageId")) &&
-      String(a1.get("values").get("actionPoint")) === "120";
-    console.log(`  buildSweepAction 两次重建 id 不同 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+      String(b1.get("values").get("stageId")) === String(b2.get("values").get("stageId")) &&
+      String(b1.get("values").get("actionPoint")) === "120";
+    console.log(`  现场构造两次 id 不同 = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   } catch (e) {
-    console.log(`  buildSweepAction 两次重建 FAIL ${e.message}`);
+    console.log(`  现场构造两次 id FAIL ${e.message}`);
   }
   // 语义校验：默认 6 笔 = 首次 + 重试 5 次；带 --sweep-attempts 时按传入值校验
   total++;
@@ -867,13 +1121,18 @@ function selfTest() {
     const before = activeAddress();
     setActive(AVATARS[1]);
     const switched = activeAddress() === AVATARS[1].address;
-    let rejected = false;
-    // 主角色 bnb 的模板绝不能被 bnbyes 套用（归属校验必须拒绝）
-    try { buildSweepAction(FALLBACK_SWEEP_RAW); } catch (_) { rejected = true; }
+    // 现场构造：切到 bnbyes 后 action 的 avatarAddress 必须是 bnbyes，绝不串回 bnb
+    const loadout = { equipmentIds: [], costumeIds: [], ownedRuneIds: new Set() };
+    const builtB = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446).action;
+    const addrB = Buffer.from(builtB.get("values").get("avatarAddress")).toString("hex");
+    const wantB = Buffer.from(Address.fromHex(AVATARS[1].address).toBytes()).toString("hex");
     setActive(AVATARS[0]);
+    const builtA = buildSweepActionLive(loadout, { runeSlots: [], stageId: 446 }, 446).action;
+    const addrA = Buffer.from(builtA.get("values").get("avatarAddress")).toString("hex");
+    const wantA = Buffer.from(Address.fromHex(AVATARS[0].address).toBytes()).toString("hex");
     const restored = activeAddress() === before;
-    const ok = switched && rejected && restored;
-    console.log(`  setActive 切换 + 跨角色模板被拒绝(不串号) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    const ok = switched && addrB === wantB && addrA === wantA && addrA !== addrB && restored;
+    console.log(`  setActive 切换 + 现场构造 avatar 不串号 = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   } catch (e) { setActive(AVATARS[0]); console.log(`  多角色切换 FAIL ${e.message}`); }
 
