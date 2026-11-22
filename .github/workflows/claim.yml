@@ -91,15 +91,8 @@ jobs:
           MAX_RUN: ${{ inputs.max_run_seconds }}
           # 可选覆盖：逗号分隔的 "名字:0x地址"。留空即用脚本内置的三角色。
           NC_AVATARS: ${{ vars.NC_AVATARS }}
-          # sweep 穷尽修复仍失败时的告警邮件凭证（SMTP，仅 runner 内存在，不落盘）。
-          # 任一缺失时脚本只记日志不发信，不影响领取。587 端口需另设 NC_SMTP_STARTTLS=1。
-          NC_SMTP_HOST: ${{ secrets.NC_SMTP_HOST }}
-          NC_SMTP_PORT: ${{ secrets.NC_SMTP_PORT }}
-          NC_SMTP_USER: ${{ secrets.NC_SMTP_USER }}
-          NC_SMTP_PASS: ${{ secrets.NC_SMTP_PASS }}
-          NC_SMTP_TO: ${{ secrets.NC_SMTP_TO }}
-          NC_SMTP_FROM: ${{ secrets.NC_SMTP_FROM }}
-          NC_SMTP_STARTTLS: ${{ vars.NC_SMTP_STARTTLS }}
+          # sweep 穷尽修复仍失败时，脚本自动写入 GITHUB_STEP_SUMMARY（GitHub 内置，
+          # 无需任何凭证），告警会显示在本 job 运行页顶部。
         run: |
           set -o pipefail
           # 仅调试用：允许把常驻预算临时改短，快速验证交棒；留空则走默认 5.5h。
