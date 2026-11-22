@@ -6,6 +6,11 @@
  *   · 按 boss 等级判定：仅当「全球 boss 当前等级 > 你记录的 latestBossLevel」才打。
  *     源码 raid7 里击杀奖励的唯一触发条件就是 `if (raiderState.LatestBossLevel < bossState.Level)`，
  *     发完把 latestBossLevel 更新为当前 boss 等级；多升几级源码一次补发。未升级绝不打（不浪费票）。
+ *   · 扫货链（2026-11-22 用户要求，替代旧"打一笔就停等5分钟"）：进入 --watch 后进程内
+ *     每 GAP_MS（默认 15s）轮询 boss 等级，一升级立刻打；打完 SUCCESS 不退出，继续蹲下一级，
+ *     全程不断链，直到 300 级 / 赛季末 / 买满 / 死锁 / 装备首战未通关才停。漏洞模式 p=true
+ *     不扣票/NCG，多打无所谓，重点是别让 boss 跳级漏掉击杀奖励。本地水位 handledLevel 防止
+ *     链上状态滞后导致重复打同一级；预算耗尽 normal 交棒，concurrency 排队无缝续接。
  *   · 门票：免费票优先（remainChallengeCount>=1 → PayNcg=false），用尽后 NCG 买满 40
  *     （PayNcg=true；买票不扣免费票；上限 MaxPurchaseCount=40）。
  *   · 首次入场水晶：由 raid7 action 服务端自动扣（entranceFee×level² crystal），脚本不额外构造。
@@ -141,6 +146,9 @@ const ARM_BLOCK = Math.max(0, Math.trunc(numArg("--arm-block", 0)));
 const GAP_MS = Math.max(10000, numArg("--gap-ms", 60000));
 // 单个 job 长驻预算，单位「秒」，默认 5.5h（< 6h 上限），耗尽交棒。
 const MAX_WATCH_MS = Math.max(10, numArg("--max-watch-seconds", 330 * 60)) * 1000;
+// 扫货链：同一 boss 等级连续战斗失败(FAILURE/INVALID)达此次数就跳过该级、等下次升级，
+// 防止漏洞模式下对同一级无限重刷失败交易（虽不扣票/NCG，仍白耗 gas 与 runner 时间）。
+const MAX_LEVEL_RETRY = Math.max(1, Math.trunc(numArg("--max-level-retry", 3)));
 
 // 历史 raid7 SUCCESS 模板（block 11704772，第35期；含符文槽配置——GraphQL 无法直读 Raid 槽）
 const TEMPLATE_RAW = "6475373a747970655f696475353a726169643775363a76616c7565736475313a6132303aac9d450c69df27ee290c90ec61c4b76154b0a21c75313a636c31363a3c07374778009e42bfa10a16854b5b3431363a3c07374778009e42bfa10a16854b5b3431363a124e4f4bdb116346bd68bcb86b8d301b31363a47695f4fb8c7a4449ca7c9b99891790b31363a6619635e7b72d3479fda8675f64a366e31363a12338ec56f2f2a499c1c1d5d8332666c6575313a656c31363a84afc54e6d44d840948afc3089a2479931363aeba24ec67f4e5c44acf718c40594835b31363a2a9b1888b279d449a8864952c340571431363aa44d5b8d516e95418c834092994f833631363a656ba3105d2d53419c2709151d1877c131363a78cc60679f7f1b49992732ed5b090eb731363a10279dce80a38b4390bbc01ab03ba71431363acf5f2258713bc94e943078cfa84e8cbc6575313a666c6575323a696431363a00af215d8453a9469c5196779a95bdd475313a706675313a726c6c75313a3075353a3130303437656c75313a3175353a3330303031656c75313a3375353a3130303535656c75313a3475353a3130303531656c75313a3675353a3130303532656c75313a3775353a3130303033656c75313a3875353a3130303536656c75313a3975353a313030313365656565";
@@ -178,6 +186,21 @@ function isTerminalTxStatus(s) { return s === "SUCCESS" || s === "FAILURE" || s 
 function isConfirmedTerminal(r) {
   if (!r || !isTerminalTxStatus(r.txStatus)) return false;
   return r.blockIndex != null && r.blockIndex !== "";
+}
+
+// 扫货链：把一次 runOnce 的 out.result 归类，决定本次 job 是「硬停止」还是「继续蹲」。
+// 只有四类属于硬停止（停 job、不接力）：赛季级终态、装备首战未通关、用户手动演练、
+// 以及主动 dry-run。战斗成功 / 未定论 / 失败 / 等待升级 一律继续蹲守下一轮。
+// 干净拆成纯函数便于离线自测，防止又把"打一笔就停"的旧逻辑带回来。
+function watchStopCode(result) {
+  const r = result || "";
+  // 赛季级终态：买满 / 赛季末 / 赛季空档 / 赛季不符 / 死锁 —— 停，不接力
+  if (/^(skip:(purchase_cap|season_end|season_mismatch|gap)|skip:reward_deadlock)/.test(r)) return "season_stop";
+  // 装备首战没打穿 S 级：装备错，停手（用户铁律，绝不硬打）
+  if (r.startsWith("首战未达S级")) return "first_battle_not_clear";
+  // 手工演练 / dry-run：不接力
+  if (r.startsWith("dry-run")) return "dry_run";
+  return null; // 其余（SUCCESS / 未定论 / 未成功 / no_level_up / ticket_unsafe / uninit）继续蹲
 }
 
 // Lib9c Nekoyume.Action.AddressExtension.Derive(address, string):
@@ -577,7 +600,7 @@ async function confirmTxAcrossNodes(txId, tries = CFG.confirmTries) {
 }
 
 // ---------------- 判定：本轮是否打、用什么票 ----------------
-function decide({ raidId, row, raider, boss, tip, season = SEASON }) {
+function decide({ raidId, row, raider, boss, tip, season = SEASON, handledLevel = 0 }) {
   if (raidId == null) return { ok: false, reason: "赛季空档期（raidId 读不到），跳过", code: "gap" };
   // season=0 → 自动跟随链上当前 raidId（不校验赛季号）；>0 → 仅打显式锁定的赛季。
   if (season > 0 && raidId !== season) return {
@@ -587,12 +610,15 @@ function decide({ raidId, row, raider, boss, tip, season = SEASON }) {
   if (row && row.end && tip >= BigInt(row.end - END_BUFFER)) return {
     ok: false, reason: `赛季临近结束（tip=${tip} ≥ end-buffer=${row.end - END_BUFFER}），停止开新战斗`, code: "season_end" };
 
-  // 按 boss 等级判定：只有 boss 等级高于已记录等级才打（保证击杀奖励）
+  // 按 boss 等级判定：只有 boss 等级高于「已记录等级」才打（保证击杀奖励）。
+  // 扫货链：叠加本地水位 handledLevel——本 job 内已提交过的等级即使链上 latestBossLevel
+  // 尚未同步，也不会重复提交同一级（等链上确认后再放开）。
   const bossLv = Number(boss.level);
-  const latestLv = Number(raider.latestBossLevel || 0);
+  const chainLv = Number(raider.latestBossLevel || 0);
+  const latestLv = Math.max(chainLv, Number(handledLevel) || 0);
   if (!Number.isFinite(bossLv) || bossLv <= latestLv) return {
-    ok: false, reason: `boss 未升级（boss.level=${bossLv}, latestBossLevel=${latestLv}），等待`, code: "no_level_up",
-    bossLv, latestLv };
+    ok: false, reason: `boss 未升级（boss.level=${bossLv}, 链上latest=${chainLv}, 本地水位=${handledLevel}），等待`, code: "no_level_up",
+    bossLv, latestLv, chainLv };
 
   // 门票策略：默认免费票优先；--ncg-only 时忽略免费票只用 NCG（用户自己打免费票）
   const remain = Number(raider.remainChallengeCount || 0);
@@ -614,7 +640,7 @@ function decide({ raidId, row, raider, boss, tip, season = SEASON }) {
 }
 
 // ---------------- 单次执行 ----------------
-async function runOnce(ctx, out) {
+async function runOnce(ctx, out, handledLevel = 0) {
   const tip = await getTip();
   const raidId = await getRaidId(tip);
   const row = raidId != null ? await getSeasonRow(raidId).catch(() => null) : null;
@@ -632,7 +658,7 @@ async function runOnce(ctx, out) {
     remainTickets: raider?.remainChallengeCount ?? null, purchaseCount: raider?.purchaseCount ?? null,
     ticket: row ? { price: row.ticketPrice, additional: row.additionalPrice, max: row.maxPurchase } : null,
   };
-  const d = decide({ raidId, row, raider, boss, tip });
+  const d = decide({ raidId, row, raider, boss, tip, handledLevel });
   out.decision = d;
   log({ level: "info", msg: "WB 状态检查", ...out.status, target: SEASON > 0 ? SEASON : "follow:" + raidId, hit: d.ok, why: d.reason });
   if (!d.ok) { out.result = "skip:" + d.code; return; }
@@ -692,7 +718,7 @@ async function runOnce(ctx, out) {
     return;
   }
   if (result.txStatus !== "SUCCESS") {
-    out.result = `交易未成功（${result.txStatus}@block${result.blockIndex}）——停止本轮，不重复提交`;
+    out.result = `交易未成功（${result.txStatus}@block${result.blockIndex}）——本轮不重复提交，继续蹲等下次重判`;
     return;
   }
 
@@ -778,21 +804,59 @@ async function main() {
 
   if (WATCH) {
     const started = Date.now();
-    log({ level: "info", msg: "进入 WB 蹲守（进程内轮询，按 boss 等级判定）", season: SEASON > 0 ? SEASON : "follow", gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000) });
+    log({ level: "info", msg: "进入 WB 扫货链蹲守（进程内高频轮询 boss 等级，一升级就打，打完继续蹲不退出）",
+          season: SEASON > 0 ? SEASON : "follow", gapMs: GAP_MS, budgetSec: Math.round(MAX_WATCH_MS / 1000) });
     let rounds = 0;
+    let handledLevel = 0;             // 本地水位：本 job 已提交过的最高 boss 等级，防链上状态滞后重复打同一级
+    let activeRaidId = null;          // 赛季切换后水位必须归零（新赛季 boss 从 1 级起，否则被旧水位永久卡住）
+    let lastAttemptLevel = null;      // 上一轮尝试的 boss 等级 + 赛季，用于统计同一级连续失败
+    let consecutiveFails = 0;
     while (Date.now() - started < MAX_WATCH_MS) {
       rounds++; out.round = rounds;
+      // 每轮重置易变字段，避免上一轮残留污染本轮判定。
+      out.submitted = false; out.txId = undefined; out.txResult = undefined;
+      out.firstBattleClear = undefined; out.deadlock = undefined;
       try {
-        await runOnce(ctx, out);
-        // 达到买票上限 / 赛季结束 / 已提交未定论 / 交易定论 → 停止本 job，不空转、不交棒
-        if (out.result && /^(skip:(purchase_cap|season_end|season_mismatch|gap)|战斗提交成功|交易未定论|交易未成功)/.test(out.result)) {
-          out.handoff = "none"; break;
+        await runOnce(ctx, out, handledLevel);
+
+        const raidNow = out.status?.raidId ?? null;
+        if (activeRaidId !== raidNow) {
+          // 新赛季 / 首次拿到 raidId：水位归零，从头紧跟 boss 等级。
+          if (activeRaidId !== null) log({ level: "info", msg: "赛季切换，本地水位归零", from: activeRaidId, to: raidNow });
+          activeRaidId = raidNow; handledLevel = 0; lastAttemptLevel = null; consecutiveFails = 0;
         }
+
+        const bossNow = Number(out.status?.bossLevel || 0);
+        const stop = watchStopCode(out.result);
+        if (stop) {
+          out.handoff = "none"; out.stopReason = stop;
+          log({ level: "info", msg: "硬停止，本 job 结束且不接力", reason: stop, result: out.result });
+          break;
+        }
+
+        // 战斗 SUCCESS：把该等级写入本地水位，下一轮只追更高的 boss 等级。
+        // 这样即使链上 latestBossLevel 尚未同步，也不会重复提交同一级、更不会空窗等 5 分钟。
+        if (out.result === "战斗提交成功（SUCCESS）") {
+          if (Number.isFinite(bossNow) && bossNow > handledLevel) handledLevel = bossNow;
+          out.handledLevel = handledLevel;
+          lastAttemptLevel = `${raidNow}:${bossNow}`; consecutiveFails = 0;
+          log({ level: "info", msg: "战斗成功，继续蹲守下一级（扫货链不退出）", bossLevel: bossNow, handledLevel });
+        } else if (out.result && (out.result.startsWith("交易未成功") || out.result.startsWith("首战未达S级"))) {
+          // 同一级连续失败计数，达到上限后抬水位跳过该级，避免无限重刷失败交易。
+          const key = `${raidNow}:${bossNow}`;
+          if (key === lastAttemptLevel) consecutiveFails++; else { lastAttemptLevel = key; consecutiveFails = 1; }
+          if (consecutiveFails >= MAX_LEVEL_RETRY && Number.isFinite(bossNow) && bossNow > handledLevel) {
+            handledLevel = bossNow; out.handledLevel = handledLevel;
+            log({ level: "warn", msg: "同一 boss 等级连续失败达上限，抬水位跳过等下次升级", bossLevel: bossNow, fails: consecutiveFails });
+          }
+        }
+        // 未定论 / 未成功 / 未升级 / 装备读取不全 / 票价护栏未通过：都继续蹲，下一轮重判。
       } catch (e) { log({ level: "warn", msg: "本轮检查异常，稍后重试", detail: e.message }); }
       await sleepMs(GAP_MS);
     }
-    if (!out.handoff) out.handoff = out.submitted ? "none" : (DRY ? "dry_run" : "budget_exhausted");
-    out.rounds = rounds; out.elapsedSec = Math.round((Date.now() - started) / 1000);
+    // 预算耗尽 → 正常交棒（扫货链不间断）；只有上面硬停止分支已设 out.handoff 时才保留 none。
+    if (!out.handoff) out.handoff = "budget_exhausted";
+    out.rounds = rounds; out.handledLevel = handledLevel; out.elapsedSec = Math.round((Date.now() - started) / 1000);
     console.log(JSON.stringify(out));
     return;
   }
@@ -854,6 +918,28 @@ function selfTest() {
   ok("赛季末停止", dEnd.ok === false && dEnd.code === "season_end");
   const dMulti = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 3 }), boss: boss({ level: 7 }) });
   ok("boss多级也命中", dMulti.ok === true && dMulti.bossLv === 7 && dMulti.latestLv === 3);
+
+  // ── 扫货链（2026-11-22）：本地水位防重复打同一级 ──
+  const dHandled = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 5 }), boss: boss({ level: 6 }), handledLevel: 6 });
+  ok("本地水位>=boss不重复打", dHandled.ok === false && dHandled.code === "no_level_up" && dHandled.latestLv === 6);
+  const dHandledLower = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 5 }), boss: boss({ level: 8 }), handledLevel: 6 });
+  ok("本地水位低于boss仍打", dHandledLower.ok === true && dHandledLower.bossLv === 8);
+  const dChainStale = decide({ ...base, raidId: 37, row, raider: raider({ latestBossLevel: 5 }), boss: boss({ level: 6 }), handledLevel: 5 });
+  ok("链上滞后但水位未覆盖则打", dChainStale.ok === true && dChainStale.bossLv === 6);
+
+  // ── 扫货链：结果归类，只有硬停止才停 job，其余继续蹲 ──
+  ok("watch-战斗成功继续", watchStopCode("战斗提交成功（SUCCESS）") === null);
+  ok("watch-未定论继续", watchStopCode("交易未定论（STAGING，未入块）——不重复提交，等链上确认") === null);
+  ok("watch-交易未成功继续", watchStopCode("交易未成功（FAILURE@block1）——本轮不重复提交，继续蹲等下次重判") === null);
+  ok("watch-未升级继续", watchStopCode("skip:no_level_up") === null);
+  ok("watch-票价护栏继续", watchStopCode("skip:ticket_unsafe") === null);
+  ok("watch-状态未初始化继续", watchStopCode("skip:uninit") === null);
+  ok("watch-买满硬停", watchStopCode("skip:purchase_cap") === "season_stop");
+  ok("watch-赛季末硬停", watchStopCode("skip:season_end") === "season_stop");
+  ok("watch-赛季空档硬停", watchStopCode("skip:gap") === "season_stop");
+  ok("watch-死锁硬停", watchStopCode("skip:reward_deadlock（...）") === "season_stop");
+  ok("watch-首战未通关硬停", watchStopCode("首战未达S级通关或无法确认，停手不继续（x）") === "first_battle_not_clear");
+  ok("watch-dryrun停", watchStopCode("dry-run（未提交）") === "dry_run");
 
   ok("UUID→.NET Guid 小端", uuidToDotnet("4ec5af84-446d-40d8-948a-fc3089a24799").toString("hex") === "84afc54e6d44d840948afc3089a24799");
   ok("UUID 无连字符同样", uuidToDotnet("4ec5af84446d40d8948afc3089a24799").toString("hex") === "84afc54e6d44d840948afc3089a24799");
