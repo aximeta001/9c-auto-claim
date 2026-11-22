@@ -21,12 +21,16 @@ name: 9C World Boss 自动战斗 (Heimdall)
 # 稳定运行架构（复用领奖/无限塔链，已验证）：
 #   前置闸门：每次调度先 curl 查 tip，未到 arm_block 就整个 job 秒退（不 checkout/不装依赖/
 #             不解私钥，成本近零）。进入窗口才拉起 watch。
-#   主力：job 内 world-boss.mjs --watch 常驻，进程内每 15s 轮询一次链上状态，
-#         boss 一升级即提交（不等下一条 cron）。15s 为防跳级：boss 常一次跳多级，
-#         轮询越密越能一级一级紧跟，减少 rewardRecord 只记当前级、跳过中间级的损失。
+#   主力（扫货链，2026-11-22 改）：job 内 world-boss.mjs --watch 常驻，进程内每 15s
+#         轮询 boss 等级，一升级立刻提交 raid7；打完 SUCCESS 不退出、继续蹲下一级，
+#         全程不断链（旧版"打一笔就停、等 5 分钟重燃"会漏级，已废弃）。漏洞模式 p=true
+#         不扣票/NCG，多打无所谓，重点是 boss 跳级时不漏中间级的击杀奖励。脚本内本地水位
+#         防链上状态滞后重复打同一级；同一级连续失败 N 次抬水位跳过，防无限重刷。
 #   接力：job 守满预算（默认 5.5h < 6h 上限）打印 {"handoff":"budget_exhausted"}，
 #         末尾 step 用 workflow_dispatch REST API 即时刻下一个 job，concurrency 组串行无缝。
-#   停止：买满 40 / 赛季末 / 已提交未定论 / 交易定论 → 不接力，避免空转浪费 runner。
+#         新 job 水位从 0 起、靠链上 latestBossLevel 接续，赛季切换自动归零，不会卡级。
+#   停止（仅硬停止才不接力）：买满 40 / 赛季末 / 赛季空档 / 死锁 / 装备首战未通关。
+#         战斗成功 / 未定论 / 单笔失败 / 未升级 一律继续蹲，不再因"打了一笔"就停 job。
 #   保险：schedule 每 5 分钟只作「接力链意外断裂时重新点火」，默认走漏洞模式。
 #
 # 交易终态只认 SUCCESS / FAILURE / INVALID 且须带 blockIndex（跨节点复核，杜绝伪 INVALID）。
