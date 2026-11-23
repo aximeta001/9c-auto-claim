@@ -242,12 +242,14 @@ const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 1280)) *
 // 没材料还会 NotEnoughMaterial。CP 不足时在 [SWEEP_MIN_STAGE, SWEEP_DEFAULT_STAGE]
 // 区间内逐级下调（见 SWEEP_CP_FALLBACK_STEP）。
 const SWEEP_DEFAULT_STAGE = Math.max(1, Math.trunc(numArg("--sweep-stage", 446)));
-// 装备槽：Lib9c ValidateEquipmentsV3 要求 8 件 = 6 常规(WEAPON/ARMOR/BELT/
-// NECKLACE/RING×2, equipped=true) + 气场(AURA) + 魔典(GRIMOIRE)。后两者在
-// GraphQL 里 equipped=false，必须按 itemId 单独取，否则只凑 6 件 → 校验失败。
+// 装备槽：6 常规(WEAPON/ARMOR/BELT/NECKLACE/RING×2, equipped=true) + 可选气场
+// (AURA) + 可选魔典(GRIMOIRE)。气场/魔典一律按 itemSubType 取，优先当前装备的、
+// 否则从背包补最高级 —— 绝不硬编码 itemId。2026-11-24 回归根因：旧代码硬编码
+// 魔典 id=10780009，但 bnbyes 的魔典是 10770002、tomoon 当前只穿 6 件（气场/
+// 魔典未装备），全被误判"装备不完整"→ 本地构造卡死 → 日常停领。
 const REGULAR_EQUIP_TYPES = new Set(["WEAPON", "ARMOR", "BELT", "NECKLACE", "RING"]);
-const AURA_ITEM_ID = 10670003;       // Barrage Aura
-const GRIMOIRE_ITEM_ID = 10780009;   // SPD Grimoire(S)
+const AURA_SUBTYPE = "AURA";         // 气场槽（id 因角色而异，不硬编码）
+const GRIMOIRE_SUBTYPE = "GRIMOIRE"; // 魔典槽（id 因角色而异，不硬编码）
 // stage→world：WorldSheet 里每 50 关一个 world（1-50→1, 401-450→9, 451-500→10…）
 function worldOfStage(stage) { return Math.ceil(Number(stage) / 50); }
 // CP 不足时每次下调的关卡数（worldId 由 worldOfStage 重算）。0=不降级，只重试。
@@ -515,6 +517,18 @@ async function fetchSweepTemplate() {
   return { runeSlots: [], source: "default" };
 }
 
+// 从装备列表里挑某个槽位的一件（纯函数，供自测覆盖）：
+//   1) 优先该角色【当前装备】(equipped=true) 的最高 level 一件；
+//   2) 没装备则从背包补最高 level 一件（同 level 按 itemId 稳定排序）。
+// 只按 itemSubType 判断，绝不看固定 itemId —— 每个角色气场/魔典 id 都不同。
+function pickEquipmentSlot(eqs, subtype) {
+  const all = (eqs || []).filter(e => e.itemSubType === subtype);
+  const on = all.filter(e => e.equipped).sort((a, b) => (b.level || 0) - (a.level || 0));
+  if (on.length) return on[0];
+  return all.sort((a, b) => (b.level || 0) - (a.level || 0) ||
+                  String(a.itemId).localeCompare(String(b.itemId)))[0] || null;
+}
+
 // 现场读取当前穿戴装备/时装 + 拥有符文列表（权威链上状态），构造 sweep 的装备字段。
 // 这是本次改造的核心：装备/时装每次都实时读，换装后自动跟上，绝不再套旧模板 GUID。
 async function resolveLiveLoadout() {
@@ -536,30 +550,32 @@ async function resolveLiveLoadout() {
   }
   const eqs = av.inventory.equipments || [];
   const cos = av.inventory.costumes || [];
-  // 装备槽 8 件（Lib9c ValidateEquipmentsV3 硬性要求）：
-  //   · 6 件常规：equipped=true 且类型为 WEAPON/ARMOR/BELT/NECKLACE/RING
-  //   · 气场 AURA(id=10670003) + 魔典 GRIMOIRE(id=10780009)：这两件在 GraphQL
-  //     里 equipped=false，但属于装备槽，必须按 itemId 单独取。2026-11-23 的
-  //     488 关失败正是只取了 equipped=true 的 6 件、漏了这两件。
+  // 按 itemSubType 取装备，不硬编码 itemId —— 每个角色的气场/魔典 id 都不同。
+  //   · 6 件常规：equipped=true 且类型为 WEAPON/ARMOR/BELT/NECKLACE/RING（必须）
+  //   · 气场 AURA / 魔典 GRIMOIRE：是可选增强槽，先取该角色【当前装备】的；
+  //     若该角色没装（如 tomoon 只穿 6 件），则取背包里最高级的一件补上。
+  //     历史 SUCCESS sweep 均为 8 件（bnb 488 / bnbyes 421 / tomoon 435），
+  //     补满 8 件能最大化 CP、降低 stage 降级概率。
   const regular = eqs.filter(e => e.equipped && REGULAR_EQUIP_TYPES.has(e.itemSubType));
-  const aura = eqs.filter(e => Number(e.id) === AURA_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
-  const grimoire = eqs.filter(e => Number(e.id) === GRIMOIRE_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
+  const aura = pickEquipmentSlot(eqs, AURA_SUBTYPE);
+  const grimoire = pickEquipmentSlot(eqs, GRIMOIRE_SUBTYPE);
   const equippedCo = cos.filter(c => c.equipped);
-  // 完整性护栏：装备不全就停手，宁可不 sweep 也不用错装备浪费 AP。
+  // 完整性护栏：只硬性要求 6 常规 + 2 时装（这是基础装备，缺失说明状态异常）。
+  // 气场/魔典缺失不再阻断 —— 用背包补，补不到就用现有装备构造，绝不再卡死日常。
   const missing = [];
   if (regular.length !== 6) missing.push(`常规装备=${regular.length}(期望6)`);
-  if (!aura) missing.push(`气场 id=${AURA_ITEM_ID} 缺失`);
-  if (!grimoire) missing.push(`魔典 id=${GRIMOIRE_ITEM_ID} 缺失`);
   if (equippedCo.length !== 2) missing.push(`时装=${equippedCo.length}(期望2)`);
   if (missing.length) {
     throw new Error(`当前穿戴装备不完整(${missing.join("; ")})，拒绝构造以免装备校验失败浪费 AP`);
   }
-  const equipmentIds = [...regular, aura, grimoire].map(e => uuidToDotnet(e.itemId));
+  const equipment = [...regular, ...(aura ? [aura] : []), ...(grimoire ? [grimoire] : [])];
+  const equipmentIds = equipment.map(e => uuidToDotnet(e.itemId));
   const costumeIds = equippedCo.map(c => uuidToDotnet(c.itemId));
   const ownedRuneIds = new Set((av.runes || []).map(r => Number(r.runeId)));
   return { equipmentIds, costumeIds, ownedRuneIds,
            equipCount: equipmentIds.length, costumeCount: costumeIds.length,
-           aura: { id: aura.id, level: aura.level }, grimoire: { id: grimoire.id, level: grimoire.level } };
+           aura: aura ? { id: aura.id, level: aura.level, equipped: !!aura.equipped } : null,
+           grimoire: grimoire ? { id: grimoire.id, level: grimoire.level, equipped: !!grimoire.equipped } : null };
 }
 
 // 用现场装备 + 符文槽 + 指定关卡，从零构造一个 hack_and_slash_sweep10 action。
@@ -732,12 +748,22 @@ async function spendApBySweep(ctx, ap) {
         }
       }
     } catch (e) {
-      one.error = String(e.message);
+      const emsg = String(e.message);
+      one.error = emsg;
       lastStatus = null;
+      // 本地确定性错误（装备不齐/RPC 全挂/GUID 非法）：retry 不会改变结果，
+      // 空转只会浪费时间与日志。立即告警停止 —— 这是"本轮无法自修"，不是"下轮再修"。
+      if (/装备不完整|inventory 读取失败|拒绝构造|GUID 格式非法/.test(emsg)) {
+        info.stopReason = "loadout_incomplete";
+        log({ level: "error", reward: "daily",
+              msg: `sweep 本地构造失败（确定性错误，立即告警不空转）：${emsg}`,
+              detail: emsg, attempt, ap });
+        break;
+      }
       log({ level: "warn", reward: "daily",
             msg: `sweep 第 ${attempt}/${MAX} 次异常，本轮立即重试`,
-            detail: String(e.message), attempt, ap });
-      // 只有次数硬护栏触顶才停；其余情况下一 attempt 继续修复重试。
+            detail: emsg, attempt, ap });
+      // 其余网络/未知异常：下一 attempt 继续本轮修复重试。
     }
   }
 
@@ -963,6 +989,27 @@ function selfTest() {
     if (ok) pass++;
   } catch (e) {
     console.log(`  关卡锁定测试 FAIL ${e.message}`);
+  }
+  // 2026-11-24 回归：气场/魔典按 itemSubType 取，不硬编码 id。
+  //  · bnbyes: 魔典 id=10770002(equipped) 必须被取到（旧代码硬编码 10780009 会漏）
+  //  · tomoon: 气场/魔典均未装备 → 从背包补最高级，不能再因"缺失"卡死日常
+  //  · 装备中的槽位优先于背包里更高级但未装备的（尊重当前穿戴）
+  total++;
+  {
+    const eqs = [
+      { itemId: "aa", itemSubType: "GRIMOIRE", level: 0, equipped: true },   // bnbyes 魔典
+      { itemId: "bb", itemSubType: "GRIMOIRE", level: 9, equipped: false },  // 背包里更高级
+      { itemId: "cc", itemSubType: "AURA", level: 11, equipped: false },      // 未装备气场
+      { itemId: "dd", itemSubType: "AURA", level: 3, equipped: false },
+      { itemId: "ee", itemSubType: "WEAPON", level: 6, equipped: true },
+    ];
+    const g = pickEquipmentSlot(eqs, "GRIMOIRE");
+    const a = pickEquipmentSlot(eqs, "AURA");
+    const ok = g?.itemId === "aa" && g?.level === 0 &&   // 装备的 10770002 式魔典优先
+               a?.itemId === "cc" && a?.level === 11 &&   // 未装备时补最高级气场
+               pickEquipmentSlot(eqs, "NECKLACE") === null;
+    console.log(`  装备槽按 subtype 取(bnbyes魔典/tomoon补气场/无槽返回null) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
   }
   // stage→world 派生：401-450→9, 451-500→10, 1-50→1（降级时 worldId 必须跟着变）
   total++;
