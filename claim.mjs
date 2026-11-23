@@ -31,12 +31,14 @@
  *  旧模板的装备 GUID 会被换装弄失效，链上报 ItemDoesNotExistException，反复重试
  *  永远失败（2026-11-22 赛季中就因套旧模板连续失败 30 笔无人知晓）。符文槽因
  *  GraphQL 读不到装配关系，沿用最近 SUCCESS sweep 模板的槽位并用 runes 列表校验。
- *  战场只认链上终态：失败后读 transactionResult.exceptionNames 诊断根因，
- *  装备失效→刷新穿戴装备重试；CP 不足→关卡降 10 级（worldId 重算）重试；
- *  其余→有限重试。每笔换新 id + nonce，重试前复核链上 AP 防重复提交。
- *  穷尽修复仍失败则 Step Summary 告警（含异常/关卡/装备差异），并暂缓领日常：
- *  AP 满却 sweep 未成功时直接领日常是零收益且白耗 2550 块冷却，故本轮不领，
- *  保持 AP 满、下轮修复成功后才 sweep→领。巡逻不受 AP 影响照常领。
+ *  战场只认链上终态：失败后读 transactionResult.exceptionNames 诊断根因，【本轮立即】
+ *  按维度升级修复再打 —— 装备/符文失效→重读穿戴+改空符文槽；CP 不足→关卡降 10 级
+ *  （worldId 重算），到最低关仍不够→空符文降 CP 门槛；未知→重试后叠加修复维度。
+ *  失败绝不留到下轮：在本次 job 内循环"诊断→修复→重试"直到成功，成功立即领日常。
+ *  每笔换新 id + nonce，重试前复核链上 AP 防重复提交。
+ *  仅硬护栏（最大次数/时间预算）触顶仍未成功才 Step Summary 告警（含异常/关卡/装备
+ *  差异）：AP 满却 sweep 未成功时直接领日常是零收益且白耗 2550 块冷却，故暂不领，
+ *  保持 AP 满，待下次唤醒立即重修、修成即领。巡逻不受 AP 影响照常领。
  *
  * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
  * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
@@ -213,25 +215,26 @@ const SWEEP_ENABLED = !args.includes("--no-sweep");   // 默认开启
 // 上限钳到 120：绝不能提交超过当前 AP 的值（否则 NotEnoughActionPointException）。
 const SWEEP_AP_TARGET = Math.max(1, Math.min(SWEEP_AP_THRESHOLD,
   Math.trunc(numArg("--sweep-ap", SWEEP_AP_THRESHOLD))));
-// ---- sweep 失败重试（失败/超时/异常都不要一次就降级）----
-// 连续最多 SWEEP_MAX_ATTEMPTS 次提交尝试（含首次）。每轮重试前先读链上
-// actionPoint 复核：若 AP 已被消耗，说明上一笔其实成功了（典型的「confirmTx
-// 超时但其实 SUCCESS」），立即收敛去领日常，绝不重复提交。这同时保证「AP 已
-// 被扣」一定接着领日常，避免出现扣了 120AP 却没补满的错配。
-// 链上幂等：多笔 sweep 同时上链时最多只有一笔能扣 120 AP，其余 FAILURE 无
-// 副作用 —— 重试提高成功率，但不会重复消耗 AP。全部失败则暂缓领日常（先修复再领）。
-// 默认 6 = 首次提交 + 失败后最多重试 5 次，正好对应「重试 5 次」。
-// 想少试几笔可 --sweep-attempts 3；--sweep-attempts 1 等于退回旧版单次行为。
-const SWEEP_MAX_ATTEMPTS = Math.max(1, Math.min(20, Math.trunc(numArg("--sweep-attempts", 6))));
+// ---- sweep 失败：本轮内立即诊断→立即修复→立即重试，直到成功 ----
+// 原则（用户明确要求）：发现 sweep 失败，绝不留到「下一轮」再修。同一个 job
+// 内就循环：读链上回执异常名 → 诊断根因 → 针对性修复（重读现场装备/符文、
+// 关卡兜底降级）→ 立即重试，直到成功；sweep 成功立即领日常。
+// 每轮重试前读链上 actionPoint 复核：若 AP 已被消耗，说明上一笔其实成功了
+// （confirmTx 超时但链上 SUCCESS），立即判成功去领日常，绝不重复提交。
+// 链上幂等：多笔 sweep 同时上链最多一笔扣 120 AP，其余 FAILURE 无副作用。
+// SWEEP_MAX_ATTEMPTS 仅作防死循环的硬护栏（失败交易不扣 AP 但烧 gas），不是
+// 「试几次就放弃交下一轮」——默认 20 足够覆盖装备刷新+逐级降级+重试。
+// 只有确定性不可恢复或硬护栏用尽才停止并告警人工介入，而不是推给下一轮。
+const SWEEP_MAX_ATTEMPTS = Math.max(1, Math.min(60, Math.trunc(numArg("--sweep-attempts", 20))));
 const SWEEP_RETRY_GAP_MS = Math.max(0, numArg("--sweep-retry-gap-ms", 4000));
 // 每笔 sweep 给足确认时间（与日常相同），让每次尝试尽量落到确定的终态，
 // 而不是半途 PENDING 就又提一笔、把多笔 sweep 堆在链上。
 const SWEEP_CONFIRM_TRIES = Math.max(1, Math.min(CFG.confirmTries,
   Math.trunc(numArg("--sweep-confirm-tries", CFG.confirmTries))));
-// sweep 整体硬预算：6 轮 ×(确认最多 60s + 间隔 4s) 约 6~7 分钟，留足余量，
-// 到点无论结果如何都停止 sweep（未成功则暂缓领日常），绝不因可选步骤拖过领取窗口。
+// sweep 本轮修复循环的整体硬预算：20 轮 ×(确认最多 60s + 间隔 4s) 最坏约 21 分钟，
+// 给足"发现失败→诊断→修复→重试直到成功"的时间；到点仍未成功才停止告警。
 // 注：每轮 confirmTx 最多 12×5s=60s，实际只在交易迟迟不出终态时才会跑满。
-const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 480)) * 1000;
+const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 1280)) * 1000;
 // ---- sweep 现场构造配置（2026-11-23）----
 // 扫荡关卡：固定无入场材料区（400-450 全部 entryCostItemId=0）。绝不跟随历史
 // SUCCESS 模板的 stageId —— 那可能是用户手工打的高级关（如 488 需入场材料
@@ -396,18 +399,19 @@ function shouldSweep(reward, ap) {
 }
 
 // 纯决策（不联网，供 --self-test 覆盖）：一轮 sweep 之后下一步怎么走。
-//   success — 已确认 AP 被消耗：交易回执 SUCCESS，或重试前复核链上 AP 已低于满值
-//   retry   — 本轮未成功（FAILURE/INVALID/PENDING/异常），且还有剩余次数
-//   degrade — 次数用尽，暂缓本轮日常领取（保持 AP 满，下轮修复后再领）
-// 关键点：confirmTx 超时(PENDING) 或回执 FAILURE 时，只要链上 AP 已掉下来，
-// 就说明那笔其实生效了 —— 只认链上，不认回执；否则会重复提交、白耗 nonce，
-// 甚至出现「sweep 已扣 AP、脚本却判失败去领日常」的错配。
+//   success   — 已确认 AP 被消耗：交易回执 SUCCESS，或重试前复核链上 AP 已低于满值
+//   repair    — 本轮未成功（FAILURE/INVALID/PENDING/异常）：立即诊断并按维度修复后重试
+//   exhausted — 仅在硬护栏（最大次数/时间预算）触顶时返回，才停止告警人工介入
+// 关键：没有「下轮再修」这一档。失败一律本轮内继续修复重试，直到成功再领日常。
+// 另：confirmTx 超时(PENDING) 或回执 FAILURE 时，只要链上 AP 已掉下来就说明那笔
+// 其实生效了 —— 只认链上，不认回执；否则会重复提交、白耗 nonce，甚至出现
+// 「sweep 已扣 AP、脚本却判失败去领日常」的错配。
 function sweepDecision({ txStatus, chainAp, attempt, maxAttempts }) {
   if (txStatus === "SUCCESS") return "success";
   if (chainAp !== null && chainAp !== undefined && Number.isFinite(chainAp) &&
       chainAp < SWEEP_AP_THRESHOLD) return "success";
-  if (attempt >= maxAttempts) return "degrade";
-  return "retry";
+  if (attempt >= maxAttempts) return "exhausted";
+  return "repair";
 }
 
 // 2026-11-23：只有 sweep 真正成功(status=swept)才允许领日常。
@@ -443,7 +447,7 @@ function diagnoseSweepFailure(exceptionNames) {
     return { action: "lower_stage", reason: "入场材料不足", names };
   }
   // 字段校验失败：最常见是关卡需入场材料但 action 未声明 entryCost（如 488 关），
-  // 或装备槽数量/顺序不符。降回无入场材料区 + 下轮重读装备。
+  // 或装备槽数量/顺序不符。降回无入场材料区 + 本轮立即重读装备。
   if (/InvalidActionField|EntryCost|Declared entry cost|InvalidEquipment|InvalidCostume/i.test(joined)) {
     return { action: "lower_stage", reason: "字段校验失败(入场材料/装备槽)，回退无材料区", names };
   }
@@ -584,14 +588,17 @@ function buildSweepActionLive(loadout, template, stageId) {
            stage, world, runeCount: runeInfos.length };
 }
 
-// 提交 sweep 消耗 AP（2026-11-23 重写）：现场构造 + 失败诊断自适应修复。
-// 与旧版「重试同一笔 6 次然后静默降级」的本质区别：
-//  1. 装备/时装每轮都现场读当前穿戴（换装自动跟上），不再套旧 GUID；
-//  2. 失败后读链上 exceptionNames 诊断根因，针对性修复后再打：
-//       装备失效 → 强制刷新 loadout；CP/关卡/材料不足 → stage 下调一级；
-//  3. 穷尽修复仍失败 → Step Summary 告警（含异常名/关卡/装备变化/txId），暂缓领日常。
-// 每一轮仍贯彻「只认链上」：每笔新 id + nonce；重试前复核链上 AP，已消耗立即收手；
-// 总耗时硬上限。sweep 未成功返回 status!==swept，调用方据此跳过本轮 daily（先修复再领）。
+// 提交 sweep 消耗 AP（2026-11-24 重写）：现场构造 + 本轮内失败即诊断即修复。
+// 用户铁律：一旦发现失败，立即着手修复，直到修复成功为止；修复成功立即领日常。
+//  1. 装备/时装每轮现场读当前穿戴（换装自动跟上），不再套旧 GUID；
+//  2. 失败后读链上 exceptionNames 诊断根因，当轮立即按维度升级修复再打：
+//       · 装备/符文 GUID 失效 → 强制重读 loadout（本实现每轮都重读）；
+//       · 命中失效符文 → 本轮下一次尝试改空符文槽（runeMode=none）；
+//       · CP/关卡/材料不足 → stage 下调一级（worldId 随之重算）；
+//       · 降到最低关仍不足 → 去掉符文降低 CP 门槛，继续打；
+//       · 未知/超时异常 → 同参数重试，连续多次仍未动则叠加上面的修复维度。
+//  3. 绝不"次数用尽就等下一轮"：只有硬护栏（最大次数/时间预算）触顶才停并告警。
+// 每笔新 id + nonce；重试前复核链上 AP，已消耗立即收敛去领日常（只认链上）。
 async function spendApBySweep(ctx, ap) {
   const started = Date.now();
   const MAX = SWEEP_MAX_ATTEMPTS;
@@ -601,30 +608,31 @@ async function spendApBySweep(ctx, ap) {
   };
   if (DRY) {
     info.status = "would_sweep";
-    info.msg = `演练：AP 已满，本应现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（最多 ${MAX} 次）后再领日常（未提交任何交易）`;
+    info.msg = `演练：AP 已满，本应现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP，失败即诊断修复直到成功，再领日常（未提交任何交易）`;
     log({ level: "info", reward: "daily", msg: info.msg, ap, maxAttempts: MAX });
     return info;
   }
 
-  // 现场资源：符文槽/起点关卡拉一次；装备/时装每轮重读。
-  let template = null;
+  // 现场资源与修复状态。
+  let template = null;        // 符文槽模板（首轮拉一次）
   let loadout = null;
   let stage = SWEEP_DEFAULT_STAGE;
-  let sameStageFails = 0;       // 同一关卡「非装备/非CP」失败计数，防止未知异常空转
+  let runeMode = "full";      // full=带历史符文槽；none=空符文槽（降 CP 门槛 / 绕开失效符文）
+  let sameShapeFails = 0;     // 同一(stage,runeMode)形态下连续失败次数 → 用于升级修复维度
   let lastStatus = null;
   let lastDiag = null;
 
   for (let attempt = 1; attempt <= MAX; attempt++) {
-    // 预算保护
+    // 硬护栏：本轮修复时间预算触顶才停（不是"下轮再修"）。
     if (Date.now() - started > SWEEP_BUDGET_MS) {
       log({ level: "warn", reward: "daily",
-            msg: "sweep 累计耗时达到上限，转告警并暂缓领日常",
+            msg: "sweep 本轮修复时间预算触顶，停止并告警（非等下轮）",
             elapsedMs: Date.now() - started, attempts: info.attempts });
       info.stopReason = "budget_exhausted";
       break;
     }
 
-    // 非首轮：复核链上 AP，已消耗说明此前某笔其实成功了，立即收手。
+    // 非首轮：复核链上 AP，已消耗说明此前某笔其实成功了，立即收手去领日常。
     let chainAp = null;
     if (attempt > 1) {
       if (SWEEP_RETRY_GAP_MS > 0) await new Promise(r => setTimeout(r, SWEEP_RETRY_GAP_MS));
@@ -635,7 +643,7 @@ async function spendApBySweep(ctx, ap) {
     if (pre === "success") {
       info.status = "swept";
       info.confirmedBy = "chain_ap";
-      info.msg = `复核链上 AP=${chainAp} 已消耗，此前 sweep 已生效，继续领日常`;
+      info.msg = `复核链上 AP=${chainAp} 已消耗，此前 sweep 已生效，立即领日常`;
       log({ level: "info", reward: "daily", msg: info.msg, attempts: info.attempts, chainAp });
       return info;
     }
@@ -644,13 +652,14 @@ async function spendApBySweep(ctx, ap) {
     const one = { attempt };
     info.attemptLog.push(one);
     try {
-      // 符文槽模板：首轮拉一次（仅取符文槽；装备、关卡都不取模板）。
-      // 关卡锁定 SWEEP_DEFAULT_STAGE(446, 无入场材料区)，绝不跟随历史高关。
+      // 符文槽模板首轮拉一次（仅取符文槽；装备、关卡都不取模板）。
       if (!template) template = await fetchSweepTemplate();
       // 装备/时装每轮现场重读 —— 换装后立刻跟上（修复根因）。
       loadout = await resolveLiveLoadout();
-      const built = buildSweepActionLive(loadout, template, stage);
-      one.stage = built.stage; one.world = built.world;
+      // 修复维度：runeMode=none 时丢弃全部符文槽（ Lib9c 允许无符文，CP 门槛降低）。
+      const effTemplate = runeMode === "none" ? { ...template, runeSlots: [] } : template;
+      const built = buildSweepActionLive(loadout, effTemplate, stage);
+      one.stage = built.stage; one.world = built.world; one.runeMode = runeMode;
       one.equipCount = loadout.equipCount; one.costumeCount = loadout.costumeCount;
       one.runeCount = built.runeCount;
       info.stage = built.stage; info.world = built.world;
@@ -660,9 +669,9 @@ async function spendApBySweep(ctx, ap) {
       const txId = await submitTx({ account: ctx.account, pub: ctx.pub, signer: ctx.signer, nonce, actionValue: built.action });
       one.txId = txId; info.txId = txId;
       log({ level: "info", reward: "daily",
-            msg: `AP 已满：现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（第 ${attempt}/${MAX} 次）`,
+            msg: `AP 已满：现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（修复重试第 ${attempt}/${MAX} 次）`,
             txId, stage: built.stage, world: built.world, equip: loadout.equipCount,
-            costume: loadout.costumeCount, rune: built.runeCount, attempt, maxAttempts: MAX });
+            costume: loadout.costumeCount, rune: built.runeCount, runeMode, attempt, maxAttempts: MAX });
 
       const r = await confirmTx(txId, SWEEP_CONFIRM_TRIES);
       one.txStatus = r.txStatus;
@@ -675,56 +684,66 @@ async function spendApBySweep(ctx, ap) {
       if (post === "success") {
         info.status = "swept";
         info.confirmedBy = "tx_status";
-        info.msg = `sweep 成功（第 ${attempt} 次，stage ${stage}），AP 已消耗，继续领日常`;
+        info.msg = `sweep 成功（第 ${attempt} 次，stage ${stage}, ${runeMode}符文），AP 已消耗，立即领日常`;
         log({ level: "info", reward: "daily", msg: info.msg, txId, attempts: info.attempts, stage });
         return info;
       }
 
-      // 未成功：诊断根因，决定下一轮怎么修。
+      // 未成功：立即诊断根因，当轮按维度升级修复（下一 attempt 生效）。
       const diag = diagnoseSweepFailure(r.exceptionNames);
       lastDiag = diag; one.diagnosis = diag;
       log({ level: "warn", reward: "daily",
-            msg: `sweep 第 ${attempt}/${MAX} 次未成功：${r.txStatus} / ${diag.action} / ${diag.reason}`,
-            txId, stage, names: diag.names, attempt });
+            msg: `sweep 第 ${attempt}/${MAX} 次未成功：${r.txStatus} / ${diag.action} / ${diag.reason} —— 本轮立即修复`,
+            txId, stage, runeMode, names: diag.names, attempt });
 
-      if (diag.action === "lower_stage") {
-        // CP/关卡/材料不足：下调关卡（worldId 随之重算），同关卡计数清零。
+      if (diag.action === "refresh_loadout") {
+        // 装备/符文 GUID 失效：本轮下一次尝试强制重读（本就每轮重读），并改空符文槽绕开失效符文。
+        sameShapeFails = 0;
+        one.willRefreshLoadout = true;
+        if (runeMode !== "none") { runeMode = "none"; one.willDropRunes = true; }
+      } else if (diag.action === "lower_stage") {
+        // CP/关卡/材料不足：优先逐级降关卡（worldId 随之重算）。
         if (SWEEP_CP_FALLBACK_STEP > 0 && stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
           const from = stage;
           stage -= SWEEP_CP_FALLBACK_STEP;
-          sameStageFails = 0;
-          log({ level: "info", reward: "daily", msg: `sweep 关卡降级 ${from}→${stage}（world ${worldOfStage(stage)}），下轮重试` });
+          sameShapeFails = 0;
+          log({ level: "info", reward: "daily", msg: `sweep 修复：关卡降级 ${from}→${stage}（world ${worldOfStage(stage)}），本轮立即重试` });
+        } else if (runeMode !== "none") {
+          // 已到最低关：去掉符文降低 CP 门槛，作为下一个修复维度，继续本轮重试。
+          runeMode = "none";
+          sameShapeFails = 0;
+          log({ level: "info", reward: "daily", msg: `sweep 修复：已到最低关 ${stage}，改空符文槽降低 CP 门槛，本轮立即重试` });
         } else {
-          // 已到最低关卡仍不够 → 无路可降，停止后续尝试。
-          info.stopReason = "stage_floor";
-          break;
+          // 最低关 + 空符文仍失败：形态已穷尽，计入计数让通用升级逻辑处理。
+          sameShapeFails += 1;
         }
-      } else if (diag.action === "refresh_loadout") {
-        // 装备失效：下一轮强制重读穿戴（本实现本就每轮重读，这里显式记一次）。
-        sameStageFails = 0;
-        one.willRefreshLoadout = true;
       } else {
-        // 其它/未知异常：同参数有限重试，超过就停。
-        sameStageFails += 1;
-        if (sameStageFails >= SWEEP_MAX_SAME_STAGE_RETRY) {
-          info.stopReason = "repeated_unknown_failure";
-          break;
+        // 未知/超时异常：同形态重试；连续多次不动则升级修复维度（先去符文，再降关卡）。
+        sameShapeFails += 1;
+        if (sameShapeFails >= SWEEP_MAX_SAME_STAGE_RETRY) {
+          if (runeMode !== "none") {
+            runeMode = "none";
+            log({ level: "info", reward: "daily", msg: `sweep 修复：未知异常重试未果，改空符文槽，本轮立即重试` });
+          } else if (stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
+            stage -= SWEEP_CP_FALLBACK_STEP;
+            log({ level: "info", reward: "daily", msg: `sweep 修复：未知异常重试未果，关卡降级 ${stage}（world ${worldOfStage(stage)}），本轮立即重试` });
+          }
+          sameShapeFails = 0;
         }
       }
-      if (post === "degrade") break;                     // 次数用尽
     } catch (e) {
       one.error = String(e.message);
       lastStatus = null;
       log({ level: "warn", reward: "daily",
-            msg: `sweep 第 ${attempt}/${MAX} 次异常，准备重试`,
+            msg: `sweep 第 ${attempt}/${MAX} 次异常，本轮立即重试`,
             detail: String(e.message), attempt, ap });
-      if (attempt >= MAX) break;
+      // 只有次数硬护栏触顶才停；其余情况下一 attempt 继续修复重试。
     }
   }
 
-  // 穷尽修复仍未成功：Step Summary 告警，返回给调用方跳过本轮日常领取。
+  // 硬护栏触顶仍未成功：Step Summary 告警。AP 未消耗，暂不领日常（AP 满时领=零收益）。
   info.status = "sweep_unconfirmed";
-  info.msg = `sweep 经 ${info.attempts} 次尝试仍未成功（停止原因=${info.stopReason || "attempts_exhausted"}），已告警并暂缓领日常（修复后再领）`;
+  info.msg = `sweep 本轮经 ${info.attempts} 次"诊断→修复→重试"仍未成功（硬护栏=${info.stopReason || "attempts_exhausted"}），已告警；AP 未消耗，暂不领日常，待被唤醒立即重修`;
   log({ level: "error", reward: "daily", msg: info.msg,
         attempts: info.attempts, lastTxStatus: info.txStatus ?? null,
         lastDiag, stage, ap });
@@ -805,7 +824,7 @@ async function sendSweepAlert(info, ctx) {
     `|---|---|---|---|---|---|---|`,
     attemptRows || "| - | - | - | - | - | - | - |",
     ``,
-    `> 装备/时装已现场读取当前穿戴；若仍报 ItemDoesNotExist 请检查装备是否被锁定/刚变动。日常奖励不受影响，已照常领取。`,
+    `> 本轮已按"失败即诊断→修复（重读装备/空符文/降关卡）→立即重试"循环修复仍未成功（仅硬护栏触顶才停，未推给下轮）。装备/时装均为现场读取；若仍报 ItemDoesNotExist 请检查装备是否被锁定/刚变动。AP 未消耗，日常暂不领（AP 满时领=零收益），待下次唤醒立即重修，修成即刻领取。`,
     ``,
   ].join("\n");
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
@@ -877,13 +896,27 @@ function selfTest() {
     console.log(`  shouldSweep(${rw}, ${String(apv)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
-  // 2026-11-23：只有 sweep 成功才领日常；失败/未确认/演练一律暂缓。
+  // 2026-11-24：只有 sweep 成功才领日常；失败/未确认/演练一律暂缓（本轮先修到成功）。
   total++;
   {
     const cases = [["swept", true], ["sweep_unconfirmed", false], ["skipped", false],
                    ["would_sweep", false], [null, false], [undefined, false]];
     const ok = cases.every(([s, want]) => sweepAllowsClaim(s) === want);
     console.log(`  sweep 成功才领日常(仅swept放行) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 失败不"下轮再修"：未成功一律 repair 继续本轮修复；成功才收敛放行领日常。
+  total++;
+  {
+    const flow = [
+      // 序列：失败→失败→成功，前两步必须 repair，最后 success，随后 sweepAllowsClaim 放行
+      [{ txStatus: "FAILURE", chainAp: 120, attempt: 1, maxAttempts: 20 }, "repair"],
+      [{ txStatus: "INVALID", chainAp: 120, attempt: 2, maxAttempts: 20 }, "repair"],
+      [{ txStatus: "SUCCESS", chainAp: null, attempt: 3, maxAttempts: 20 }, "success"],
+    ];
+    const ok = flow.every(([inp, want]) => sweepDecision(inp) === want) &&
+               sweepAllowsClaim("swept") === true;
+    console.log(`  失败即修复直到成功再领日常(无下轮) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
   // 现场构造：buildSweepActionLive 用传入的当前装备/符文槽从零拼 action，
@@ -982,8 +1015,8 @@ function selfTest() {
     console.log(`  现场构造锁死 ${SWEEP_AP_TARGET}AP/0药水 = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
-  // sweep 重试决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
-  // 次数未满 retry，次数用尽 degrade（暂缓领日常）。只认链上 + 有界重试。
+  // sweep 修复决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
+  // 未成功一律 repair（本轮立即修复重试，绝不"下轮再修"）；仅硬护栏触顶才 exhausted。
   const M = 6;
   const decisionCases = [
     [{ txStatus: "SUCCESS", chainAp: 120, attempt: 1, maxAttempts: M }, "success"],
@@ -991,15 +1024,15 @@ function selfTest() {
     [{ txStatus: "FAILURE", chainAp: 0,   attempt: 2, maxAttempts: M }, "success"],
     [{ txStatus: "PENDING", chainAp: 119, attempt: 3, maxAttempts: M }, "success"],
     [{ txStatus: "INVALID", chainAp: 12,  attempt: 5, maxAttempts: M }, "success"],
-    [{ txStatus: "FAILURE", chainAp: 120, attempt: 1, maxAttempts: M }, "retry"],
-    [{ txStatus: "PENDING", chainAp: 120, attempt: 3, maxAttempts: M }, "retry"],
-    [{ txStatus: "INVALID", chainAp: null,attempt: 2, maxAttempts: M }, "retry"],
-    [{ txStatus: null,      chainAp: null,attempt: 1, maxAttempts: M }, "retry"], // 异常
-    [{ txStatus: "FAILURE", chainAp: 120, attempt: 6, maxAttempts: M }, "degrade"],
-    [{ txStatus: "PENDING", chainAp: null,attempt: 6, maxAttempts: M }, "degrade"],
-    [{ txStatus: null,      chainAp: null,attempt: 6, maxAttempts: M }, "degrade"],
-    [{ txStatus: "PENDING", chainAp: NaN, attempt: 6, maxAttempts: M }, "degrade"],
-    [{ txStatus: "PENDING", chainAp: NaN, attempt: 2, maxAttempts: M }, "retry"],
+    [{ txStatus: "FAILURE", chainAp: 120, attempt: 1, maxAttempts: M }, "repair"],
+    [{ txStatus: "PENDING", chainAp: 120, attempt: 3, maxAttempts: M }, "repair"],
+    [{ txStatus: "INVALID", chainAp: null,attempt: 2, maxAttempts: M }, "repair"],
+    [{ txStatus: null,      chainAp: null,attempt: 1, maxAttempts: M }, "repair"], // 异常
+    [{ txStatus: "FAILURE", chainAp: 120, attempt: 6, maxAttempts: M }, "exhausted"],
+    [{ txStatus: "PENDING", chainAp: null,attempt: 6, maxAttempts: M }, "exhausted"],
+    [{ txStatus: null,      chainAp: null,attempt: 6, maxAttempts: M }, "exhausted"],
+    [{ txStatus: "PENDING", chainAp: NaN, attempt: 6, maxAttempts: M }, "exhausted"],
+    [{ txStatus: "PENDING", chainAp: NaN, attempt: 2, maxAttempts: M }, "repair"],
   ];
   total += decisionCases.length;
   for (const [inp, expect] of decisionCases) {
@@ -1025,13 +1058,13 @@ function selfTest() {
   } catch (e) {
     console.log(`  现场构造两次 id FAIL ${e.message}`);
   }
-  // 语义校验：默认 6 笔 = 首次 + 重试 5 次；带 --sweep-attempts 时按传入值校验
+  // 语义校验：默认 20 笔硬护栏（本轮内修到成功为止，非"6 次就等下轮"）；带 --sweep-attempts 时按传入值校验
   total++;
   {
     const expected = args.includes("--sweep-attempts")
-      ? Math.max(1, Math.min(20, Math.trunc(numArg("--sweep-attempts", 6)))) : 6;
+      ? Math.max(1, Math.min(60, Math.trunc(numArg("--sweep-attempts", 20)))) : 20;
     const ok = SWEEP_MAX_ATTEMPTS === expected;
-    console.log(`  sweep 最多 ${SWEEP_MAX_ATTEMPTS} 笔=首次+${SWEEP_MAX_ATTEMPTS - 1} 次重试（期望 ${expected}）  ${ok ? "OK" : "FAIL"}`);
+    console.log(`  sweep 硬护栏 ${SWEEP_MAX_ATTEMPTS} 笔（本轮修到成功为止，期望 ${expected}）  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
   // ---- 多角色（同一 agent 下串行处理，绝不串号 / 抢 nonce）----
@@ -1124,14 +1157,13 @@ async function watchClaim(reward, ctx, ub, snap) {
   const ap = snap?.av?.actionPoint ?? null;
   if (shouldSweep(reward, ap)) {
     rec.sweep = await spendApBySweep(ctx, ap);
-    // 2026-11-23：sweep 必须先诊断修复成功，才允许领日常。AP 满时直接领日常
-    // 是零收益还白耗一个 2550 块冷却周期；sweep 没成功就领等于白领。
-    // 失败时本轮跳过 daily，让 AP 保持满，下轮（修复后）再 sweep→领。
+    // sweep 已在内部"失败即诊断即修复直到成功"；只有成功(swept)才走到这里领日常。
+    // AP 满时直接领日常是零收益还白耗一个 2550 块冷却周期，故未成功绝不领。
     if (!sweepAllowsClaim(rec.sweep.status)) {
       rec.status = "sweep_blocked";
-      rec.msg = `日常暂缓：AP 已满但 sweep 未成功(${rec.sweep.status}/${rec.sweep.stopReason || "-"})，先修复再领`;
+      rec.msg = `日常暂不领：AP 满但本轮 sweep 硬护栏触顶仍未修成(${rec.sweep.status}/${rec.sweep.stopReason || "-"})；待唤醒立即重修，修成即领`;
       log({ level: "warn", reward, msg: rec.msg, sweep: rec.sweep.status, attempts: rec.sweep.attempts });
-      return { rec, done: false };   // 不领日常，等下一轮重新检查
+      return { rec, done: false };   // 不领日常；被再次唤醒时立即重新诊断修复
     }
   }
   if (DRY) {
@@ -1719,14 +1751,14 @@ async function main() {
     // AP 满时先 sweep 消耗（仅日常奖励）；sweep 内部等到终态，随后重新 getNonce
     if (shouldSweep(reward, avatarState.actionPoint)) {
       rec.sweep = await spendApBySweep({ account, pub, signer }, avatarState.actionPoint);
-      // 2026-11-23：sweep 未成功就不领日常（AP 满直接领=零收益+白耗冷却）。
-      // 本轮跳过 daily、不刷 dailyRewardReceivedIndex，下轮修复后再 sweep→领。
+      // sweep 已在本轮内失败即修直到成功；仅在硬护栏触顶仍未成功时不领日常
+      // （AP 满直接领=零收益+白耗冷却），不刷 dailyRewardReceivedIndex。
       if (!sweepAllowsClaim(rec.sweep.status)) {
         rec.status = "sweep_blocked";
-        rec.msg = `日常暂缓：AP 满但 sweep 未成功(${rec.sweep.status}/${rec.sweep.stopReason || "-"})，先修复再领`;
+        rec.msg = `日常暂不领：AP 满但本轮 sweep 硬护栏触顶仍未修成(${rec.sweep.status}/${rec.sweep.stopReason || "-"})；修成即领`;
         out.ok = false;
         log({ level: "warn", reward, msg: rec.msg, sweep: rec.sweep.status, attempts: rec.sweep.attempts });
-        continue;   // 跳过本轮日常提交
+        continue;   // 跳过本轮日常提交，待唤醒立即重修
       }
     }
 
