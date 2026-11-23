@@ -34,7 +34,9 @@
  *  战场只认链上终态：失败后读 transactionResult.exceptionNames 诊断根因，
  *  装备失效→刷新穿戴装备重试；CP 不足→关卡降 10 级（worldId 重算）重试；
  *  其余→有限重试。每笔换新 id + nonce，重试前复核链上 AP 防重复提交。
- *  穷尽修复仍失败则发邮件告警（含异常/关卡/装备差异），且照常领日常（不阻塞冷却）。
+ *  穷尽修复仍失败则 Step Summary 告警（含异常/关卡/装备差异），并暂缓领日常：
+ *  AP 满却 sweep 未成功时直接领日常是零收益且白耗 2550 块冷却，故本轮不领，
+ *  保持 AP 满、下轮修复成功后才 sweep→领。巡逻不受 AP 影响照常领。
  *
  * --watch 把「等待」搬进本次 job 内部：闹钟只需在解锁窗口内把 job 叫醒一次，
  * 之后由本循环按链上区块自行推进，不依赖闹钟准时、不依赖跨运行状态文件。
@@ -217,7 +219,7 @@ const SWEEP_AP_TARGET = Math.max(1, Math.min(SWEEP_AP_THRESHOLD,
 // 超时但其实 SUCCESS」），立即收敛去领日常，绝不重复提交。这同时保证「AP 已
 // 被扣」一定接着领日常，避免出现扣了 120AP 却没补满的错配。
 // 链上幂等：多笔 sweep 同时上链时最多只有一笔能扣 120 AP，其余 FAILURE 无
-// 副作用 —— 重试提高成功率，但不会重复消耗 AP。全部失败才降级照常领日常。
+// 副作用 —— 重试提高成功率，但不会重复消耗 AP。全部失败则暂缓领日常（先修复再领）。
 // 默认 6 = 首次提交 + 失败后最多重试 5 次，正好对应「重试 5 次」。
 // 想少试几笔可 --sweep-attempts 3；--sweep-attempts 1 等于退回旧版单次行为。
 const SWEEP_MAX_ATTEMPTS = Math.max(1, Math.min(20, Math.trunc(numArg("--sweep-attempts", 6))));
@@ -227,7 +229,7 @@ const SWEEP_RETRY_GAP_MS = Math.max(0, numArg("--sweep-retry-gap-ms", 4000));
 const SWEEP_CONFIRM_TRIES = Math.max(1, Math.min(CFG.confirmTries,
   Math.trunc(numArg("--sweep-confirm-tries", CFG.confirmTries))));
 // sweep 整体硬预算：6 轮 ×(确认最多 60s + 间隔 4s) 约 6~7 分钟，留足余量，
-// 到点无论结果如何都降级照常领日常，绝不因可选步骤拖过领取窗口。
+// 到点无论结果如何都停止 sweep（未成功则暂缓领日常），绝不因可选步骤拖过领取窗口。
 // 注：每轮 confirmTx 最多 12×5s=60s，实际只在交易迟迟不出终态时才会跑满。
 const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 480)) * 1000;
 // ---- sweep 现场构造配置（2026-11-23）----
@@ -396,7 +398,7 @@ function shouldSweep(reward, ap) {
 // 纯决策（不联网，供 --self-test 覆盖）：一轮 sweep 之后下一步怎么走。
 //   success — 已确认 AP 被消耗：交易回执 SUCCESS，或重试前复核链上 AP 已低于满值
 //   retry   — 本轮未成功（FAILURE/INVALID/PENDING/异常），且还有剩余次数
-//   degrade — 次数用尽，降级照常领日常（绝不阻塞领取、错失冷却窗口）
+//   degrade — 次数用尽，暂缓本轮日常领取（保持 AP 满，下轮修复后再领）
 // 关键点：confirmTx 超时(PENDING) 或回执 FAILURE 时，只要链上 AP 已掉下来，
 // 就说明那笔其实生效了 —— 只认链上，不认回执；否则会重复提交、白耗 nonce，
 // 甚至出现「sweep 已扣 AP、脚本却判失败去领日常」的错配。
@@ -406,6 +408,13 @@ function sweepDecision({ txStatus, chainAp, attempt, maxAttempts }) {
       chainAp < SWEEP_AP_THRESHOLD) return "success";
   if (attempt >= maxAttempts) return "degrade";
   return "retry";
+}
+
+// 2026-11-23：只有 sweep 真正成功(status=swept)才允许领日常。
+// 失败/未确认/演练(would_sweep)一律返回 false —— AP 满直接领日常是零收益
+// 还白耗一个 2550 块冷却周期，必须先诊断修复成功、消耗掉 AP 再领。
+function sweepAllowsClaim(status) {
+  return status === "swept";
 }
 
 // 失败根因诊断（2026-11-23）：把 exceptionNames 映射为具体修复动作，代替过去
@@ -580,9 +589,9 @@ function buildSweepActionLive(loadout, template, stageId) {
 //  1. 装备/时装每轮都现场读当前穿戴（换装自动跟上），不再套旧 GUID；
 //  2. 失败后读链上 exceptionNames 诊断根因，针对性修复后再打：
 //       装备失效 → 强制刷新 loadout；CP/关卡/材料不足 → stage 下调一级；
-//  3. 穷尽修复仍失败 → 发邮件告警（含异常名/关卡/装备变化/txId），照常领日常。
+//  3. 穷尽修复仍失败 → Step Summary 告警（含异常名/关卡/装备变化/txId），暂缓领日常。
 // 每一轮仍贯彻「只认链上」：每笔新 id + nonce；重试前复核链上 AP，已消耗立即收手；
-// 总耗时硬上限，绝不拖过领取窗口。daily_reward7 无 AP 门槛，sweep 失败不阻塞领取。
+// 总耗时硬上限。sweep 未成功返回 status!==swept，调用方据此跳过本轮 daily（先修复再领）。
 async function spendApBySweep(ctx, ap) {
   const started = Date.now();
   const MAX = SWEEP_MAX_ATTEMPTS;
@@ -609,7 +618,7 @@ async function spendApBySweep(ctx, ap) {
     // 预算保护
     if (Date.now() - started > SWEEP_BUDGET_MS) {
       log({ level: "warn", reward: "daily",
-            msg: "sweep 累计耗时达到上限，转告警并照常领日常",
+            msg: "sweep 累计耗时达到上限，转告警并暂缓领日常",
             elapsedMs: Date.now() - started, attempts: info.attempts });
       info.stopReason = "budget_exhausted";
       break;
@@ -713,9 +722,9 @@ async function spendApBySweep(ctx, ap) {
     }
   }
 
-  // 穷尽修复仍未成功：发告警邮件（不阻塞日常领取）。
+  // 穷尽修复仍未成功：Step Summary 告警，返回给调用方跳过本轮日常领取。
   info.status = "sweep_unconfirmed";
-  info.msg = `sweep 经 ${info.attempts} 次尝试仍未成功（停止原因=${info.stopReason || "attempts_exhausted"}），已告警并照常领日常`;
+  info.msg = `sweep 经 ${info.attempts} 次尝试仍未成功（停止原因=${info.stopReason || "attempts_exhausted"}），已告警并暂缓领日常（修复后再领）`;
   log({ level: "error", reward: "daily", msg: info.msg,
         attempts: info.attempts, lastTxStatus: info.txStatus ?? null,
         lastDiag, stage, ap });
@@ -868,6 +877,15 @@ function selfTest() {
     console.log(`  shouldSweep(${rw}, ${String(apv)}) = ${got}  期望 ${expect}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
+  // 2026-11-23：只有 sweep 成功才领日常；失败/未确认/演练一律暂缓。
+  total++;
+  {
+    const cases = [["swept", true], ["sweep_unconfirmed", false], ["skipped", false],
+                   ["would_sweep", false], [null, false], [undefined, false]];
+    const ok = cases.every(([s, want]) => sweepAllowsClaim(s) === want);
+    console.log(`  sweep 成功才领日常(仅swept放行) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
   // 现场构造：buildSweepActionLive 用传入的当前装备/符文槽从零拼 action，
   // 字段类型严格对齐（数字用 Text，装备/符文 GUID 用 Bytes）。
   total++;
@@ -965,7 +983,7 @@ function selfTest() {
     if (ok) pass++;
   }
   // sweep 重试决策：SUCCESS 优先；链上 AP 已消耗也判 success（超时但其实成功）；
-  // 次数未满 retry，次数用尽 degrade（降级照常领日常）。只认链上 + 有界重试。
+  // 次数未满 retry，次数用尽 degrade（暂缓领日常）。只认链上 + 有界重试。
   const M = 6;
   const decisionCases = [
     [{ txStatus: "SUCCESS", chainAp: 120, attempt: 1, maxAttempts: M }, "success"],
@@ -1106,6 +1124,15 @@ async function watchClaim(reward, ctx, ub, snap) {
   const ap = snap?.av?.actionPoint ?? null;
   if (shouldSweep(reward, ap)) {
     rec.sweep = await spendApBySweep(ctx, ap);
+    // 2026-11-23：sweep 必须先诊断修复成功，才允许领日常。AP 满时直接领日常
+    // 是零收益还白耗一个 2550 块冷却周期；sweep 没成功就领等于白领。
+    // 失败时本轮跳过 daily，让 AP 保持满，下轮（修复后）再 sweep→领。
+    if (!sweepAllowsClaim(rec.sweep.status)) {
+      rec.status = "sweep_blocked";
+      rec.msg = `日常暂缓：AP 已满但 sweep 未成功(${rec.sweep.status}/${rec.sweep.stopReason || "-"})，先修复再领`;
+      log({ level: "warn", reward, msg: rec.msg, sweep: rec.sweep.status, attempts: rec.sweep.attempts });
+      return { rec, done: false };   // 不领日常，等下一轮重新检查
+    }
   }
   if (DRY) {
     rec.status = "would_claim";
@@ -1692,6 +1719,15 @@ async function main() {
     // AP 满时先 sweep 消耗（仅日常奖励）；sweep 内部等到终态，随后重新 getNonce
     if (shouldSweep(reward, avatarState.actionPoint)) {
       rec.sweep = await spendApBySweep({ account, pub, signer }, avatarState.actionPoint);
+      // 2026-11-23：sweep 未成功就不领日常（AP 满直接领=零收益+白耗冷却）。
+      // 本轮跳过 daily、不刷 dailyRewardReceivedIndex，下轮修复后再 sweep→领。
+      if (!sweepAllowsClaim(rec.sweep.status)) {
+        rec.status = "sweep_blocked";
+        rec.msg = `日常暂缓：AP 满但 sweep 未成功(${rec.sweep.status}/${rec.sweep.stopReason || "-"})，先修复再领`;
+        out.ok = false;
+        log({ level: "warn", reward, msg: rec.msg, sweep: rec.sweep.status, attempts: rec.sweep.attempts });
+        continue;   // 跳过本轮日常提交
+      }
     }
 
     // 提交（单笔单 action）
