@@ -231,9 +231,18 @@ const SWEEP_CONFIRM_TRIES = Math.max(1, Math.min(CFG.confirmTries,
 // 注：每轮 confirmTx 最多 12×5s=60s，实际只在交易迟迟不出终态时才会跑满。
 const SWEEP_BUDGET_MS = Math.max(1000, numArg("--sweep-budget-seconds", 480)) * 1000;
 // ---- sweep 现场构造配置（2026-11-23）----
-// 起始扫荡关卡：优先取「本角色最近一笔 SUCCESS sweep」的 stageId/worldId（跟随养成），
-// 拿不到时用这里的默认。CP 不足时逐级下调（见 SWEEP_CP_FALLBACK_STEP）。
+// 扫荡关卡：固定无入场材料区（400-450 全部 entryCostItemId=0）。绝不跟随历史
+// SUCCESS 模板的 stageId —— 那可能是用户手工打的高级关（如 488 需入场材料
+// 500001×N），现场构造不带 entryCost 字段会 InvalidActionFieldException，背包
+// 没材料还会 NotEnoughMaterial。CP 不足时在 [SWEEP_MIN_STAGE, SWEEP_DEFAULT_STAGE]
+// 区间内逐级下调（见 SWEEP_CP_FALLBACK_STEP）。
 const SWEEP_DEFAULT_STAGE = Math.max(1, Math.trunc(numArg("--sweep-stage", 446)));
+// 装备槽：Lib9c ValidateEquipmentsV3 要求 8 件 = 6 常规(WEAPON/ARMOR/BELT/
+// NECKLACE/RING×2, equipped=true) + 气场(AURA) + 魔典(GRIMOIRE)。后两者在
+// GraphQL 里 equipped=false，必须按 itemId 单独取，否则只凑 6 件 → 校验失败。
+const REGULAR_EQUIP_TYPES = new Set(["WEAPON", "ARMOR", "BELT", "NECKLACE", "RING"]);
+const AURA_ITEM_ID = 10670003;       // Barrage Aura
+const GRIMOIRE_ITEM_ID = 10780009;   // SPD Grimoire(S)
 // stage→world：WorldSheet 里每 50 关一个 world（1-50→1, 401-450→9, 451-500→10…）
 function worldOfStage(stage) { return Math.ceil(Number(stage) / 50); }
 // CP 不足时每次下调的关卡数（worldId 由 worldOfStage 重算）。0=不降级，只重试。
@@ -424,6 +433,11 @@ function diagnoseSweepFailure(exceptionNames) {
   if (/NotEnoughMaterial|InsufficientMaterial|NotEnoughItem/i.test(joined)) {
     return { action: "lower_stage", reason: "入场材料不足", names };
   }
+  // 字段校验失败：最常见是关卡需入场材料但 action 未声明 entryCost（如 488 关），
+  // 或装备槽数量/顺序不符。降回无入场材料区 + 下轮重读装备。
+  if (/InvalidActionField|EntryCost|Declared entry cost|InvalidEquipment|InvalidCostume/i.test(joined)) {
+    return { action: "lower_stage", reason: "字段校验失败(入场材料/装备槽)，回退无材料区", names };
+  }
   if (!names.length) return { action: "retry", reason: "无异常名（超时/PENDING）", names };
   return { action: "retry", reason: "其它异常", names };
 }
@@ -472,19 +486,20 @@ async function fetchSweepTemplate() {
           const av = v.get("avatarAddress");
           if (!Buffer.isBuffer(av) || !av.equals(mine)) continue;
           const runeSlots = [...v.get("runeInfos")].map(slot => [...slot].map(x => String(x)));
-          const stageId = Number(String(v.get("stageId")));
-          const worldId = Number(String(v.get("worldId")));
-          return { runeSlots, stageId, worldId, source: `mimir@${it.blockIndex}` };
+          // 注意：只取符文槽。绝不取该交易的 stageId —— 那可能是用户手工打的
+          // 高级关（如 488 需入场材料 500001×N），现场构造不带 entryCost 字段
+          // 会 InvalidActionFieldException。关卡固定用 SWEEP_DEFAULT_STAGE（无入场
+          // 材料区），符文槽沿用历史 SUCCESS 即可（换符文后由 ownedRuneIds 过滤）。
+          return { runeSlots, source: `mimir@${it.blockIndex}` };
         }
       }
     }
   } catch (e) {
     log({ level: "warn", msg: "拉取历史 sweep 符文槽失败（将用空符文槽现场构造）", detail: String(e.message) });
   }
-  // 找不到 SUCCESS 模板：符文槽用空（Lib9c 允许不装符文），关卡用默认——
-  // 装备仍现场读，所以不会重蹈「套旧装备」覆辙；只是少了符文加成，CP 可能不够触发降级。
-  return { runeSlots: [], stageId: SWEEP_DEFAULT_STAGE,
-           worldId: worldOfStage(SWEEP_DEFAULT_STAGE), source: "default" };
+  // 找不到 SUCCESS 模板：符文槽用空（Lib9c 允许不装符文）——
+  // 装备仍现场读，只是少了符文加成，CP 可能不够触发降级。
+  return { runeSlots: [], source: "default" };
 }
 
 // 现场读取当前穿戴装备/时装 + 拥有符文列表（权威链上状态），构造 sweep 的装备字段。
@@ -508,18 +523,30 @@ async function resolveLiveLoadout() {
   }
   const eqs = av.inventory.equipments || [];
   const cos = av.inventory.costumes || [];
-  // 当前穿戴的常规装备（equipped=true）。Lib9c 校验的是「背包里存在这些 GUID」，
-  // 因此 tuned 后装/换装都能通过；只要 equipped 标记可靠即可。
-  const equippedEq = eqs.filter(e => e.equipped);
+  // 装备槽 8 件（Lib9c ValidateEquipmentsV3 硬性要求）：
+  //   · 6 件常规：equipped=true 且类型为 WEAPON/ARMOR/BELT/NECKLACE/RING
+  //   · 气场 AURA(id=10670003) + 魔典 GRIMOIRE(id=10780009)：这两件在 GraphQL
+  //     里 equipped=false，但属于装备槽，必须按 itemId 单独取。2026-11-23 的
+  //     488 关失败正是只取了 equipped=true 的 6 件、漏了这两件。
+  const regular = eqs.filter(e => e.equipped && REGULAR_EQUIP_TYPES.has(e.itemSubType));
+  const aura = eqs.filter(e => Number(e.id) === AURA_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
+  const grimoire = eqs.filter(e => Number(e.id) === GRIMOIRE_ITEM_ID).sort((a, b) => (b.level || 0) - (a.level || 0))[0] || null;
   const equippedCo = cos.filter(c => c.equipped);
-  if (!equippedEq.length) {
-    throw new Error("当前无 equipped 装备，拒绝构造（宁可不 sweep 也不用空装备浪费 AP）");
+  // 完整性护栏：装备不全就停手，宁可不 sweep 也不用错装备浪费 AP。
+  const missing = [];
+  if (regular.length !== 6) missing.push(`常规装备=${regular.length}(期望6)`);
+  if (!aura) missing.push(`气场 id=${AURA_ITEM_ID} 缺失`);
+  if (!grimoire) missing.push(`魔典 id=${GRIMOIRE_ITEM_ID} 缺失`);
+  if (equippedCo.length !== 2) missing.push(`时装=${equippedCo.length}(期望2)`);
+  if (missing.length) {
+    throw new Error(`当前穿戴装备不完整(${missing.join("; ")})，拒绝构造以免装备校验失败浪费 AP`);
   }
-  const equipmentIds = equippedEq.map(e => uuidToDotnet(e.itemId));
+  const equipmentIds = [...regular, aura, grimoire].map(e => uuidToDotnet(e.itemId));
   const costumeIds = equippedCo.map(c => uuidToDotnet(c.itemId));
   const ownedRuneIds = new Set((av.runes || []).map(r => Number(r.runeId)));
   return { equipmentIds, costumeIds, ownedRuneIds,
-           equipCount: equipmentIds.length, costumeCount: costumeIds.length };
+           equipCount: equipmentIds.length, costumeCount: costumeIds.length,
+           aura: { id: aura.id, level: aura.level }, grimoire: { id: grimoire.id, level: grimoire.level } };
 }
 
 // 用现场装备 + 符文槽 + 指定关卡，从零构造一个 hack_and_slash_sweep10 action。
@@ -608,11 +635,9 @@ async function spendApBySweep(ctx, ap) {
     const one = { attempt };
     info.attemptLog.push(one);
     try {
-      // 符文槽/关卡模板：首轮拉一次（仅取符文槽，装备绝不取模板）。
+      // 符文槽模板：首轮拉一次（仅取符文槽；装备、关卡都不取模板）。
+      // 关卡锁定 SWEEP_DEFAULT_STAGE(446, 无入场材料区)，绝不跟随历史高关。
       if (!template) template = await fetchSweepTemplate();
-      if (stage === SWEEP_DEFAULT_STAGE && Number.isFinite(template.stageId)) {
-        stage = Math.max(SWEEP_MIN_STAGE, Math.trunc(template.stageId));
-      }
       // 装备/时装每轮现场重读 —— 换装后立刻跟上（修复根因）。
       loadout = await resolveLiveLoadout();
       const built = buildSweepActionLive(loadout, template, stage);
@@ -861,11 +886,32 @@ function selfTest() {
       Buffer.isBuffer(v.get("id")) && v.get("id").length === 16 &&
       [...v.get("equipments")][0].equals(eq) &&
       // 不在 ownedRuneIds 的 99999 必须被过滤掉（换符文后失效）
-      [...v.get("runeInfos")].length === 2;
-    console.log(`  现场构造 action(装备/符文/字段类型) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+      [...v.get("runeInfos")].length === 2 &&
+      // 2026-11-23：绝不携带 entryCost 字段（关卡锁定无入场材料区），
+      // 否则高关要求声明入场材料，缺失会 InvalidActionFieldException。
+      ![...v.keys()].map(String).some(k => /entryCost/i.test(k));
+    console.log(`  现场构造 action(装备/符文/字段类型/无入场材料字段) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   } catch (e) {
     console.log(`  现场构造 action FAIL ${e.message}`);
+  }
+  // 2026-11-23 回归：关卡锁定 SWEEP_DEFAULT_STAGE，绝不从历史高关模板继承 stageId。
+  // fetchSweepTemplate 只返回 runeSlots/source，不含 stageId/worldId。这里验证
+  // 即使传入一个带 stageId=488 的模板，buildSweepActionLive 仍用调用方给的 stage。
+  total++;
+  try {
+    const co = Buffer.from("22".repeat(16), "hex");
+    const loadout = { equipmentIds: [Buffer.from("11".repeat(16), "hex")], costumeIds: [co], ownedRuneIds: new Set() };
+    const tplWithHighStage = { runeSlots: [], stageId: 488, worldId: 10, source: "mimir@fake" };
+    const b = buildSweepActionLive(loadout, tplWithHighStage, SWEEP_DEFAULT_STAGE);
+    const v = b.action.get("values");
+    const ok = String(v.get("stageId")) === String(SWEEP_DEFAULT_STAGE) &&
+      String(v.get("worldId")) === String(worldOfStage(SWEEP_DEFAULT_STAGE)) &&
+      ![...v.keys()].map(String).some(k => /entryCost/i.test(k));
+    console.log(`  关卡锁定默认关(忽略模板488,无入场材料字段) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  关卡锁定测试 FAIL ${e.message}`);
   }
   // stage→world 派生：401-450→9, 451-500→10, 1-50→1（降级时 worldId 必须跟着变）
   total++;
@@ -900,6 +946,7 @@ function selfTest() {
       [[null, "Nekoyume.Action.NotEnoughCombatPointException", null], "lower_stage"],
       [["Nekoyume.Action.InvalidStageException"], "lower_stage"],
       [["Nekoyume.Action.NotEnoughMaterialException"], "lower_stage"],
+      [["Nekoyume.Exceptions.InvalidActionFieldException"], "lower_stage"],
       [[], "retry"],
       [["SomeWeirdException"], "retry"],
     ];
