@@ -26,25 +26,54 @@
  *        id -> 新的 randomBytes(16)（每笔必须不同，否则被判重复交易）
  *        s  -> 当前赛季号（模板是历史赛季，不改会 InvalidAdventureBossSeasonException）
  *      其余字段一字不改，保证链上装备/符文/等级校验与那笔已成功交易完全一致。
- *   3) 赛季号从「当前赛季窗口内、链上其他玩家 SUCCESS 的 adventure boss 交易」解析，
- *      因为 Sweep.Execute 会校验 latestSeason.Season == Season，SUCCESS 交易的 s
- *      必然就是当时的当前赛季号。解析不到就拒绝提交，绝不臆测；可用 --season 覆盖。
- *   4) 每笔串行：重新取 nextTxNonce -> 签名 -> stageTransaction -> 只认链上终态
- *      (SUCCESS/FAILURE/INVALID)。同一 signer 绝不并发抢 nonce。
- *   5) 第一笔非 SUCCESS 立即停止，不把剩下的次数继续扔上去白跑。
+ *   3) 赛季号优先读链上 LatestSeason state（SeasonInfo，赛季一开启即写入，不依赖索引），
+ *      再用「本季窗口内 SUCCESS 的 adventure boss 交易」交叉校验；两者都没有才拒绝提交，
+ *      绝不臆测。Mimir 全局索引在新赛季早期经常还没覆盖，故另备「本角色交易」兜底。
+ *      可用 --season 覆盖。
+ *   4) 提交策略分两种模式（默认「批量模式」，AB 专用）：
+ *
+ *      【批量模式 batch · 默认】AB 是可重复执行、失败可事后补齐的操作，
+ *      不像日常/巡逻奖励那样「一次机会、重复领取就浪费」，因此不逐笔等终态：
+ *        · 整批开始取一次链上 nextTxNonce，之后本地严格 +1 连续递增，
+ *          同一 signer 绝不并发抢号；每笔独立 id（16 随机字节）。
+ *        · 每笔只做「签名 -> stageTransaction」，笔间留 --gap-ms（默认 2000ms，
+ *          略大于实测单笔提交耗时），不查链上终态。
+ *        · 全部提交完做一次「总复核」：并行轮询所有 txId 的终态，
+ *          只认 SUCCESS/FAILURE/INVALID，INCLUDED/STAGING 不算结论。
+ *        · 统计链上 SUCCESS 数；不足目标次数则按差额再补一轮（重新取链上
+ *          nextTxNonce 起步），最多 --max-rounds 轮。
+ *        · 防「伪 INVALID」：节点尚未索引刚提交的 txId 时会短暂返回
+ *          INVALID + blockIndex=null + 无异常名，这不是真终态，继续等；
+ *          复核时对每个 txId 跨全部 RPC 节点取结果，任一节点已决即采信。
+ *
+ *      【逐笔模式 confirm-each · --confirm-each】旧行为，便于排查/保守场景：
+ *        每笔重新取 nextTxNonce -> 签名 -> stageTransaction -> 等链上终态，
+ *        第一笔非 SUCCESS 立即收手。日常/巡逻奖励链(claim.mjs)仍是这个策略，
+ *        本文件不会影响它。
+ *
+ *   5) 两种模式都只认链上终态，都保证 nonce 不并发、每笔 id 唯一；
+ *      批量模式把「等确认」从「每笔一次」压缩成「整批一次」，是提速的关键。
  *
  * 成本提醒（SweepAdventureBoss.Execute 源码）：
  *   requiredPotion = explorer.Floor * sweep_ap(=1)，每笔真扣 AP 药水(500000)。
  *   即「每笔消耗 = 你当前赛季已通关层数 × 1 瓶」。29 层 -> 29 瓶/笔，10 笔 = 290 瓶。
- *   FAILURE 时异常回滚不扣药水。脚本不预判层数（链上未暴露该字段），
+ *   FAILURE/INVALID 时异常回滚不扣药水。脚本不预判层数（链上未暴露该字段），
  *   只做「总药水 >= 次数」的最低门槛检查，真实消耗由链上裁决。
  *
  * 用法：
  *   node sweep-boss.mjs --self-test                 纯逻辑自测，不联网
  *   node sweep-boss.mjs --dry-run                  联网读链并构造 10 笔，不提交
  *   node sweep-boss.mjs --dry-run --times 5        预览 5 笔
- *   node sweep-boss.mjs --times 10                 真实连发 10 笔
+ *   node sweep-boss.mjs --times 10                 批量提交 10 笔 + 末尾总复核 + 自动补齐
+ *   node sweep-boss.mjs --times 10 --gap-ms 1500   调整笔间间隔
+ *   node sweep-boss.mjs --times 10 --confirm-each  回退到逐笔等终态的旧模式
  *   node sweep-boss.mjs --times 10 --season 1429   手工指定赛季号
+ *
+ * 批量模式参数：
+ *   --gap-ms N             笔间间隔，默认 2000（应略大于单笔提交耗时）
+ *   --final-tries N        总复核最多轮询轮数，默认 12
+ *   --final-interval-ms N  总复核轮询间隔，默认 3000（并行查全部 txId，不随笔数增长）
+ *   --max-rounds N         最多「提交+复核」轮数（含补齐），默认 3
  *
  * 依赖：@planetarium/{account,tx,bencodex,lib9c}（见同目录 package.json）
  */
@@ -82,6 +111,10 @@ const CFG = {
   api9c: "https://api.9capi.com",
   confirmTries: 12,
   confirmIntervalMs: 5000,
+  // 批量模式（AB 专用）：不等每笔终态，整批提交完再一次性复核 + 自动补齐
+  finalTries: 12,          // 总复核最多轮询轮数
+  finalIntervalMs: 3000,   // 总复核轮询间隔（并行查全部 txId，不随笔数线性增长）
+  maxRounds: 3,            // 最多「提交+复核」轮数，防止无限补齐
 };
 
 const TYPE_ID = "sweep_adventure_boss";
@@ -124,11 +157,23 @@ const numArg = (flag, def) => {
   return i >= 0 && Number.isFinite(Number(args[i + 1])) ? Number(args[i + 1]) : def;
 };
 const TIMES = Math.max(1, Math.min(50, Math.trunc(numArg("--times", 10))));
-const GAP_MS = Math.max(0, numArg("--gap-ms", 1500));
+// 批量模式笔间间隔：默认 2000ms，实测单笔「签名+stageTransaction」约 300~900ms，
+// 2s 略大于单笔耗时，既让节点消化上一笔、又不浪费时间等链上终态。
+const GAP_MS = Math.max(0, numArg("--gap-ms", 2000));
 const seasonArgIdx = args.indexOf("--season");
 const SEASON_OVERRIDE = seasonArgIdx >= 0 && /^\d+$/.test(String(args[seasonArgIdx + 1] || ""))
   ? BigInt(args[seasonArgIdx + 1]) : null;
 const NO_GEAR_REFRESH = args.includes("--no-gear-refresh");
+// 逐笔模式（旧行为）开关：默认走批量模式。日常/巡逻奖励链不受影响。
+const CONFIRM_EACH = args.includes("--confirm-each");
+// 硬门槛：sweep 前必须确认本角色本季真实通关层数 >= MIN_FLOOR，否则拒绝提交。
+// 2026-11-24 血泪教训：floor=27 时误做 20 笔 sweep，每笔少拿第28层积分约6000+分，
+// 20 笔共损失约 12万~14万分。用户定下铁律：没冲过目标层绝不 sweep。
+// 默认 28；可用 --min-floor N 覆盖；--min-floor 0 显式关闭校验（不推荐）。
+const MIN_FLOOR = Math.max(0, Math.min(30, Math.trunc(numArg("--min-floor", 28))));
+const FINAL_TRIES = Math.max(1, Math.min(60, Math.trunc(numArg("--final-tries", CFG.finalTries))));
+const FINAL_INTERVAL_MS = Math.max(200, numArg("--final-interval-ms", CFG.finalIntervalMs));
+const MAX_ROUNDS = Math.max(1, Math.min(10, Math.trunc(numArg("--max-rounds", CFG.maxRounds))));
 
 function log(obj) { console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj })); }
 
@@ -167,30 +212,58 @@ async function getTip() {
 
 // 9CAPI 赛季状态：只用来判断「赛季进行中」+ 拿到窗口与 BOSS 名（纯展示，不参与判断）
 async function getSeasonStatus() {
+  // 2026-11-24 修复：9capi 的 /adventureBossHeimdallStatus（及其 heimdall6 节点）
+  // 卡在旧赛季(1458)，返回陈旧/finished=true 会误拦截。改为从最新节点的
+  // LatestSeason raw state 读权威赛季元数据（season/start/end/bossId）。
+  const ls = await fetchSeasonFromChainState();
+  if (!ls || !ls.start || !ls.end) {
+    // 兜底：仍尝试旧 REST 端点
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 30000);
+    try {
+      const r = await fetch(CFG.api9c + "/adventureBossHeimdallStatus", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ avatarAddress: CFG.avatarAddress }), signal: ctrl.signal,
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      if (typeof j.startBlockIndex !== "number" || typeof j.endBlockIndex !== "number") throw new Error("赛季状态字段缺失");
+      return { finished: !!j.finished, start: BigInt(j.startBlockIndex), end: BigInt(j.endBlockIndex),
+        bossId: j.bossId ?? null, bossName: j.bossName || "未知",
+        floor: typeof j.floor === "number" ? j.floor : null, raw: j };
+    } finally { clearTimeout(t); }
+  }
+  const BOSS_NAME = { 211000: "Surtr", 211001: "Laufey", 211002: "Jormungandr", 211003: "Hella" };
+  const tip = await getTip();
+  return {
+    finished: tip.tip > BigInt(ls.end),
+    start: BigInt(ls.start), end: BigInt(ls.end),
+    bossId: ls.bossId ?? null,
+    bossName: BOSS_NAME[ls.bossId] || "未知",
+    floor: null,   // 该脚本对 floor 只做提示、不硬拦截；个人层数以第一笔链上终态为准
+    raw: ls,
+  };
+}
+
+// 读本角色本季「真实通关层数」floor —— 唯一权威是 9capi heimdall6 的
+// adventureBossSeasonStatus（该节点 2026-11-24 已恢复同步）。返回 floor 或 null。
+// 注意：绝不能用「交易笔数推算」代替——explore 受 CP 限制打不满，推算会虚报。
+async function getMyRealFloor() {
+  const q = `query($a:Address!){ stateQuery { adventureBossSeasonStatus(avatarAddress:$a){
+    floor maxFloor bossId finished startBlockIndex endBlockIndex } } }`;
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 30000);
+  const t = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const r = await fetch(CFG.api9c + "/adventureBossHeimdallStatus", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ avatarAddress: CFG.avatarAddress }),
-      signal: ctrl.signal,
-    });
+    const url = "https://heimdall6.9capi.com/graphql";
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q, variables: { a: CFG.avatarAddress } }), signal: ctrl.signal });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
-    if (typeof j.startBlockIndex !== "number" || typeof j.endBlockIndex !== "number") {
-      throw new Error("赛季状态字段缺失");
-    }
-    return {
-      finished: !!j.finished,
-      start: BigInt(j.startBlockIndex),
-      end: BigInt(j.endBlockIndex),
-      bossId: j.bossId ?? null,
-      bossName: j.bossName || "未知",
-      floor: typeof j.floor === "number" ? j.floor : null,
-      raw: j,
-    };
-  } finally { clearTimeout(t); }
+    const s = j.data?.stateQuery?.adventureBossSeasonStatus;
+    return s && typeof s.floor === "number" ? { floor: s.floor, maxFloor: s.maxFloor,
+      bossId: s.bossId, start: BigInt(s.startBlockIndex), end: BigInt(s.endBlockIndex) } : null;
+  } catch (_) { return null; }
+  finally { clearTimeout(t); }
 }
 
 // 从一段 action raw 解出赛季号：sweep/unlock_floor 用 `s`，explore 用 `season`。
@@ -232,6 +305,64 @@ async function fetchCurrentSeason(status) {
   }
   if (!found.length) return null;
   found.sort((a, b) => (a.season === b.season ? 0 : a.season > b.season ? 1 : -1));
+  return found[found.length - 1];
+}
+
+// ---- 赛季号兜底（新赛季早期 Mimir 全局索引还没覆盖时）----
+// 兜底 1：直接读链上 LatestSeason 状态。这是最权威的硬事实，赛季一开启就写入，
+//   完全不依赖交易索引是否追上。存储位置（Lib9c AdventureBossModule.cs / SeasonInfo.cs）：
+//     accountAddress = Addresses.AdventureBoss = 0x…0100
+//     address        = LatestSeasonAddress    = 全零地址
+//     value          = List[Season, StartBlockIndex, EndBlockIndex, NextStartBlockIndex, BossId]
+//   实测编码为 Bencodex Text（u…）或 Integer（i…e）混编，两种都要兼容。
+const ADVENTURE_BOSS_ACCOUNT = "0x0000000000000000000000000000000000000100";
+const LATEST_SEASON_KEY = "0x0000000000000000000000000000000000000000";
+
+// 纯函数，供 --self-test 覆盖：把 state hex 解成赛季号等字段，解不出返回 null
+function parseLatestSeasonState(hexOrNull) {
+  if (!hexOrNull || typeof hexOrNull !== "string") return null;
+  const raw = hexOrNull.startsWith("0x") ? hexOrNull.slice(2) : hexOrNull;
+  if (!/^[0-9a-fA-F]+$/.test(raw) || raw.length % 2 !== 0) return null;
+  let list;
+  try { list = decode(Buffer.from(raw, "hex")); } catch (_) { return null; }
+  if (!Array.isArray(list) || list.length < 5) return null;
+  const asNum = (x) => {
+    if (typeof x === "bigint") return Number(x);
+    if (typeof x === "number") return Number.isSafeInteger(x) ? x : null;
+    const s = Buffer.isBuffer(x) ? x.toString("utf8") : String(x);
+    return /^\d+$/.test(s) && Number.isSafeInteger(Number(s)) ? Number(s) : null;
+  };
+  const [season, start, end, nextStart, bossId] = list.slice(0, 5).map(asNum);
+  if (season === null || !Number.isSafeInteger(season) || season <= 0) return null;
+  return { season: BigInt(season), start, end, nextStart, bossId };
+}
+
+async function fetchSeasonFromChainState() {
+  const q = "query($a:Address!,$c:Address!){ state(address:$a, accountAddress:$c) }";
+  const d = await gqlRpc(q, { a: LATEST_SEASON_KEY, c: ADVENTURE_BOSS_ACCOUNT });
+  return parseLatestSeasonState(d.data?.state);
+}
+
+// 兜底 2：本角色本赛季窗口内 SUCCESS 的 adventure boss 交易。
+//   sweep/explore/unlock_floor 在 Execute 里都硬性要求 Season == 当前赛季，
+//   所以能 SUCCESS 的交易，其 s/season 必然就是当前赛季号（排除 wanted）。
+async function fetchSeasonFromMyTxs(status, take = 160) {
+  const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:${take}){
+    items { blockIndex object { txStatus actions { typeId raw } } } } }`;
+  const d = await gql(CFG.mimir, q, { a: CFG.avatarAddress });
+  const found = [];
+  for (const it of d.data?.transactions?.items || []) {
+    const blk = BigInt(it.blockIndex);
+    if (blk < status.start || blk > status.end) continue;
+    if (it.object?.txStatus !== "SUCCESS") continue;
+    for (const ac of it.object?.actions || []) {
+      if (!AB_TYPES.has(ac.typeId) || !ac.raw) continue;
+      const s = readSeasonFromRaw(ac.raw);
+      if (s !== null) found.push({ season: s, blk, typeId: ac.typeId });
+    }
+  }
+  if (!found.length) return null;
+  found.sort((a, b) => (a.blk === b.blk ? 0 : a.blk > b.blk ? 1 : -1));
   return found[found.length - 1];
 }
 
@@ -440,7 +571,9 @@ async function confirmTx(txId) {
     try {
       const d = await gqlRpc(q, { t: txId });
       const r = d.data?.transaction?.transactionResult;
-      if (r && isTerminalTxStatus(r.txStatus)) return r;
+      // 伪 INVALID 防护：节点尚未索引到刚提交的 txId 时会短暂返回
+      // INVALID + blockIndex=null + 无异常名，这不是真终态，继续轮询。
+      if (r && isTerminalTxStatus(r.txStatus) && !isPhantomInvalid(r)) return r;
     } catch (_) { /* 节点还没索引到 */ }
     if (i < CFG.confirmTries - 1) await new Promise((r) => setTimeout(r, CFG.confirmIntervalMs));
   }
@@ -450,7 +583,148 @@ async function confirmTx(txId) {
 // 纯决策（不联网，供 --self-test 覆盖）：一笔的链上终态出来后，是否继续下一笔。
 // 只有 SUCCESS 才继续；FAILURE/INVALID/PENDING/异常一律收手，避免把剩余次数
 // 继续扔上去白跑（每笔都要等确认，且失败原因多半不会自己消失）。
+// 仅逐笔模式使用。
 function shouldContinue(txStatus) { return txStatus === "SUCCESS"; }
+
+// ---------------- 批量模式：跨节点终态查询 / 伪 INVALID 防护 ----------------
+const RESULT_Q = "query($t:TxId!){ transaction { transactionResult(txId:$t){ txStatus blockIndex exceptionNames } } }";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 「伪 INVALID」：节点还没索引到刚提交的 txId 时，transactionResult 会短暂返回
+// INVALID + blockIndex=null + 无异常名。这不是真终态，稍后通常会变成 SUCCESS。
+// 纯函数，供 --self-test 覆盖。
+function isPhantomInvalid(r) {
+  if (!r || r.txStatus !== "INVALID") return false;
+  if (r.blockIndex !== null && r.blockIndex !== undefined) return false;
+  const names = (r.exceptionNames || []).filter(Boolean);
+  return names.length === 0;
+}
+
+// 跨全部 RPC 节点查一笔终态：任一节点给出「已决」结果就采信。
+// 优先级：SUCCESS > FAILURE > 真 INVALID > 伪 INVALID(视为未决) > 未决。
+// 这样即使主节点落后、别的节点已索引，也不会误判成失败。
+async function queryResultAcrossNodes(txId) {
+  // 并行问所有节点：耗时约等于「一次 RPC 往返」，不随节点数增长。
+  const rs = await Promise.all(CFG.rpcUrls.map(async (url) => {
+    try {
+      const d = await gql(url, RESULT_Q, { t: txId }, 20000);
+      const r = d.data?.transaction?.transactionResult;
+      return (r && !d.errors) ? r : null;
+    } catch (_) { return null; }
+  }));
+  const results = rs.filter(Boolean);
+  const decisive = results.filter((r) => isTerminalTxStatus(r.txStatus) && !isPhantomInvalid(r));
+  if (decisive.length) {
+    // 多节点不一致时，SUCCESS 优先（链上成功是唯一能推进的终态）
+    const ok = decisive.find((r) => r.txStatus === "SUCCESS");
+    return ok || decisive[0];
+  }
+  // 全是伪 INVALID / 中间态 / 无响应 -> 未决
+  return null;
+}
+
+// 总复核：并行轮询一批 txId 的链上终态，直到全部出结论或轮数用尽。
+// 关键：所有 txId 在每一轮里「并行」查，耗时不随笔数线性增长。
+async function reconcileBatch(pending, tries, intervalMs) {
+  const settled = new Map();          // txId -> 终态结果
+  let left = pending.map((p) => p.txId);
+  for (let k = 0; k < tries && left.length; k++) {
+    const rs = await Promise.all(left.map((id) => queryResultAcrossNodes(id)));
+    const next = [];
+    for (let j = 0; j < left.length; j++) {
+      if (rs[j]) settled.set(left[j], rs[j]);
+      else next.push(left[j]);
+    }
+    left = next;
+    if (left.length) await sleep(intervalMs);
+  }
+  return {
+    settled,
+    unresolved: left,                 // 到轮数用尽仍未出结论的 txId
+  };
+}
+
+// 纯决策：下一轮还应新提交多少笔。供 --self-test 覆盖。
+// 关键：未决(pending)的交易可能已经成功，先占位、不重复提交，
+// 避免对「还在飞」的交易重复扣药水 / 多刷。只有明确少了才补差额。
+function planBatchNeed(target, successSoFar, pendingCount) {
+  return Math.max(0, target - successSoFar - pendingCount);
+}
+
+// ---------------- 批量编排（可注入依赖，供 --self-test 离线演练）----------------
+// 把「连续提交 -> 总复核 -> 按差额补齐」的循环抽成可测函数：所有网络副作用
+// 通过 deps 注入。自测里用 mock 就能演练完整流程，不联网、不提交、不消耗 AP。
+async function runBatchLoop(deps) {
+  const {
+    target, maxRounds, gapMs = 0, gap = sleep,
+    planNeed = planBatchNeed,
+    freshNonce,        // () => Promise<nonce|null>，真实取链上 nextTxNonce
+    submitOne,         // (nonce) => Promise<txId|null>，内部含有限重试
+    reconcile,         // (pending) => Promise<{settled:Map<txId,r>, unresolved:txId[]}>
+    onLog = () => {},
+  } = deps;
+
+  const results = [], pending = [];
+  let cursor = null, submitted = 0, success = 0, round = 0;
+
+  while (round < maxRounds) {
+    round++;
+    const chain = await freshNonce();
+    if (chain !== null && chain !== undefined && (cursor === null || chain > cursor)) cursor = chain;
+    if (cursor === null) throw new Error("无法取得批量提交的起始 nonce");
+
+    // 未决交易可能已成功，先占位不重复提交
+    const need = planNeed(target, success, pending.length);
+    onLog({ msg: "轮开始", round, maxRounds, need, successSoFar: success,
+      pending: pending.length, startNonce: String(cursor) });
+
+    if (need > 0) {
+      for (let j = 0; j < need; j++) {
+        const nonce = cursor;
+        let txId = null;
+        for (let a = 1; a <= 3 && !txId; a++) {
+          txId = await submitOne(nonce);
+          if (!txId && a < 3) await gap(gapMs);
+        }
+        if (!txId) {
+          // 提交失败：nonce 游标不推进，下一轮会用同一个 nonce 补上，
+          // 保证链上 nonce 连续、不留空洞。
+          onLog({ msg: "单笔提交连续失败，本轮停止提交，nonce 不推进", nonce: String(nonce) });
+          break;
+        }
+        cursor = typeof cursor === "bigint" ? cursor + 1n : cursor + 1;
+        const item = { i: ++submitted, txId, nonce: typeof nonce === "bigint" ? Number(nonce) : nonce };
+        results.push({ ...item, txStatus: "PENDING", exceptionNames: [] });
+        pending.push(item);
+        onLog({ msg: "已提交", submitted, txId, nonce: item.nonce });
+        if (j < need - 1 && gapMs > 0) await gap(gapMs);
+      }
+    }
+
+    // 末尾总复核：并行查所有未决 txId，跨节点取终态，伪 INVALID 不算结论
+    if (pending.length) {
+      const rec = await reconcile(pending);
+      for (const [txId, r] of rec.settled) {
+        const row = results.find((x) => x.txId === txId);
+        if (row) {
+          row.txStatus = r.txStatus;
+          row.exceptionNames = r.exceptionNames || [];
+          row.blockIndex = r.blockIndex ?? null;
+        }
+      }
+      const still = pending.filter((p) => rec.unresolved.includes(p.txId));
+      pending.length = 0;
+      pending.push(...still);
+    }
+
+    success = results.filter((x) => x.txStatus === "SUCCESS").length;
+    const failed = results.filter((x) => x.txStatus === "FAILURE" || x.txStatus === "INVALID").length;
+    onLog({ msg: "轮完成", round, success, failed, unresolved: pending.length, submitted });
+    if (success >= target) break;
+    if (pending.length === 0 && planNeed(target, success, 0) === 0) break;
+  }
+  return { results, success, pending, rounds: round, submitted };
+}
 
 // 失败原因的人话解释
 function explainFailure(r) {
@@ -469,7 +743,7 @@ function explainFailure(r) {
 }
 
 // ---------------- 自测（纯逻辑，不联网） ----------------
-function selfTest() {
+async function selfTest() {
   let pass = 0, fail = 0;
   const ok = (name, cond) => { if (cond) { pass++; console.log(`  PASS  ${name}`); } else { fail++; console.log(`  FAIL  ${name}`); } };
 
@@ -520,11 +794,30 @@ function selfTest() {
 
   // 6) 参数边界
   ok("TIMES 钳制在 1..50", TIMES >= 1 && TIMES <= 50);
-  // 7) 连发决策：只有 SUCCESS 继续，其余一律收手
+  // 7) 逐笔模式决策：只有 SUCCESS 继续，其余一律收手
   for (const [s, expect] of [["SUCCESS", true], ["FAILURE", false], ["INVALID", false],
     ["PENDING", false], ["INCLUDED", false], [null, false]]) {
     ok(`shouldContinue(${String(s)})`, shouldContinue(s) === expect);
   }
+  // 7b) 批量模式：伪 INVALID 识别（节点未索引，不是真终态）
+  ok("伪 INVALID：INVALID+blockIndex=null+空异常名", isPhantomInvalid({
+    txStatus: "INVALID", blockIndex: null, exceptionNames: [] }));
+  ok("伪 INVALID：exceptionNames 含 null 也算空", isPhantomInvalid({
+    txStatus: "INVALID", blockIndex: null, exceptionNames: [null, null] }));
+  ok("真 INVALID：有 blockIndex 不算伪", !isPhantomInvalid({
+    txStatus: "INVALID", blockIndex: 11829844, exceptionNames: [] }));
+  ok("真 INVALID：有异常名不算伪", !isPhantomInvalid({
+    txStatus: "INVALID", blockIndex: null, exceptionNames: ["InvalidSeasonException"] }));
+  ok("SUCCESS/FAILURE 不是伪 INVALID", !isPhantomInvalid({ txStatus: "SUCCESS", blockIndex: 1, exceptionNames: [] })
+    && !isPhantomInvalid({ txStatus: "FAILURE", blockIndex: 1, exceptionNames: [] }));
+  ok("null 结果不是伪 INVALID", !isPhantomInvalid(null));
+  // 7c) 批量模式：补齐笔数决策（pending 占位，避免重复提交）
+  ok("planBatchNeed 10 笔全未提交=10", planBatchNeed(10, 0, 0) === 10);
+  ok("planBatchNeed 已成功 10 笔=0", planBatchNeed(10, 10, 0) === 0);
+  ok("planBatchNeed 成功 8 + 未决 2 = 0（不重复补）", planBatchNeed(10, 8, 2) === 0);
+  ok("planBatchNeed 成功 7 + 失败已定 3 笔=3（补差额）", planBatchNeed(10, 7, 0) === 3);
+  ok("planBatchNeed 成功 7 + 未决 1 = 2", planBatchNeed(10, 7, 1) === 2);
+  ok("planBatchNeed 超额成功返回 0（不出现负数）", planBatchNeed(10, 12, 3) === 0);
   // 8) 失败解释
   ok("药水不足有专门提示", /AP 药水/.test(explainFailure({ exceptionNames: ["NotEnoughMaterialException"] })));
   ok("未通关有专门提示", /首层/.test(explainFailure({ exceptionNames: ["InvalidOperationException"] })));
@@ -556,6 +849,89 @@ function selfTest() {
   // 关键回归：Mimir 旧值 566 绝不能再被当成真值
   ok("Mimir 旧值 566 不等于 V2 真值 14268", 566 !== 14268);
 
+  // 10) 赛季号兜底：链上 LatestSeason state 解析（Text / Integer 两种编码都要兼容）
+  // 1434 赛季链上真实值：l u4:1434 u8:11791016 u8:11792816 u8:11795516 u6:211003 e
+  const LS_TEXT_HEX = "6c75343a3134333475383a313137393130313675383a313137393238313675383a313137393535313675363a32313130303365";
+  const ls = parseLatestSeasonState(LS_TEXT_HEX);
+  ok("LatestSeason Text 编码解析 season=1434", ls && ls.season === 1434n);
+  ok("LatestSeason Text 编码解析 start/end/boss", ls && ls.start === 11791016 && ls.end === 11792816 && ls.bossId === 211003);
+  ok("LatestSeason 支持 0x 前缀", parseLatestSeasonState("0x" + LS_TEXT_HEX)?.season === 1434n);
+  const intEncoded = Buffer.from(encode([
+    1434n, 11791016n, 11792816n, 11795516n, 211003n,
+  ])).toString("hex");
+  ok("LatestSeason Integer 编码解析 season=1434", parseLatestSeasonState(intEncoded)?.season === 1434n);
+  ok("LatestSeason 少于 5 元素返回 null", parseLatestSeasonState(Buffer.from(encode([1434n, 1n])).toString("hex")) === null);
+  ok("LatestSeason 非 hex 返回 null", parseLatestSeasonState("zzzz") === null);
+  ok("LatestSeason 奇长度 hex 返回 null", parseLatestSeasonState("abc") === null);
+  ok("LatestSeason null/空返回 null", parseLatestSeasonState(null) === null && parseLatestSeasonState("") === null);
+  ok("LatestSeason 首元素非法返回 null", parseLatestSeasonState(Buffer.from(encode([
+    "oops", 1n, 2n, 3n, 4n,
+  ])).toString("hex")) === null);
+
+  // 11) 批量模式离线演练（mock 注入，不联网、不提交、不消耗 AP）
+  // 用可控剧本跑完整 runBatchLoop，验证 nonce 连续性 / 补齐 / 伪 INVALID / 轮数上限。
+  // script(nonce, call)：call 是「第几次总复核」，据此可确定性地安排剧本。
+  const mkR = (s) => ({ txStatus: s, blockIndex: 1, exceptionNames: [] });
+  const mockRun = (opts) => {
+    let nonce = 72420n, call = 0, submitFailed = false;
+    return runBatchLoop({
+      target: opts.target ?? 4, maxRounds: opts.maxRounds ?? 3, gapMs: 0,
+      gap: async () => {},
+      freshNonce: async () => nonce,           // 链上值固定，靠内部游标推进
+      submitOne: async (n) => {
+        if (opts.failSubmitAt && Number(n) === opts.failSubmitAt && !submitFailed) {
+          submitFailed = true; return null;    // 模拟一次提交失败
+        }
+        return `tx-${Number(n)}`;
+      },
+      reconcile: async (p) => {
+        call++;
+        const settled = new Map(), unresolved = [];
+        for (const it of p) {
+          const r = opts.script(it.nonce, call);
+          if (r === "UNRESOLVED") unresolved.push(it.txId);
+          else settled.set(it.txId, mkR(r));
+        }
+        return { settled, unresolved };
+      },
+      onLog: () => {},
+    });
+  };
+
+  // A) 全部 SUCCESS：一轮达标，提交 4 笔，nonce 连续
+  const A = await mockRun({ script: () => "SUCCESS" });
+  ok("演练A 全部成功：1 轮达标", A.rounds === 1 && A.success === 4 && A.submitted === 4);
+  ok("演练A nonce 连续 72420..72423", A.results.every((r, i) => r.nonce === 72420 + i));
+  ok("演练A 无未决", A.pending.length === 0);
+
+  // B) 首轮 72421/72423 两笔 FAILURE：第 2 轮补齐 2 笔，最终 success=4、提交 6 笔
+  const B = await mockRun({
+    script: (n, call) => (call === 1 && (n === 72421 || n === 72423) ? "FAILURE" : "SUCCESS"),
+  });
+  ok("演练B 最终达标 success=4", B.success === 4);
+  ok("演练B 触发补齐：提交 6 笔", B.submitted === 6 && B.rounds === 2);
+  ok("演练B 无未决残留", B.pending.length === 0);
+  ok("演练B nonce 连续 72420..72425", B.results.every((r, i) => r.nonce === 72420 + i));
+
+  // C) 伪 INVALID 表现为 UNRESOLVED：首轮 2 笔未决，不应重复提交，第 2 轮复核转 SUCCESS
+  const C = await mockRun({
+    maxRounds: 3,
+    script: (n, call) => (call === 1 && (n === 72421 || n === 72422) ? "UNRESOLVED" : "SUCCESS"),
+  });
+  ok("演练C 未决交易不重复提交（submitted=4）", C.submitted === 4);
+  ok("演练C 后续复核转成功、最终达标", C.success === 4 && C.pending.length === 0);
+
+  // D) 单笔提交失败：nonce 不推进，下一轮用同一 nonce 补上，链上 nonce 连续
+  const D = await mockRun({ target: 3, maxRounds: 3, failSubmitAt: 72421, script: () => "SUCCESS" });
+  ok("演练D 提交失败后仍能达标", D.success === 3);
+  const dNonces = [...new Set(D.results.map((r) => r.nonce))].sort((a, b) => a - b);
+  ok("演练D nonce 无空洞/无重复", dNonces.length === 3 && dNonces[2] - dNonces[0] === 2);
+
+  // E) 轮数上限：始终 UNRESOLVED，不无限循环，且如实留下未决、不盲目补齐
+  const E = await mockRun({ target: 3, maxRounds: 2, script: () => "UNRESOLVED" });
+  ok("演练E 轮数用尽即收敛", E.rounds === 2 && E.success === 0);
+  ok("演练E 未决如实保留、未盲目补齐", E.pending.length === 3 && E.submitted === 3);
+
   console.log(`\n  self-test: ${pass} passed, ${fail} failed`);
   return fail === 0;
 }
@@ -564,7 +940,7 @@ function selfTest() {
 async function main() {
   if (SELF_TEST) {
     console.log("=== 9C Adventure Boss 一键 Sweep · 纯逻辑自测 ===");
-    return selfTest() ? 0 : 1;
+    return (await selfTest()) ? 0 : 1;
   }
 
   log({ level: "info", msg: "一键连续 Sweep 启动", times: TIMES, dryRun: DRY, avatar: CFG.avatarAddress });
@@ -606,14 +982,65 @@ async function main() {
       + "脚本不据此拦截，最终以第一笔链上终态为准。", reportedFloor: status.floor });
   }
 
-  // 3) 当前赛季号
+  // 2.5) 硬门槛（2026-11-24 铁律）：没冲过目标层绝不 sweep。
+  // 每笔 sweep 从 fl=1 累加到 explorer.Floor 逐层抽积分；少一层=每笔少该层积分≈6000+分，
+  // 20 笔≈12万~14万分，损失巨大。故提交前必须读到真实 floor >= MIN_FLOOR。
+  // 读不到真实 floor（节点故障）时也拒绝——宁可不刷，也不冒虚报风险。
+  if (MIN_FLOOR > 0) {
+    const real = await getMyRealFloor();
+    if (!real) {
+      throw new Error(`无法从 heimdall6 读到本角色真实通关层数，拒绝 sweep（铁律：没确认冲过 ${MIN_FLOOR} 层不 sweep）。`);
+    }
+    // 交叉校验：真实 floor 所在赛季窗口必须与链上 LatestSeason 一致，防止节点陈旧
+    if (real.start !== status.start || real.end !== status.end) {
+      throw new Error(`heimdall6 个人状态窗口[${real.start},${real.end}]与链上[${status.start},${status.end}]不一致，节点可能滞后，拒绝 sweep。`);
+    }
+    log({ level: "info", msg: "硬门槛校验：本角色真实通关层数", realFloor: real.floor,
+      maxFloor: real.maxFloor, minFloor: MIN_FLOOR });
+    if (real.floor < MIN_FLOOR) {
+      throw new Error(`本角色真实只通关到第 ${real.floor} 层，未达门槛 ${MIN_FLOOR} 层——拒绝 sweep（每少一层/笔≈6000+分，绝不冒险）。请先在游戏里冲过第 ${MIN_FLOOR} 层再跑。`);
+    }
+  }
+
+  // 3) 当前赛季号：链上 LatestSeason state 为权威，Mimir 交易解析为辅 + 交叉校验
   let season, seasonSource;
   if (SEASON_OVERRIDE !== null) {
     season = SEASON_OVERRIDE; seasonSource = "--season 手工指定";
   } else {
-    const hit = await fetchCurrentSeason(status);
-    if (!hit) throw new Error("无法从链上解析当前赛季号（本赛季窗口内还没有任何成功的 adventure boss 交易）。请用 --season N 手工指定，或稍后再试。");
-    season = hit.season; seasonSource = `Mimir ${hit.typeId}@${hit.blk} (SUCCESS)`;
+    // 3a) 链上硬事实：赛季一开启就有，不受 Mimir 索引滞后影响
+    let chainSeason = null;
+    try {
+      const ls = await fetchSeasonFromChainState();
+      if (ls) {
+        chainSeason = ls.season;
+        log({ level: "info", msg: "链上 LatestSeason state", season: Number(ls.season),
+          start: ls.start, end: ls.end, bossId: ls.bossId });
+      }
+    } catch (e) {
+      log({ level: "warn", msg: "链上 LatestSeason state 读取失败，降级用交易解析", err: String(e.message).slice(0, 140) });
+    }
+
+    // 3b) 交易解析（全局优先，其次本角色）
+    let txHit = await fetchCurrentSeason(status);
+    let txSource = txHit ? `Mimir 全局 ${txHit.typeId}@${txHit.blk} (SUCCESS)` : null;
+    if (!txHit) {
+      txHit = await fetchSeasonFromMyTxs(status);
+      txSource = txHit ? `Mimir 本角色 ${txHit.typeId}@${txHit.blk} (SUCCESS)` : null;
+    }
+
+    if (chainSeason !== null) {
+      season = chainSeason; seasonSource = "链上 LatestSeason state";
+      if (txHit && txHit.season !== chainSeason) {
+        log({ level: "warn", msg: "交易解析赛季号与链上状态不一致，以链上为准",
+          txSeason: Number(txHit.season), chainSeason: Number(chainSeason), txSource });
+      } else if (txHit) {
+        seasonSource += `（与 ${txSource} 一致）`;
+      }
+    } else if (txHit) {
+      season = txHit.season; seasonSource = txSource;
+    } else {
+      throw new Error("无法解析当前赛季号：链上 LatestSeason state 读不到，且本赛季窗口内本角色/全局都没有成功的 adventure boss 交易。请用 --season N 手工指定，或稍后再试。");
+    }
   }
   log({ level: "info", msg: "当前赛季号", season: Number(season), source: seasonSource });
 
@@ -648,6 +1075,8 @@ async function main() {
 
   // 6) dry-run：构造 N 笔并做字节级校验，绝不提交
   if (DRY) {
+    log({ level: "info", msg: "本次运行模式", mode: CONFIRM_EACH ? "confirm-each（逐笔等终态）" : "batch（连续提交+末尾总复核+补齐）",
+      gapMs: GAP_MS, finalTries: FINAL_TRIES, finalIntervalMs: FINAL_INTERVAL_MS, maxRounds: MAX_ROUNDS });
     log({ level: "info", msg: "DRY-RUN：以下仅预览，不会提交任何交易" });
     for (let i = 1; i <= TIMES; i++) {
       const a = buildSweepAction(rawHex, season);
@@ -663,34 +1092,100 @@ async function main() {
     return 0;
   }
 
-  // 7) 真实连发：串行、每笔重取 nonce、只认链上终态
+  // 7) 真实连发
   const results = [];
-  for (let i = 1; i <= TIMES; i++) {
-    const nonce = await getNonce(signer.toString());
-    const actionValue = buildSweepAction(rawHex, season);
-    const txId = await submitTx({ account, pub, signer, nonce, actionValue });
-    log({ level: "info", msg: `已提交第 ${i}/${TIMES} 笔`, txId, nonce: Number(nonce) });
-    const r = await confirmTx(txId);
-    results.push({ i, txId, nonce: Number(nonce), txStatus: r.txStatus,
-      exceptionNames: r.exceptionNames || [] });
-    log({ level: r.txStatus === "SUCCESS" ? "info" : "error",
-      msg: `第 ${i}/${TIMES} 笔链上终态`, txId, txStatus: r.txStatus,
-      blockIndex: r.blockIndex ?? null, exceptionNames: r.exceptionNames || [] });
 
-    if (!shouldContinue(r.txStatus)) {
-      log({ level: "error", msg: "停止连发（第一笔非 SUCCESS 即收手，不白跑剩余次数）",
-        reason: explainFailure(r), txId, at: i });
-      break;
+  // ---- 逐笔模式（--confirm-each，旧行为）----
+  // 每笔重新取 nonce、等链上终态，第一笔非 SUCCESS 立即收手。
+  // 日常/巡逻奖励链仍是这个策略，但那是 claim.mjs，不受本文件影响。
+  if (CONFIRM_EACH) {
+    for (let i = 1; i <= TIMES; i++) {
+      const nonce = await getNonce(signer.toString());
+      const actionValue = buildSweepAction(rawHex, season);
+      const txId = await submitTx({ account, pub, signer, nonce, actionValue });
+      log({ level: "info", msg: `已提交第 ${i}/${TIMES} 笔`, txId, nonce: Number(nonce) });
+      const r = await confirmTx(txId);
+      results.push({ i, txId, nonce: Number(nonce), txStatus: r.txStatus,
+        exceptionNames: r.exceptionNames || [] });
+      log({ level: r.txStatus === "SUCCESS" ? "info" : "error",
+        msg: `第 ${i}/${TIMES} 笔链上终态`, txId, txStatus: r.txStatus,
+        blockIndex: r.blockIndex ?? null, exceptionNames: r.exceptionNames || [] });
+      if (!shouldContinue(r.txStatus)) {
+        log({ level: "error", msg: "停止连发（第一笔非 SUCCESS 即收手，不白跑剩余次数）",
+          reason: explainFailure(r), txId, at: i });
+        break;
+      }
+      if (i < TIMES && GAP_MS > 0) await sleep(GAP_MS);
     }
-    if (i < TIMES && GAP_MS > 0) await new Promise((r2) => setTimeout(r2, GAP_MS));
+    const okCount = results.filter((x) => x.txStatus === "SUCCESS").length;
+    log({ level: "info", msg: "本次连发结束", mode: "confirm-each", requested: TIMES,
+      submitted: results.length, success: okCount, season: Number(season), results });
+    console.log(JSON.stringify({ summary: true, mode: "confirm-each", requested: TIMES,
+      submitted: results.length, success: okCount, season: Number(season), results }, null, 2));
+    return okCount === TIMES ? 0 : 1;
   }
 
-  const okCount = results.filter((x) => x.txStatus === "SUCCESS").length;
-  log({ level: "info", msg: "本次连发结束", requested: TIMES, submitted: results.length,
-    success: okCount, season: Number(season), results });
-  console.log(JSON.stringify({ summary: true, requested: TIMES, submitted: results.length,
-    success: okCount, season: Number(season), results }, null, 2));
-  return okCount === TIMES ? 0 : 1;
+  // ---- 批量模式（默认，AB 专用）----
+  // 连续提交 N 笔（笔间只留 --gap-ms，不等链上终态）-> 末尾一次性总复核
+  // -> 按链上 SUCCESS 数与目标的差额自动补齐，最多 --max-rounds 轮。
+  log({ level: "info", msg: "批量模式启动：连续提交 + 末尾总复核 + 自动补齐",
+    mode: "batch", times: TIMES, gapMs: GAP_MS, finalTries: FINAL_TRIES,
+    finalIntervalMs: FINAL_INTERVAL_MS, maxRounds: MAX_ROUNDS });
+
+  const batch = await runBatchLoop({
+    target: TIMES, maxRounds: MAX_ROUNDS, gapMs: GAP_MS,
+    // 起始 nonce 取链上真实进度（runBatchLoop 内部用 max(链上值, 本地游标)
+    // 防止节点索引滞后导致撞号）；每笔构造独立 id 并做 3 次提交重试。
+    freshNonce: async () => {
+      try { return await getNonce(signer.toString()); }
+      catch (e) {
+        log({ level: "warn", msg: "起始 nonce 读取失败，交由内部游标兜底", err: String(e?.message || e) });
+        return null;
+      }
+    },
+    submitOne: async (nonce) => {
+      const actionValue = buildSweepAction(rawHex, season);
+      let txId = null, lastErr = null;
+      for (let attempt = 1; attempt <= 3 && !txId; attempt++) {
+        try { txId = await submitTx({ account, pub, signer, nonce, actionValue }); }
+        catch (e) { lastErr = String(e?.message || e); if (attempt < 3) await sleep(GAP_MS); }
+      }
+      if (!txId) {
+        log({ level: "error", msg: "单笔 stageTransaction 连续 3 次失败（nonce 不推进）",
+          nonce: Number(nonce), err: lastErr });
+      }
+      return txId;
+    },
+    reconcile: async (p) => {
+      log({ level: "info", msg: "末尾总复核开始", checking: p.length,
+        tries: FINAL_TRIES, intervalMs: FINAL_INTERVAL_MS });
+      return reconcileBatch(p, FINAL_TRIES, FINAL_INTERVAL_MS);
+    },
+    onLog: (o) => log({ level: "info", ...o }),
+  });
+
+  // 明确失败的原因打一条人话提示（不改变「只认终态」的结论）
+  for (const row of batch.results) {
+    if (row.txStatus === "FAILURE" || row.txStatus === "INVALID") {
+      log({ level: "warn", msg: "一笔链上终态非 SUCCESS", txId: row.txId,
+        txStatus: row.txStatus, reason: explainFailure(row) });
+    }
+  }
+  // 收尾：轮数用尽仍未出终态的交易，如实标注，绝不盲目补齐（避免重复扣药水）
+  for (const p of batch.pending) {
+    log({ level: "warn", msg: "总复核轮数用尽后仍未出链上终态，不盲目补齐，请事后按 txId 复查",
+      txId: p.txId, nonce: p.nonce });
+  }
+  const failedCount = batch.results.filter((x) => x.txStatus === "FAILURE" || x.txStatus === "INVALID").length;
+  log({ level: "info", msg: "本次连发结束", mode: "batch", requested: TIMES,
+    submitted: batch.submitted, success: batch.success, failed: failedCount,
+    unresolved: batch.pending.length, rounds: batch.rounds, season: Number(season),
+    results: batch.results });
+  console.log(JSON.stringify({ summary: true, mode: "batch", requested: TIMES,
+    submitted: batch.submitted, success: batch.success, failed: failedCount,
+    unresolved: batch.pending.length, rounds: batch.rounds, season: Number(season),
+    results: batch.results }, null, 2));
+  return batch.success === TIMES ? 0 : 1;
 }
 
 main().then((code) => { process.exitCode = code; })
