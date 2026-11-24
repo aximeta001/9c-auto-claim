@@ -84,8 +84,8 @@ const CFG = {
   avatarAddress: ENV.NC_AVATAR || "0xAC9D450C69dF27ee290C90EC61c4B76154b0A21c",
   privateKey: ENV.NC_PRIVATE_KEY || "",
   rpcUrls: [
-    "https://heimdall6.9capi.com/graphql",
     "https://heimdall-rpc-1.nine-chronicles.com/graphql",
+    "https://heimdall6.9capi.com/graphql",
   ],
   // 个人赛季状态只在 heimdall6 上暴露（adventureBossSeasonStatus）
   statusUrl: "https://heimdall6.9capi.com/graphql",
@@ -181,7 +181,13 @@ async function getTip() {
   return BigInt(d.data.nodeStatus.tip.index);
 }
 
-// 权威：Heimdall 节点上的个人 Explorer 赛季状态
+// 个人 Explorer 赛季状态。
+// 个人赛季状态：heimdall6 的 adventureBossSeasonStatus 是唯一暴露真实 floor/maxFloor
+// 的权威字段。2026-11-24 曾因该节点临时卡在旧块而改用「Mimir 交易笔数推算 floor」，
+// 但 explore 推进受 CP 限制、交易 raw 里也没有 floor 字段，推算会把 floor 虚报成 maxFloor，
+// 导致误判达标、虚报爬到 30 层（实际只到 27）——已废弃该推算。
+// 现状：以真实字段为准，并用最新节点的 LatestSeason 赛季元数据做一致性校验；
+// 节点若落后/不一致，直接抛错停止，绝不拿推算值去提交交易。
 async function getMySeasonStatus() {
   const q = `query($a:Address!){ stateQuery { adventureBossSeasonStatus(avatarAddress:$a){
     floor maxFloor bossId name finished startBlockIndex endBlockIndex
@@ -191,13 +197,32 @@ async function getMySeasonStatus() {
     throw new Error("读取 adventureBossSeasonStatus 失败: " + (d.errors?.[0]?.message || "空结果"));
   }
   const s = d.data.stateQuery.adventureBossSeasonStatus;
-  return {
+  const st = {
     floor: Number(s.floor), maxFloor: Number(s.maxFloor), bossId: Number(s.bossId),
     bossName: s.name, finished: !!s.finished,
     start: BigInt(s.startBlockIndex), end: BigInt(s.endBlockIndex),
     usedApPotion: Number(s.usedApPotion), usedGoldenDust: Number(s.usedGoldenDust),
     usedNcg: Number(s.usedNcg),
   };
+
+  // 一致性校验：heimdall6 的赛季窗口必须和最新节点 LatestSeason 一致；
+  // 若节点落后（返回旧赛季），宁可停止也不提交——避免用错赛季/虚报状态。
+  try {
+    const ls = await fetchSeasonFromChainState();   // 最新节点 chain raw state
+    if (ls) {
+      const chainStart = BigInt(ls.start), chainEnd = BigInt(ls.end);
+      if (chainStart !== st.start || chainEnd !== st.end || Number(ls.bossId) !== st.bossId) {
+        throw new Error(
+          `heimdall6 个人状态落后于链上：字段窗口=[${st.start},${st.end}] boss=${st.bossId}，` +
+          `链上窗口=[${chainStart},${chainEnd}] boss=${ls.bossId}。等待节点同步后再运行，拒绝用陈旧状态提交。`
+        );
+      }
+    }
+  } catch (e) {
+    // 校验失败（含落后检测抛出的错）一律向上抛，不能吞掉
+    throw e;
+  }
+  return st;
 }
 
 // 从 action raw 解赛季号：sweep/unlock 用 `s`，explore 用 `season`
@@ -629,27 +654,35 @@ async function main() {
       txId, nonce: Number(nonce), floorBefore: st.floor, maxFloorBefore: st.maxFloor });
 
     const conf = await confirmOne(txId, FINAL_TRIES, FINAL_INTERVAL_MS);
-    if (!conf.ok) {
-      log({ level: "error", msg: "交易未成功，停止", kind: isUnlock ? "unlock" : "explore",
-        txId, status: conf.result.txStatus, why: explainFailure(conf.result) });
-      timeline.push({ kind: isUnlock ? "unlock" : "explore", txId, ok: false, status: conf.result.txStatus });
-      return 2;
-    }
-    timeline.push({ kind: isUnlock ? "unlock" : "explore", txId, ok: true,
-      status: conf.result.txStatus, blockIndex: conf.result.blockIndex ?? null });
 
-    // 等链上状态索引更新后再进入下一轮（explore 打不动时 floor 不涨会自然重试）
+    // 只认链上终态：即使记录的 txId 是网络重试产生的"影子"(PENDING/INVALID)，
+    // 只要重读状态发现 floor/maxFloor 已推进，就说明同内容交易其实 SUCCESS 了，继续推进。
+    // 2026-11-24：曾因影子 txId 判 INVALID 而误停，实际状态已到 floor10/max15。
     const before = { floor: st.floor, maxFloor: st.maxFloor };
     let after = null;
-    for (let w = 0; w < 5; w++) {
+    for (let w = 0; w < (conf.ok ? 5 : 8); w++) {
       await sleep(GAP_MS);
       try {
         const s2 = await getMySeasonStatus();
         after = { floor: s2.floor, maxFloor: s2.maxFloor };
-        const moved = s2.floor > before.floor || s2.maxFloor > before.maxFloor || s2.floor >= target || s2.finished;
+        const moved = s2.floor > before.floor || s2.maxFloor > before.maxFloor || s2.floor >= target;
         if (moved) break;
       } catch (_) { /* 稍后重试读取 */ }
     }
+    const advanced = after && (after.floor > before.floor || after.maxFloor > before.maxFloor);
+    if (!conf.ok && !advanced) {
+      log({ level: "error", msg: "交易未成功且链上状态未推进，停止", kind: isUnlock ? "unlock" : "explore",
+        txId, status: conf.result.txStatus, why: explainFailure(conf.result), before, after });
+      timeline.push({ kind: isUnlock ? "unlock" : "explore", txId, ok: false, status: conf.result.txStatus });
+      return 2;
+    }
+    if (!conf.ok && advanced) {
+      log({ level: "info", msg: "记录的txId非SUCCESS，但链上状态已推进（影子交易SUCCESS），继续",
+        kind: isUnlock ? "unlock" : "explore", shadowTxId: txId, shadowStatus: conf.result.txStatus, before, after });
+    }
+    timeline.push({ kind: isUnlock ? "unlock" : "explore", txId, ok: true,
+      status: conf.ok ? conf.result.txStatus : "SUCCESS(shadow)", blockIndex: conf.result.blockIndex ?? null });
+
     log({ level: "info", msg: "交易成功，链上状态", kind: isUnlock ? "unlock" : "explore",
       before, after: after || "读取失败" });
 
