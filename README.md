@@ -1,5 +1,8 @@
 # 9C 自动挂机（Heimdall）：奖励领取 + 市场扫货 + 无限塔冲塔 + AB 爬楼
 
+> ⚠️ **动手前必读 [`RULES.md`](./RULES.md)**：AB/sweep 铁律（没冲过 28 层绝不 sweep、
+> 层数只认链上权威字段、门票只用 Golden Dust）、通用交易纪律、动手前检查清单。
+
 本仓库含**两条相互独立的纯 GitHub 自接力链**、**两条纯手工触发的 AB 链**，外加**一条无限塔新赛季冲塔链**：
 
 | 链 | workflow | 脚本 | 作用 | 触发 |
@@ -72,8 +75,17 @@ AB 与领奖链的**风险模型不同**：领取是「一次机会、重复领�
 
 需要回退到旧的「每笔等终态」时加 `--confirm-each`（workflow 里勾 `confirm_each`）。**领奖链 `claim.mjs` 不受影响**，仍是逐笔复核 + 幂等锁。
 
+> **铁律（2026-11-24 血泪教训）：没冲过目标层，绝不 sweep。**
+> `SweepAdventureBoss.cs` 的积分是 `for fl=1..explorer.Floor` 逐层各抽一次、累加进 `explorer.Score`（赛季排名分）。少打第 28 层 = 每笔 sweep 少抽一次第 28 层积分 ≈ **6000+ 分**，20 笔就是 **约 12 万~14 万分**，且这部分直接决定奖励占比，绝不是「差异极小」。
+> 事故经过：heimdall6 节点一度卡在旧赛季，`explore-boss.mjs` 被临时改成「用 Mimir 交易笔数推算 floor」，而 `explore_adventure_boss` 受 CP 限制打不满、raw 里也没有层数——推算把 floor 虚报成 30（真实只到 27），脚本据此提前收手，20 笔 sweep 全在 27 层做，白丢约 12 万+ 分。
+> 因此现在有**两道硬闸**：
+> 1. `explore-boss.mjs` 的 `getMySeasonStatus()` 只认 heimdall6 真实 `floor/maxFloor`，并用链上 `LatestSeason` 窗口做一致性校验；节点落后就报错停，**绝不再用交易笔数推算**。
+> 2. `sweep-boss.mjs` 提交前必读真实 `floor`，`floor < --min-floor`（默认 28）或读不到 / 窗口不一致，一律**拒绝 sweep**。层数从交易推算这条路已彻底废弃。
+> 以后流程：**先把角色真实冲过 28 层（读链上 floor 确认）→ 再跑 sweep**，顺序不可颠倒。
+
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `--min-floor` | 28 | **硬门槛**：本角色真实通关层数必须 ≥ 此值才 sweep，否则拒绝（0=关闭，不推荐） |
 | `--gap-ms` | 2000 | 笔间间隔，应略大于单笔提交耗时 |
 | `--final-tries` | 12 | 总复核最多轮询轮数 |
 | `--final-interval-ms` | 3000 | 总复核轮询间隔（并行查全部 txId，不随笔数增长） |
