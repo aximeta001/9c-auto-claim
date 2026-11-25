@@ -106,6 +106,25 @@ const EXCLUDE_TICKERS = new Set([
   "RUNESTONE_STUN_ARENA",           // Stun Rune (Arena)，最易混淆
 ]);
 const RUNE_SHEET_NAME = "Stun Rune (Adventure)";
+const EMPTY_TICKERS = new Set();
+
+// ---------------- 第二目标：Draupnir（德劳普尼尔符文） ----------------
+// RuneSheet (Mimir sheet "RuneSheet")：
+//   10060,Draupnir,RUNESTONE_DRAUPNIR   ← 目标，全表仅此一条，无 Arena 变体
+// 与 Stun Rune 一样：符文是 FUNGIBLE_ASSET_VALUE，身份就是 ticker，市场接口
+// 不支持 itemIds 过滤（实测 500），故仍以 ticker 全等匹配，名字不参与判定。
+const DRAUP = {
+  enabled: !args.includes("--no-draupnir"),
+  ticker: "RUNESTONE_DRAUPNIR",
+  runeId: 10060,
+  name: "Draupnir",
+  // 单价红线 40 NCG/个 = 4000 minor。判定：price*100 <= 4000*quantity
+  maxUnitPriceMinor: BigInt(Math.max(0, Math.trunc(numArg("--draupnir-max-unit-price-minor", 4000)))),
+  // 目标「总持仓」个数（不是本次新增）：脚本每轮读链上余额，达此数即不再买。
+  // 跨 daemon 接力/重启都安全，无需本地状态文件。
+  // 2026-11-25：部署时账号已持有 20 个，约定「再买 20 个」→ 目标总持仓 40。
+  targetHeld: Math.max(0, Math.trunc(numArg("--draupnir-target-held", 40))),
+};
 
 // 单价阈值：0.2 NCG / 件。NCG 有 2 位小数 => 0.2 NCG = 20 minor units。
 // 判定用整数：price(NCG)*100 <= pricePerItemMinor(20) * quantity
@@ -235,11 +254,11 @@ function uuidToBytesLe(uuid) {
 
 // ---------------- 物品身份校验（纯逻辑，供 self-test） ----------------
 // 只认「精确 ticker 匹配」：名字相似、Arena、其它物品一律拒绝。
-function isTargetListing(p, strict = true) {
+function isTargetListing(p, strict = true, ticker = TARGET_TICKER, excludes = EXCLUDE_TICKERS) {
   if (!p || typeof p !== "object") return false;
   const t = p.ticker;
-  if (typeof t !== "string" || t !== TARGET_TICKER) return false;   // 精确，非 includes/模糊
-  if (EXCLUDE_TICKERS.has(t)) return false;                          // 双保险
+  if (typeof t !== "string" || t !== ticker) return false;   // 精确，非 includes/模糊
+  if (excludes.has(t)) return false;                          // 双保险
   if (strict) {
     if (p.exist === false || p.legacy === true) return false;         // 已下架/旧版
     // 9CAPI 的 price 实测恒为「整数 NCG」（链上 price = price*100 minor）。
@@ -265,10 +284,11 @@ function unitPriceOf(priceNcg, quantity) {
 }
 
 // 从挂单列表挑出「目标物品 + 单价达标」的候选，按单价升序（先买最便宜）
-function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR) {
+function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR, ticker = TARGET_TICKER) {
+  const excludes = ticker === TARGET_TICKER ? EXCLUDE_TICKERS : EMPTY_TICKERS;
   const out = [];
   for (const p of listings || []) {
-    if (!isTargetListing(p)) continue;
+    if (!isTargetListing(p, true, ticker, excludes)) continue;
     const price = Number(p.price);
     const qty = Number(p.quantity);
     const up = unitPriceOf(price, qty);
@@ -286,6 +306,67 @@ function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR) {
   }
   out.sort((a, b) => (a.unitPrice - b.unitPrice) || (a.priceNcg - b.priceNcg));
   return out;
+}
+
+// ---------------- Draupnir：持仓读取 / 买入规划（纯逻辑，供 self-test） ----------------
+// 符文是 FAV，余额直接挂在 avatar 地址上；decimalPlaces=0（整数个）。
+// 读不到返回 null（调用方保守处理：本轮不买，绝不按 0 处理导致超买）。
+async function getRuneBalance(ticker, decimalPlaces = 0) {
+  const q = "query($a:Address!,$c:CurrencyInput!){ stateQuery { balance(address:$a,currency:$c){ quantity } } }";
+  const d = await gqlRpc(q, { a: CFG.avatarAddress, c: { ticker, decimalPlaces, minters: [] } });
+  const qty = d.data?.stateQuery?.balance?.quantity;
+  if (qty == null) return null;
+  const n = Number(qty);
+  return Number.isFinite(n) ? n : null;
+}
+
+// 规划本次买入。规则（与用户约定，一条不放松）：
+//   1. 只买「整堆 10 或 20」；20 个装单价 40 时总价上限 800，10 个装 400。
+//   2. 零散堆（<10）不单买，但两堆可以凑成 10（如 9+1、8+2），总价必须 <= 10*单价红线。
+//   3. 累计数量不超过 need（need = 目标持仓 - 当前持仓）。
+//   4. 剩余需求不足 10 就停手，绝不为一两个零头多花一笔。
+// candidates 必须已按单价升序（selectCandidates 的输出）。
+function planDraupnirPurchase(candidates, need, unitPriceMinor = DRAUP.maxUnitPriceMinor) {
+  const pool = (candidates || []).slice();
+  const unitCapNcg = Number(unitPriceMinor) / 100;   // 4000 minor → 40 NCG
+  const picks = [];
+  const taken = new Set();
+  let left = Math.max(0, Math.trunc(Number(need) || 0));
+
+  // 1) 整堆：按单价升序吃，10/20 装，且不超过剩余需求
+  for (const c of pool) {
+    if (left < 10) break;
+    if (c.quantity !== 10 && c.quantity !== 20) continue;
+    if (c.quantity > left) continue;
+    picks.push(c); taken.add(c.productId); left -= c.quantity;
+  }
+
+  // 2) 零散凑 10：两堆数量和正好 10，总价 <= 10*单价红线，取总价最低的一组
+  while (left >= 10) {
+    const loose = pool.filter((c) => !taken.has(c.productId) && c.quantity > 0 && c.quantity < 10);
+    let best = null;
+    for (let i = 0; i < loose.length; i++) {
+      for (let j = i + 1; j < loose.length; j++) {
+        const a = loose[i], b = loose[j];
+        if (a.quantity + b.quantity !== 10) continue;
+        const spend = a.priceNcg + b.priceNcg;
+        if (spend > unitCapNcg * 10) continue;                 // 总价 <= 400
+        if (!best || spend < best.spend) best = { a, b, spend };
+      }
+    }
+    if (!best) break;
+    picks.push(best.a, best.b);
+    taken.add(best.a.productId); taken.add(best.b.productId);
+    left -= 10;
+  }
+
+  const items = picks.sort((x, y) => (x.unitPrice - y.unitPrice) || (x.priceNcg - y.priceNcg));
+  return {
+    picks: items,
+    count: items.reduce((s, c) => s + c.quantity, 0),
+    spendNcg: items.reduce((s, c) => s + c.priceNcg, 0),
+    leftCount: Math.max(0, left),
+  };
 }
 
 // ---------------- Valkyrie 装备：身份判定 / 候选筛选 / action 构造 ----------------
@@ -371,9 +452,9 @@ function buildValkyrieBuyAction(items, buyerAvatarBuf, actionIdBuf) {
 // 返回 { fungibleAssetValueProducts: [...] }，每条带 productId / seller / price /
 // quantity / unitPrice / ticker / exist / legacy。服务端按 ticker 精确返回，
 // 本地再用 isTargetListing 逐条复核，双保险。
-async function fetchListings() {
+async function fetchListings(ticker = TARGET_TICKER) {
   const url = `${CFG.api9c}/marketProviderHeimdall/Market/products/fav` +
-    `?tickers=${encodeURIComponent(TARGET_TICKER)}&limit=10000&offset=0&order=price_asc`;
+    `?tickers=${encodeURIComponent(ticker)}&limit=10000&offset=0&order=price_asc`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 45000);
   let j;
@@ -384,7 +465,8 @@ async function fetchListings() {
   } finally { clearTimeout(t); }
   const favs = Array.isArray(j?.fungibleAssetValueProducts) ? j.fungibleAssetValueProducts : [];
   // 逐条复核：即便服务端串了别的 ticker，本地也绝不放行
-  const safe = favs.filter((p) => isTargetListing(p));
+  const excludes = ticker === TARGET_TICKER ? EXCLUDE_TICKERS : EMPTY_TICKERS;
+  const safe = favs.filter((p) => isTargetListing(p, true, ticker, excludes));
   return { listings: safe, rawCount: favs.length, rejected: favs.length - safe.length };
 }
 
@@ -460,9 +542,9 @@ async function verifyListingOnchain(c) {
     // BuyProduct 执行时自行校验（productId/price/seller 不符即 FAILURE，
     // 无资金损失，符合「只认链上、失败无所谓」）。只有查到「明确不符」才拦截。
     if (!p || d.errors) return { skip: false, reason: "not_indexed_let_chain_decide" };
-    // 物品身份：资产 ticker 必须正是目标（链上权威二次确认，防串货）
+    // 物品身份：资产 ticker 必须正是该候选自己的 ticker（链上权威二次确认，防串货）
     const assetTicker = p.asset?.ticker;
-    if (assetTicker && assetTicker !== TARGET_TICKER)
+    if (assetTicker && assetTicker !== (c.ticker || TARGET_TICKER))
       return { skip: true, reason: `asset_ticker=${assetTicker}` };
     if (p.productType && p.productType !== "FUNGIBLE_ASSET_VALUE" && p.productType !== "FungibleAssetValue")
       return { skip: true, reason: `productType=${p.productType}` };
@@ -576,6 +658,42 @@ async function scanAndBuy(ctx, opts = {}) {
   round.rejectedByTicker = rejected;
   const favCandidates = selectCandidates(favListings);
 
+  // ---- Draupnir 符文挂单（第二目标） ----
+  // 目标数量按「链上总持仓」判定：每轮重读余额，达 targetHeld 即不再买，
+  // 因此 daemon 接力/重启都不会重复买、不会超买。
+  let draupPicks = [], draupInfo = null;
+  if (DRAUP.enabled) {
+    let l2 = [], raw2 = 0, rej2 = 0;
+    if (opts.simulatedDraupListings) {
+      l2 = opts.simulatedDraupListings; raw2 = l2.length;
+    } else if (!opts.simulatedListings) {
+      const f2 = await fetchListings(DRAUP.ticker);
+      l2 = f2.listings; raw2 = f2.rawCount; rej2 = f2.rejected;
+    }
+    const c2 = selectCandidates(l2, DRAUP.maxUnitPriceMinor, DRAUP.ticker);
+    let held = null, balErr = null;
+    if (opts.draupHeld != null) held = opts.draupHeld;
+    else if (!opts.simulatedListings) {
+      try { held = await getRuneBalance(DRAUP.ticker, 0); }
+      catch (e) { balErr = String(e.message).slice(0, 80); }
+    }
+    const need = held == null ? 0 : Math.max(0, DRAUP.targetHeld - held);
+    const plan = held == null
+      ? { picks: [], count: 0, spendNcg: 0, leftCount: 0 }
+      : planDraupnirPurchase(c2, need);
+    draupPicks = plan.picks;
+    draupInfo = {
+      ticker: DRAUP.ticker, runeId: DRAUP.runeId, name: DRAUP.name,
+      targetHeld: DRAUP.targetHeld, held, need, balanceError: balErr,
+      maxUnitPriceNcg: Number(DRAUP.maxUnitPriceMinor) / 100,
+      rawCount: raw2, rejectedByTicker: rej2, candidateCount: c2.length,
+      planCount: plan.count, planSpendNcg: plan.spendNcg, leftCount: plan.leftCount,
+      candidates: c2.map((c) => ({ productId: c.productId, quantity: c.quantity, priceNcg: c.priceNcg, unitPrice: c.unitPrice })),
+    };
+    round.draupnir = draupInfo;
+    if (held == null) log({ level: "warn", msg: "Draupnir 持仓读取失败，本轮不买（保守，绝不按 0 处理）", detail: balErr });
+  }
+
   // ---- Valkyrie 装备挂单 ----
   let valkCandidates = [];
   if (ENABLE_VALKYRIE) {
@@ -599,15 +717,16 @@ async function scanAndBuy(ctx, opts = {}) {
 
   const allCandidates = [
     ...favCandidates.map((c) => ({ ...c, kind: "fav" })),
+    ...draupPicks.map((c) => ({ ...c, kind: "draupnir" })),
     ...valkCandidates.map((c) => ({ ...c, kind: "valkyrie" })),
   ];
   round.candidateCount = allCandidates.length;
   round.candidates = allCandidates.map((c) => ({
     kind: c.kind, productId: c.productId,
-    unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
+    unitPrice: c.kind === "valkyrie" ? c.priceNcg : c.unitPrice,
     priceNcg: c.priceNcg,
-    quantity: c.kind === "fav" ? c.quantity : 1,
-    ticker: c.kind === "fav" ? c.ticker : c.partKey,
+    quantity: c.kind === "valkyrie" ? 1 : c.quantity,
+    ticker: c.kind === "valkyrie" ? c.partKey : c.ticker,
   }));
 
   if (allCandidates.length === 0) return round;
@@ -655,8 +774,8 @@ async function scanAndBuy(ctx, opts = {}) {
   if (DRY) {
     for (const c of buyable) round.bought.push({
       productId: c.productId, status: "would_buy", kind: c.kind,
-      priceNcg: c.priceNcg, unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
-      quantity: c.kind === "fav" ? c.quantity : 1,
+      priceNcg: c.priceNcg, unitPrice: c.kind === "valkyrie" ? c.priceNcg : c.unitPrice,
+      quantity: c.kind === "valkyrie" ? 1 : c.quantity,
     });
     log({ level: "info", msg: `演练：命中 ${buyable.length} 单，本应购买（未提交任何交易）`,
           fav: favCandidates.length, valkyrie: valkCandidates.length, buyable: buyable.length });
@@ -668,6 +787,7 @@ async function scanAndBuy(ctx, opts = {}) {
   const groups = [
     { kind: "valkyrie", list: buyable.filter((c) => c.kind === "valkyrie"), build: buildValkyrieBuyAction },
     { kind: "fav",      list: buyable.filter((c) => c.kind === "fav"),      build: buildBuyAction },
+    { kind: "draupnir", list: buyable.filter((c) => c.kind === "draupnir"), build: buildBuyAction },
   ];
   let txCount = 0;
   for (const group of groups) {
@@ -702,8 +822,8 @@ async function scanAndBuy(ctx, opts = {}) {
           rec.status = "bought";
           for (const c of batch) {
             round.bought.push({ productId: c.productId, status: "bought", kind: c.kind,
-              unitPrice: c.kind === "fav" ? c.unitPrice : c.priceNcg,
-              priceNcg: c.priceNcg, quantity: c.kind === "fav" ? c.quantity : 1, txId });
+              unitPrice: c.kind === "valkyrie" ? c.priceNcg : c.unitPrice,
+              priceNcg: c.priceNcg, quantity: c.kind === "valkyrie" ? 1 : c.quantity, txId });
             if (c.kind === "valkyrie") {
               ctx.spentNcg += c.priceNcg;
               round.valkSpendNcg += c.priceNcg;
@@ -738,6 +858,11 @@ async function daemonMode() {
     valkyrie: {
       enabled: ENABLE_VALKYRIE, minLevel: VALK_MIN_LEVEL, maxPriceNcg: VALK_MAX_PRICE_NCG,
       spendCapNcg: VALK_SPEND_CAP_NCG, spentNcg: 0, capReached: false,
+    },
+    draupnir: {
+      enabled: DRAUP.enabled, ticker: DRAUP.ticker, runeId: DRAUP.runeId,
+      targetHeld: DRAUP.targetHeld, maxUnitPriceNcg: Number(DRAUP.maxUnitPriceMinor) / 100,
+      held: null, need: null, planCount: 0,
     },
     config: {
       pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000,
@@ -787,6 +912,9 @@ async function daemonMode() {
       log({ level: "info", msg: "市场扫货常驻启动", tip,
             ticker: TARGET_TICKER, maxUnitPriceNcg: Number(UNIT_PRICE_MINOR) / 100,
             valkyrie: ENABLE_VALKYRIE ? `5部位/lv>=${VALK_MIN_LEVEL}/<=${VALK_MAX_PRICE_NCG}NCG/封顶${VALK_SPEND_CAP_NCG}NCG` : "关闭",
+            draupnir: DRAUP.enabled
+              ? `${DRAUP.ticker}/<=${Number(DRAUP.maxUnitPriceMinor) / 100}NCG/总持仓${DRAUP.targetHeld}个`
+              : "关闭",
             pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000 });
     }
     try {
@@ -796,9 +924,16 @@ async function daemonMode() {
       out.totals.tx += r.txSubmitted || 0;
       out.valkyrie.spentNcg = ctx.spentNcg;
       out.valkyrie.capReached = ctx.spentNcg >= VALK_SPEND_CAP_NCG;
+      if (r.draupnir) {
+        out.draupnir.held = r.draupnir.held;
+        out.draupnir.need = r.draupnir.need;
+        out.draupnir.planCount = r.draupnir.planCount;
+      }
       log({ level: "daemon", round: out.rounds, tip,
             rawCount: r.rawCount, candidateCount: r.candidateCount,
             valkCandidates: (r.valkCandidates || []).length, valkSpendNcg: ctx.spentNcg,
+            draupHeld: r.draupnir?.held ?? null, draupNeed: r.draupnir?.need ?? null,
+            draupPlan: r.draupnir?.planCount ?? 0,
             buyableCount: r.buyableCount, txSubmitted: r.txSubmitted,
             elapsedSec: Math.round((Date.now() - started) / 1000) });
       if (r.ok === false) { out.ok = false; out.error = r.error; handoff = "aborted"; break; }
@@ -882,6 +1017,9 @@ async function onceMode() {
     spendCapNcg: VALK_SPEND_CAP_NCG, candidates: r.valkCandidates || [],
     rawCount: r.valkRawCount ?? null, fetchErrors: r.valkFetchErrors || [],
   };
+  out.draupnir = r.draupnir || {
+    enabled: DRAUP.enabled, ticker: DRAUP.ticker, runeId: DRAUP.runeId, targetHeld: DRAUP.targetHeld,
+  };
   if (r.ok === false) { out.ok = false; out.error = r.error; }
   console.log(JSON.stringify(out));
   process.exit(out.ok ? 0 : 1);
@@ -940,6 +1078,37 @@ function selfTest() {
     const c = selectCandidates(ls, 20n);
     chk("selectCandidates: 排除 Arena/高价，保留达标", c.length === 2 && !c.some((x) => x.productId === "arena"), `len=${c.length}`);
     chk("selectCandidates: 按单价升序(cheap 在前)", c[0].productId === "cheap" && c[0].unitPrice === 0.05);
+  }
+
+  // 3b) Draupnir：ticker 精确匹配 + 单价红线 + 买入规划
+  {
+    chk("Draupnir ticker 精确命中",
+      isTargetListing({ ticker: DRAUP.ticker, exist: true, legacy: false, price: 400, quantity: 10 }, true, DRAUP.ticker, EMPTY_TICKERS) === true);
+    chk("Draupnir 不误吃 Stun Rune",
+      isTargetListing({ ticker: TARGET_TICKER, exist: true, legacy: false, price: 400, quantity: 10 }, true, DRAUP.ticker, EMPTY_TICKERS) === false);
+    chk("Draupnir 名字相似串拒绝",
+      isTargetListing({ ticker: "RUNESTONE_DRAUPNIR_OLD", exist: true, legacy: false, price: 400, quantity: 10 }, true, DRAUP.ticker, EMPTY_TICKERS) === false);
+    chk("Draupnir 40NCG/个 恰好命中(800/20)", isCheapEnough(800, 20, 4000n) === true);
+    chk("Draupnir 801/20 略超不买", isCheapEnough(801, 20, 4000n) === false);
+    chk("Draupnir 400/10 恰好命中", isCheapEnough(400, 10, 4000n) === true);
+    chk("Draupnir 401/10 略超不买", isCheapEnough(401, 10, 4000n) === false);
+
+    const mk = (id, qty, price) => ({ productId: id, quantity: qty, priceNcg: price, unitPrice: price / qty, ticker: DRAUP.ticker });
+    const planCases = [
+      ["20个装 800 一次买齐", [mk("a", 20, 800)], 20, 20, 800],
+      ["10个装 400 x2 凑 20", [mk("a", 10, 400), mk("b", 10, 400)], 20, 20, 800],
+      ["9+1 凑 10 恰好 400", [mk("a", 9, 360), mk("b", 1, 40)], 10, 10, 400],
+      ["9个 360 无配对不买", [mk("a", 9, 360)], 10, 0, 0],
+      ["need15 只买 10 不补零头", [mk("a", 10, 400)], 15, 10, 400],
+      ["need0 不买", [mk("a", 20, 800)], 0, 0, 0],
+      ["便宜 20 装优先(38/个)", [mk("c", 20, 760), mk("a", 10, 390), mk("b", 10, 390)], 20, 20, 760],
+      ["need20 只有 10 装 800 超限候选为空", [], 20, 0, 0],
+    ];
+    for (const [n, list, need, expCount, expSpend] of planCases) {
+      const r = planDraupnirPurchase(list, need, 4000n);
+      chk(`planDraupnir: ${n}`, r.count === expCount && r.spendNcg === expSpend,
+        `count=${r.count} spend=${r.spendNcg}`);
+    }
   }
 
   // 4) UUID → bytes_le：与链上真实交易 / 9CAPI mobileBuy 返回逐字节对齐
