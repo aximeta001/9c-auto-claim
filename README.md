@@ -8,7 +8,7 @@
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG）+ **Draupnir 符文**（≤40 NCG/个、总持仓 40 停） | 自接力常驻 |
 | **AB Sweep 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
 | **AB 爬楼链** | **`explore-boss.yml`** | **`explore-boss.mjs`** | Adventure Boss 自动挑战爬楼到目标层（门票全程 Golden Dust） | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
@@ -189,7 +189,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 文件 | 作用 |
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）+ Draupnir（≤40 NCG/个、只买 10/20 整堆、总持仓 40 停）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
 | `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
 | `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
@@ -344,15 +344,16 @@ tail -f claim.log
 
 ---
 
-## 七、市场扫货：Stun Rune (Adventure) + Valkyrie 装备 低价自动购买
+## 七、市场扫货：Stun Rune (Adventure) + Valkyrie 装备 + Draupnir 低价自动购买
 
-独立的一条自接力链（`market.yml` + `market-buy.mjs`），与领奖链完全隔离。两个目标共用
+独立的一条自接力链（`market.yml` + `market-buy.mjs`），与领奖链完全隔离。三个目标共用
 同一条链、同一次扫描、同一私钥：
 
 1. **Stun Rune (Adventure)**：单价 ≤ 0.2 NCG/件就整单买下；绝不能和相似的
    **Stun Rune (Arena)** 或名字近似物品搞混（7.1–7.6）。
 2. **Valkyrie 五部位装备**：强化等级 ≥3、单价 ≤2 NCG、全部元素变体，本次运行累计
    封顶 500 NCG（7.7）。
+3. **Draupnir（德劳普尼尔符文）**：单价 ≤ 40 NCG/个，只买 10/20 整堆，总持仓达 40 个即停（7.8）。
 
 ### 7.1 为什么不会搞错（用 id，不用名字）
 
@@ -363,6 +364,7 @@ tail -f claim.log
 |---|---|---|---|
 | **Stun Rune (Adventure)** | `10021` | `RUNESTONE_STUN_ADVENTURE` | ✅ 目标 |
 | Stun Rune (Arena) | `10022` | `RUNESTONE_STUN_ARENA` | ❌ 明确排除 |
+| **Draupnir（德劳普尼尔）** | `10060` | `RUNESTONE_DRAUPNIR` | ✅ 目标（全表仅此一条） |
 
 - **数据源头就分开**：请求 9CAPI 时直接用 `tickers=RUNESTONE_STUN_ADVENTURE` 精确参数，
   服务端只返回该资产；Adventure / Arena 是两个不同 ticker，永不交叉。
@@ -512,3 +514,39 @@ p[0] = [ productId(16B), [NCG currency, price×100], sellerAgent(20B), sellerAva
 **演练**：`--simulate-listings-file sim.json` 现支持 `{ "fav":[...], "valkyrie":{ "Sword":[...], ... } }`
 结构，离线验证筛选 / 排序 / 预算，不提交任何交易。自测已扩到 **60/60**（含装备段位、
 等级/单价边界、元素变体、NonFungible 字节级比对、预算封顶）。
+
+### 7.8 Draupnir（德劳普尼尔符文）扫货
+
+**目标**：`RuneSheet` id `10060` / ticker `RUNESTONE_DRAUPNIR`（全表仅一条，无 Arena 变体）。
+
+**为什么仍按 ticker 而不按 itemId**：符文是 `FungibleAssetValue`，链上没有 itemId 字段，
+市场接口也**不支持** `itemIds` 过滤（实测 `?itemIds=10060` 直接返回 500 错误页，返回体里
+只有 `ticker`）。ticker 就是这类资产的唯一 ID，与 `RuneSheet.id` 一对一，等价于按 ID 锁定。
+
+**价格与数量规则（用户 2026-11-25 约定）**：
+
+| 项 | 规则 |
+|---|---|
+| 单价红线 | **≤ 40 NCG/个**，判定 `price × 100 ≤ 4000 × quantity`（整数比较） |
+| 10 个装 | 总价 ≤ 400 NCG |
+| 20 个装 | 总价 ≤ 800 NCG，**可一次买齐**，不必拆单 |
+| 整堆 | 只买 10 或 20 的整堆，按单价升序先买便宜的 |
+| 零散 | 9 个、8 个这类**不单买**；仅当两堆数量和正好 10（如 9+1、8+2）且总价 ≤400 才买 |
+| 零头 | 剩余需求不足 10 就停手，不为 1–2 个零头多花一笔 |
+| 数量上限 | **总持仓 40 个**（部署时已有 20 + 再买 20），每轮读链上余额，达标即不再买 |
+
+**不会超买**：目标按「链上总持仓」而非「本次新增」判定，每轮重读
+`balance(avatar, RUNESTONE_DRAUPNIR, dp=0)`。daemon 5.5h 接力、进程重启、手动重跑都不会
+重复计数。**读不到余额时本轮直接不买**（保守处理，绝不按 0 计算）。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--draupnir-target-held N` | `40` | 目标总持仓个数，达到即停 |
+| `--draupnir-max-unit-price-minor N` | `4000` | 单价上限最小单位（4000 = 40 NCG/个） |
+| `--no-draupnir` | 关闭 | 临时关闭 Draupnir，只跑 Stun/Valkyrie |
+
+自测已扩到 **79/79**，Draupnir 部分覆盖：ticker 精确匹配、名字相似串拒绝、
+800/20 与 400/10 边界命中、801/20 与 401/10 拒绝、20 装一次买齐、10×2 凑 20、
+9+1 凑 10、无配对不买、need15 只买 10、need0 不买。
