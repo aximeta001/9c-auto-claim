@@ -663,35 +663,46 @@ async function scanAndBuy(ctx, opts = {}) {
   // 因此 daemon 接力/重启都不会重复买、不会超买。
   let draupPicks = [], draupInfo = null;
   if (DRAUP.enabled) {
-    let l2 = [], raw2 = 0, rej2 = 0;
-    if (opts.simulatedDraupListings) {
-      l2 = opts.simulatedDraupListings; raw2 = l2.length;
-    } else if (!opts.simulatedListings) {
-      const f2 = await fetchListings(DRAUP.ticker);
-      l2 = f2.listings; raw2 = f2.rawCount; rej2 = f2.rejected;
+    try {
+      let l2 = [], raw2 = 0, rej2 = 0;
+      if (opts.simulatedDraupListings) {
+        l2 = opts.simulatedDraupListings; raw2 = l2.length;
+      } else if (!opts.simulatedListings) {
+        const f2 = await fetchListings(DRAUP.ticker);
+        l2 = f2.listings; raw2 = f2.rawCount; rej2 = f2.rejected;
+      }
+      const c2 = selectCandidates(l2, DRAUP.maxUnitPriceMinor, DRAUP.ticker);
+      let held = null, balErr = null;
+      if (opts.draupHeld != null) held = opts.draupHeld;
+      else if (!opts.simulatedListings) {
+        try { held = await getRuneBalance(DRAUP.ticker, 0); }
+        catch (e) { balErr = String(e.message).slice(0, 80); }
+      }
+      const need = held == null ? 0 : Math.max(0, DRAUP.targetHeld - held);
+      const plan = held == null
+        ? { picks: [], count: 0, spendNcg: 0, leftCount: 0 }
+        : planDraupnirPurchase(c2, need);
+      draupPicks = plan.picks;
+      draupInfo = {
+        ticker: DRAUP.ticker, runeId: DRAUP.runeId, name: DRAUP.name,
+        targetHeld: DRAUP.targetHeld, held, need, balanceError: balErr,
+        maxUnitPriceNcg: Number(DRAUP.maxUnitPriceMinor) / 100,
+        rawCount: raw2, rejectedByTicker: rej2, candidateCount: c2.length,
+        planCount: plan.count, planSpendNcg: plan.spendNcg, leftCount: plan.leftCount,
+        candidates: c2.map((c) => ({ productId: c.productId, quantity: c.quantity, priceNcg: c.priceNcg, unitPrice: c.unitPrice })),
+      };
+      round.draupnir = draupInfo;
+      if (held == null) log({ level: "warn", msg: "Draupnir 持仓读取失败，本轮不买（保守，绝不按 0 处理）", detail: balErr });
+    } catch (e) {
+      // Draupnir 是附加目标：接口/解析异常只跳过它，绝不拖垮 Stun / Valkyrie 本轮
+      draupInfo = {
+        ticker: DRAUP.ticker, runeId: DRAUP.runeId, name: DRAUP.name,
+        targetHeld: DRAUP.targetHeld, held: null, need: 0,
+        error: String(e.message).slice(0, 120), candidateCount: 0, planCount: 0,
+      };
+      round.draupnir = draupInfo;
+      log({ level: "warn", msg: "Draupnir 本轮扫描失败，跳过（不影响其它目标）", detail: draupInfo.error });
     }
-    const c2 = selectCandidates(l2, DRAUP.maxUnitPriceMinor, DRAUP.ticker);
-    let held = null, balErr = null;
-    if (opts.draupHeld != null) held = opts.draupHeld;
-    else if (!opts.simulatedListings) {
-      try { held = await getRuneBalance(DRAUP.ticker, 0); }
-      catch (e) { balErr = String(e.message).slice(0, 80); }
-    }
-    const need = held == null ? 0 : Math.max(0, DRAUP.targetHeld - held);
-    const plan = held == null
-      ? { picks: [], count: 0, spendNcg: 0, leftCount: 0 }
-      : planDraupnirPurchase(c2, need);
-    draupPicks = plan.picks;
-    draupInfo = {
-      ticker: DRAUP.ticker, runeId: DRAUP.runeId, name: DRAUP.name,
-      targetHeld: DRAUP.targetHeld, held, need, balanceError: balErr,
-      maxUnitPriceNcg: Number(DRAUP.maxUnitPriceMinor) / 100,
-      rawCount: raw2, rejectedByTicker: rej2, candidateCount: c2.length,
-      planCount: plan.count, planSpendNcg: plan.spendNcg, leftCount: plan.leftCount,
-      candidates: c2.map((c) => ({ productId: c.productId, quantity: c.quantity, priceNcg: c.priceNcg, unitPrice: c.unitPrice })),
-    };
-    round.draupnir = draupInfo;
-    if (held == null) log({ level: "warn", msg: "Draupnir 持仓读取失败，本轮不买（保守，绝不按 0 处理）", detail: balErr });
   }
 
   // ---- Valkyrie 装备挂单 ----
