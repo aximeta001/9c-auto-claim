@@ -248,6 +248,12 @@ const SWEEP_DEFAULT_STAGE = Math.max(1, Math.trunc(numArg("--sweep-stage", 446))
 // 魔典 id=10780009，但 bnbyes 的魔典是 10770002、tomoon 当前只穿 6 件（气场/
 // 魔典未装备），全被误判"装备不完整"→ 本地构造卡死 → 日常停领。
 const REGULAR_EQUIP_TYPES = new Set(["WEAPON", "ARMOR", "BELT", "NECKLACE", "RING"]);
+// 常规装备按槽位收敛（2026-11-26）：市场扫货可能给一个角色塞进多件同类已装备装备
+// （bnb 实测 14 件），旧代码"恰好 6 件"的硬校验会让 sweep 在构造阶段直接抛错、
+// 日常永远领不出来。这里明确每个槽位要几件，总共恒定 6 件。
+const REGULAR_SLOTS = [
+  ["WEAPON", 1], ["ARMOR", 1], ["BELT", 1], ["NECKLACE", 1], ["RING", 2],
+];
 const AURA_SUBTYPE = "AURA";         // 气场槽（id 因角色而异，不硬编码）
 const GRIMOIRE_SUBTYPE = "GRIMOIRE"; // 魔典槽（id 因角色而异，不硬编码）
 // stage→world：WorldSheet 里每 50 关一个 world（1-50→1, 401-450→9, 451-500→10…）
@@ -517,16 +523,22 @@ async function fetchSweepTemplate() {
   return { runeSlots: [], source: "default" };
 }
 
-// 从装备列表里挑某个槽位的一件（纯函数，供自测覆盖）：
-//   1) 优先该角色【当前装备】(equipped=true) 的最高 level 一件；
-//   2) 没装备则从背包补最高 level 一件（同 level 按 itemId 稳定排序）。
+// 从装备列表里挑某个槽位的 n 件（纯函数，供自测覆盖）：
+//   1) 优先该角色【当前装备】(equipped=true)，按 level 降序；
+//   2) 已装备不够才从背包补，同样按 level 降序；
+//   3) 同 level 按 itemId 稳定排序，结果可复现。
 // 只按 itemSubType 判断，绝不看固定 itemId —— 每个角色气场/魔典 id 都不同。
-function pickEquipmentSlot(eqs, subtype) {
+// 多件时（戒指×2）优先取已装备的两件最高级，避免把背包货塞进装备栏。
+function pickEquipmentSlots(eqs, subtype, n = 1) {
   const all = (eqs || []).filter(e => e.itemSubType === subtype);
-  const on = all.filter(e => e.equipped).sort((a, b) => (b.level || 0) - (a.level || 0));
-  if (on.length) return on[0];
-  return all.sort((a, b) => (b.level || 0) - (a.level || 0) ||
-                  String(a.itemId).localeCompare(String(b.itemId)))[0] || null;
+  const rank = (a, b) => (b.level || 0) - (a.level || 0) ||
+                  String(a.itemId).localeCompare(String(b.itemId));
+  const on = all.filter(e => e.equipped).sort(rank);
+  const off = all.filter(e => !e.equipped).sort(rank);
+  return [...on, ...off].slice(0, Math.max(0, n));
+}
+function pickEquipmentSlot(eqs, subtype) {
+  return pickEquipmentSlots(eqs, subtype, 1)[0] || null;
 }
 
 // 现场读取当前穿戴装备/时装 + 拥有符文列表（权威链上状态），构造 sweep 的装备字段。
@@ -556,14 +568,19 @@ async function resolveLiveLoadout() {
   //     若该角色没装（如 tomoon 只穿 6 件），则取背包里最高级的一件补上。
   //     历史 SUCCESS sweep 均为 8 件（bnb 488 / bnbyes 421 / tomoon 435），
   //     补满 8 件能最大化 CP、降低 stage 降级概率。
-  const regular = eqs.filter(e => e.equipped && REGULAR_EQUIP_TYPES.has(e.itemSubType));
+  // 常规装备按槽位收敛：每槽取优先级最高的一件、戒指两件，恒定 6 件。
+  // 扫货塞进 14 件同类已装备（bnb 2026-11-26 实测）也不会让构造阶段抛错。
+  const regular = REGULAR_SLOTS.flatMap(([subtype, n]) => pickEquipmentSlots(eqs, subtype, n));
   const aura = pickEquipmentSlot(eqs, AURA_SUBTYPE);
   const grimoire = pickEquipmentSlot(eqs, GRIMOIRE_SUBTYPE);
   const equippedCo = cos.filter(c => c.equipped);
-  // 完整性护栏：只硬性要求 6 常规 + 2 时装（这是基础装备，缺失说明状态异常）。
+  // 完整性护栏：每个常规槽位必须凑齐 + 2 时装（基础装备缺失说明状态异常）。
   // 气场/魔典缺失不再阻断 —— 用背包补，补不到就用现有装备构造，绝不再卡死日常。
   const missing = [];
-  if (regular.length !== 6) missing.push(`常规装备=${regular.length}(期望6)`);
+  for (const [subtype, n] of REGULAR_SLOTS) {
+    const got = regular.filter(e => e.itemSubType === subtype).length;
+    if (got < n) missing.push(`${subtype}=${got}(期望${n})`);
+  }
   if (equippedCo.length !== 2) missing.push(`时装=${equippedCo.length}(期望2)`);
   if (missing.length) {
     throw new Error(`当前穿戴装备不完整(${missing.join("; ")})，拒绝构造以免装备校验失败浪费 AP`);
@@ -1009,6 +1026,66 @@ function selfTest() {
                a?.itemId === "cc" && a?.level === 11 &&   // 未装备时补最高级气场
                pickEquipmentSlot(eqs, "NECKLACE") === null;
     console.log(`  装备槽按 subtype 取(bnbyes魔典/tomoon补气场/无槽返回null) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 2026-11-26 回归：bnb 被扫货塞了十几件"已装备"常规装备，旧代码硬校验
+  // regular.length !== 6 会让 sweep 在构造阶段直接抛错 → daily 到期也领不到。
+  // 新逻辑按槽位收敛：每槽取优先级最高的一件、戒指两件，恒定 6 件。
+  total++;
+  {
+    const mk = (subtype, ids) => ids.map(([id, level]) => ({ itemId: id, itemSubType: subtype, level, equipped: true }));
+    const many = [
+      ...mk("WEAPON", [["w1", 9], ["w2", 5], ["w3", 7]]),
+      ...mk("ARMOR", [["a1", 4], ["a2", 8], ["a3", 2]]),
+      ...mk("BELT", [["b1", 6]]),
+      ...mk("NECKLACE", [["n1", 3], ["n2", 10], ["n3", 1], ["n4", 6]]),
+      ...mk("RING", [["r1", 2], ["r2", 11], ["r3", 7], ["r4", 9]]),
+    ];
+    const picked = REGULAR_SLOTS.flatMap(([t, n]) => pickEquipmentSlots(many, t, n));
+    const ids = picked.map(e => e.itemId).join(",");
+    const ok = many.length === 15 && picked.length === 6 && ids === "w1,a2,b1,n2,r2,r4";
+    console.log(`  多装备按槽位收敛6件(15件→最高级6件) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 原本恰好 6 件的角色（bnbyes/tomoon）结果必须完全不变。
+  total++;
+  {
+    const six = [
+      ["WEAPON", "w", 5], ["ARMOR", "a", 4], ["BELT", "b", 3],
+      ["NECKLACE", "n", 6], ["RING", "r1", 7], ["RING", "r2", 8],
+    ].map(([itemSubType, itemId, level]) => ({ itemId, itemSubType, level, equipped: true }));
+    const picked = REGULAR_SLOTS.flatMap(([t, n]) => pickEquipmentSlots(six, t, n));
+    const ok = picked.length === 6 && picked.every(e => e.equipped) &&
+      picked.map(e => e.itemId).join(",") === "w,a,b,n,r2,r1";
+    console.log(`  原6件角色收敛结果不变 = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 戒指×2 也遵守"已装备优先于背包"：不能为了等级把背包货塞进来。
+  total++;
+  {
+    const eqs = [
+      { itemId: "r_on1", itemSubType: "RING", level: 3, equipped: true },
+      { itemId: "r_on2", itemSubType: "RING", level: 2, equipped: true },
+      { itemId: "r_off", itemSubType: "RING", level: 10, equipped: false },
+    ];
+    const p = pickEquipmentSlots(eqs, "RING", 2);
+    const ok = p.length === 2 && p[0].itemId === "r_on1" && p[1].itemId === "r_on2";
+    console.log(`  戒指双槽已装备优先(不被背包高级顶替) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 槽位确实缺失时仍要能被护栏发现（收敛不等于放宽基础装备要求）。
+  total++;
+  {
+    const oneRing = [
+      { itemId: "w", itemSubType: "WEAPON", level: 5, equipped: true },
+      { itemId: "a", itemSubType: "ARMOR", level: 5, equipped: true },
+      { itemId: "b", itemSubType: "BELT", level: 5, equipped: true },
+      { itemId: "n", itemSubType: "NECKLACE", level: 5, equipped: true },
+      { itemId: "r1", itemSubType: "RING", level: 5, equipped: true },
+    ];
+    const picked = REGULAR_SLOTS.flatMap(([t, n]) => pickEquipmentSlots(oneRing, t, n));
+    const ok = picked.length === 5 && pickEquipmentSlots(oneRing, "RING", 2).length === 1;
+    console.log(`  真实缺槽仍可被护栏识别(单戒指=1) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
   }
   // stage→world 派生：401-450→9, 451-500→10, 1-50→1（降级时 worldId 必须跟着变）
