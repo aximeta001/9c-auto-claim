@@ -146,13 +146,25 @@ AB 与领奖链的**风险模型不同**：领取是「一次机会、重复领�
 - **AP 已满**（≥ 120）→ 先发 `hack_and_slash_sweep10`，把 120 AP 消耗掉（每次 4 AP × 30 次），**确认成功后再领日常**，才能吃到整整 120 AP，并顺带获得 30 次 sweep 掉落。
 - **巡逻奖励与 AP 无关，不触发 sweep。**
 
+> **铁律（2026-11-26 血泪教训）：sweep 绝不能用空符文，会把你身上的符文清空。**
+> `Lib9c/Action/HackAndSlashSweep.cs` 里 `runeSlotState.UpdateSlot(runeInfos, ...)` 会把
+> action 携带的 `runeInfos` **写回冒险模式符文槽**——先全部卸下再按 runeInfos 重装。
+> 所以带空 `runeInfos` 的 sweep = 把你的冒险符文全部清空。旧脚本从「最近一次 sweep」
+> 反推符文、且失败时会改空符文降 CP，bnb 因此每笔 sweep 都被清空，用户每次都要手动重装。
+>
+> 现规则：`claim.mjs` 的符文槽改从「最近一笔带**非空** runeInfos 的冒险 action」
+> （hack_and_slash / sweep / event dungeon / adventure boss，翻页最多 600 笔）读取，
+> 即你当前身上的真实符文；**读不到就拒绝 sweep，宁可不领也绝不用空符文覆盖**。
+> 任何失败修复维度都不得清空符文。你在游戏里换符文后，打一笔冒险战斗，脚本自动跟随。
+> 注：AB 的 `sweep-boss.mjs` 有同样机制，同样遵守此铁律。
+
 Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 
 | 要点 | 做法 |
 |---|---|
 | 关卡选择 | 复用「本角色最近一笔 `SUCCESS` 的 sweep」原始 action，从 Mimir 动态取；客户端实际用的是 `world 9 / stage 446`（已通关且 CP 达标），不是 `lastClearedStage` 的 495 —— 495 的 `SweepRequiredCPSheet` CP 要求更高，硬造会 `NotEnoughCombatPointException` |
 | 参数构造 | 复用链上已成功 action 的**字节**，但强制改写 3 个字段：`GameAction.Id`（换新 16 字节）、`actionPoint → "120"`、`apStoneCount → "0"`；装备 / 符文 / 关卡 / 入场材料声明一字不改，自动跟随最新养成。这样无论用户手动做过 80AP 的 sweep、还是勾过 AP 药水，脚本都恒定为 **120AP / 30 次 / 不消耗药水**。覆盖时保持模板原值类型（Unicode Text），字段集合与编码类型零漂移 |
-| 装备变更 | 每轮动态取最近成功 sweep，用户手动换装后再 sweep 过一次即自动跟随；Mimir 故障回退到内置模板（block `11749808`，同样已 SUCCESS） |
+| 装备变更 | 装备/时装/符文每轮现场从链上读取，换装/换符文后打一笔冒险战斗即自动跟随；符文槽取最近一笔**非空**冒险符文 action，**读不到则拒绝 sweep**（绝不用空符文写回清空用户符文） |
 | **失败重试** | sweep 失败 / 超时(`PENDING`) / 提交异常，**最多重试 5 次**（连同首次共 6 笔，默认），尽量把 AP 消耗掉；每笔换新的 `GameAction.Id` 与重新取 `nonce`。**6 笔都未确认成功才降级照常领日常** |
 | **重试前只认链上** | 每次重试前先复核链上 `actionPoint`：**AP 已降下来就说明此前某笔其实成功了**（典型是 `confirmTx` 超时但其实 `SUCCESS`），立即收手判成功，绝不重复提交 sweep，也不会出现「AP 已扣却判失败去领日常」的错配 |
 | **不重复扣 AP** | 链上幂等：多笔 sweep 先后上链最多一笔能扣掉 120 AP，其余因 AP 不足 `FAILURE` 无副作用；重试只提高成功率，不会多消耗 AP |
