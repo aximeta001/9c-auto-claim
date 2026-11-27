@@ -32,8 +32,8 @@
  *  永远失败（2026-11-22 赛季中就因套旧模板连续失败 30 笔无人知晓）。符文槽因
  *  GraphQL 读不到装配关系，沿用最近 SUCCESS sweep 模板的槽位并用 runes 列表校验。
  *  战场只认链上终态：失败后读 transactionResult.exceptionNames 诊断根因，【本轮立即】
- *  按维度升级修复再打 —— 装备/符文失效→重读穿戴+改空符文槽；CP 不足→关卡降 10 级
- *  （worldId 重算），到最低关仍不够→空符文降 CP 门槛；未知→重试后叠加修复维度。
+ *  按维度升级修复再打 —— 装备失效→重读穿戴；CP 不足→关卡降 10 级（worldId 重算）；
+ *  未知→重试后降关卡。符文恒用链上最近一笔非空冒险符文，绝不用空符文（会把用户符文清空）。
  *  失败绝不留到下轮：在本次 job 内循环"诊断→修复→重试"直到成功，成功立即领日常。
  *  每笔换新 id + nonce，重试前复核链上 AP 防重复提交。
  *  仅硬护栏（最大次数/时间预算）触顶仍未成功才 Step Summary 告警（含异常/关卡/装备
@@ -483,44 +483,70 @@ function uuidToDotnet(u) {
     h.slice(14, 16) + h.slice(12, 14) + h.slice(16), "hex");
 }
 
-// 取「本角色最近一笔 SUCCESS sweep」的符文槽（runeInfos）与起点关卡。
-// GraphQL 只能读到 avatar.runes（拥有哪些符文、等级），读不到「装到哪个槽」，
-// 所以符文槽沿用历史 SUCCESS sweep 的槽位，再用 runes 列表校验每个 runeId 是否仍拥有。
+// 写【冒险模式】符文槽的 action。Lib9c 里这些 action 的 runeInfos 会由
+// RuneSlotState.UpdateSlot 写回 avatar 的 Adventure 符文槽（Raid/Arena 是各自独立的槽，
+// 绝不能用）。sweep 若带空 runeInfos 提交，会把冒险符文槽清空 —— 2026-11-26 实测
+// bnb 每笔 sweep 都把 runeInfos=[] 写回，符文被反复清空。故符文来源必须是「用户当前
+// 身上实际装配」的那套，即最近一笔带非空 runeInfos 的冒险战斗 action。
+const ADVENTURE_RUNE_ACTIONS = new Set([
+  "hack_and_slash",
+  "hack_and_slash_sweep10",
+  "event_dungeon_battle",
+  "event_dungeon_battle_sweep",
+  "explore_adventure_boss",
+  "sweep_adventure_boss",
+]);
+
+// 纯函数：从一组交易（Mimir items，按时间倒序=最新在前）里提取最近一笔
+// 「SUCCESS + 本角色 + 冒险 action + 非空 runeInfos」的符文槽，供自测覆盖。
+// 跳过空符文槽的交易 —— 那些正是被脚本清空后的 sweep，绝不能拿来当模板。
+function pickLatestAdventureRuneSlots(items, selfAddrBytes) {
+  for (const it of items || []) {
+    if (it?.object?.txStatus !== "SUCCESS") continue;
+    for (const a of it.object.actions || []) {
+      if (!ADVENTURE_RUNE_ACTIONS.has(a.typeId)) continue;
+      if (!a.raw || !/^[0-9a-fA-F]+$/.test(a.raw) || a.raw.length % 2 !== 0) continue;
+      try {
+        const action = decode(Buffer.from(a.raw, "hex"));
+        const v = action?.get?.("values");
+        if (!(v instanceof BencodexDictionary)) continue;
+        const av = v.get("avatarAddress");
+        if (!Buffer.isBuffer(av) || !av.equals(selfAddrBytes)) continue;   // 归属校验：只认本角色
+        const ri = v.get("runeInfos");
+        if (!ri) continue;
+        const runeSlots = [...ri].map(slot => [...slot].map(x => String(x)));
+        if (runeSlots.length === 0) continue;                              // 空符文槽跳过
+        return { runeSlots, source: `${a.typeId}@${it.blockIndex}` };
+      } catch (e) { /* 解析失败跳过该 action */ }
+    }
+  }
+  return null;
+}
+
+// 读「用户当前身上冒险模式符文槽」。GraphQL 读不到装配关系，故从链上最近一笔
+// 非空符文的冒险 action 反推（Lib9c 会把它写回符文槽，等价于当前实际装配）。
+// 找不到就返回 null —— 调用方必须拒绝 sweep，绝不用空符文覆盖清空用户符文。
 // 装备/时装绝不从这里取 —— 那是 2026-11-22 连败 30 笔的根因，改为现场读穿戴。
 async function fetchSweepTemplate() {
-  const q = `query($a:Address!){ transactions(filter:{avatarAddress:$a},take:40){
+  // Mimir 每页 take 上限 200，用 skip 翻页覆盖历史（扫货买装备会把符文记录挤到后面）。
+  // 新装的符文记录一定在最新一页最前，翻页也总是先命中最新的。
+  const q = `query($a:Address!,$sk:Int!){ transactions(filter:{avatarAddress:$a},take:200,skip:$sk){
     items { blockIndex object { txStatus actions { typeId raw } } } } }`;
+  const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
   try {
-    const d = await gql(CFG.mimir, q, { a: activeAddress() });
-    const items = d.data?.transactions?.items || [];
-    for (const it of items) {
-      const o = it.object || {};
-      if (o.txStatus !== "SUCCESS") continue;               // 只认成功的
-      for (const a of o.actions || []) {
-        if (a.typeId === SWEEP_TYPE_ID && a.raw &&
-            /^[0-9a-fA-F]+$/.test(a.raw) && a.raw.length % 2 === 0) {
-          const action = decode(Buffer.from(a.raw, "hex"));
-          const v = action?.get?.("values");
-          if (!(v instanceof BencodexDictionary)) continue;
-          // 归属校验：必须是本角色
-          const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
-          const av = v.get("avatarAddress");
-          if (!Buffer.isBuffer(av) || !av.equals(mine)) continue;
-          const runeSlots = [...v.get("runeInfos")].map(slot => [...slot].map(x => String(x)));
-          // 注意：只取符文槽。绝不取该交易的 stageId —— 那可能是用户手工打的
-          // 高级关（如 488 需入场材料 500001×N），现场构造不带 entryCost 字段
-          // 会 InvalidActionFieldException。关卡固定用 SWEEP_DEFAULT_STAGE（无入场
-          // 材料区），符文槽沿用历史 SUCCESS 即可（换符文后由 ownedRuneIds 过滤）。
-          return { runeSlots, source: `mimir@${it.blockIndex}` };
-        }
-      }
+    for (let page = 0; page < 3; page++) {
+      const d = await gql(CFG.mimir, q, { a: activeAddress(), sk: page * 200 });
+      const items = d.data?.transactions?.items || [];
+      if (!items.length) break;
+      const found = pickLatestAdventureRuneSlots(items, mine);
+      if (found) return found;
     }
   } catch (e) {
-    log({ level: "warn", msg: "拉取历史 sweep 符文槽失败（将用空符文槽现场构造）", detail: String(e.message) });
+    log({ level: "warn", msg: "拉取冒险符文槽失败（将拒绝 sweep，绝不用空符文覆盖）", detail: String(e.message) });
   }
-  // 找不到 SUCCESS 模板：符文槽用空（Lib9c 允许不装符文）——
-  // 装备仍现场读，只是少了符文加成，CP 可能不够触发降级。
-  return { runeSlots: [], source: "default" };
+  // 读不到非空符文槽：返回 null，spendApBySweep 必须拒绝构造 sweep。
+  // 宁可本轮不领日常，也不能用空符文写回把用户的符文清空。
+  return null;
 }
 
 // 从装备列表里挑某个槽位的 n 件（纯函数，供自测覆盖）：
@@ -626,10 +652,11 @@ function buildSweepActionLive(loadout, template, stageId) {
 //  1. 装备/时装每轮现场读当前穿戴（换装自动跟上），不再套旧 GUID；
 //  2. 失败后读链上 exceptionNames 诊断根因，当轮立即按维度升级修复再打：
 //       · 装备/符文 GUID 失效 → 强制重读 loadout（本实现每轮都重读）；
-//       · 命中失效符文 → 本轮下一次尝试改空符文槽（runeMode=none）；
 //       · CP/关卡/材料不足 → stage 下调一级（worldId 随之重算）；
-//       · 降到最低关仍不足 → 去掉符文降低 CP 门槛，继续打；
-//       · 未知/超时异常 → 同参数重试，连续多次仍未动则叠加上面的修复维度。
+//       · 未知/超时异常 → 同参数重试，连续多次仍未动则降关卡。
+//       · 铁律：符文恒用链上真实那套，任何修复维度都不得清空符文（空 runeInfos 会写回并清空）。
+//  2b. 2026-11-26：符文槽改从「最近一笔非空冒险符文 action」读取；读不到则拒绝 sweep，
+//      宁可不领也不清空。旧逻辑从 sweep 反推且失败改空符文，导致每笔 sweep 清空用户符文。
 //  3. 绝不"次数用尽就等下一轮"：只有硬护栏（最大次数/时间预算）触顶才停并告警。
 // 每笔新 id + nonce；重试前复核链上 AP，已消耗立即收敛去领日常（只认链上）。
 async function spendApBySweep(ctx, ap) {
@@ -650,8 +677,9 @@ async function spendApBySweep(ctx, ap) {
   let template = null;        // 符文槽模板（首轮拉一次）
   let loadout = null;
   let stage = SWEEP_DEFAULT_STAGE;
-  let runeMode = "full";      // full=带历史符文槽；none=空符文槽（降 CP 门槛 / 绕开失效符文）
-  let sameShapeFails = 0;     // 同一(stage,runeMode)形态下连续失败次数 → 用于升级修复维度
+  // 2026-11-26 起符文恒用「链上最近一笔非空冒险符文」，不再有 none 模式：
+  // 空符文 sweep 会把用户身上的符文清空（Lib9c 会把 runeInfos 写回符文槽）。
+  let sameShapeFails = 0;     // 同一 stage 形态下连续失败次数 → 用于升级修复维度
   let lastStatus = null;
   let lastDiag = null;
 
@@ -686,16 +714,23 @@ async function spendApBySweep(ctx, ap) {
     info.attemptLog.push(one);
     try {
       // 符文槽模板首轮拉一次（仅取符文槽；装备、关卡都不取模板）。
+      // 铁律：读不到非空符文槽 → 拒绝 sweep，绝不用空符文覆盖清空用户符文。
       if (!template) template = await fetchSweepTemplate();
+      if (!template || !template.runeSlots || template.runeSlots.length === 0) {
+        info.status = "blocked_no_runes";
+        info.stopReason = "no_adventure_runes";
+        info.msg = "读不到当前冒险模式符文槽，拒绝 sweep（用空符文会把你的符文清空）；请先在游戏里装好符文并打一笔冒险战斗";
+        log({ level: "warn", reward: "daily", msg: info.msg, attempts: info.attempts });
+        return info;
+      }
       // 装备/时装每轮现场重读 —— 换装后立刻跟上（修复根因）。
       loadout = await resolveLiveLoadout();
-      // 修复维度：runeMode=none 时丢弃全部符文槽（ Lib9c 允许无符文，CP 门槛降低）。
-      const effTemplate = runeMode === "none" ? { ...template, runeSlots: [] } : template;
-      const built = buildSweepActionLive(loadout, effTemplate, stage);
-      one.stage = built.stage; one.world = built.world; one.runeMode = runeMode;
+      // 符文恒用链上真实那套（template.runeSlots），永不置空。
+      const built = buildSweepActionLive(loadout, template, stage);
+      one.stage = built.stage; one.world = built.world; one.runeSource = template.source;
       one.equipCount = loadout.equipCount; one.costumeCount = loadout.costumeCount;
       one.runeCount = built.runeCount;
-      info.stage = built.stage; info.world = built.world;
+      info.stage = built.stage; info.world = built.world; info.runeSource = template.source;
 
       const nonce = await getNonce(ctx.signer.toString());
       one.nonce = Number(nonce);
@@ -704,7 +739,7 @@ async function spendApBySweep(ctx, ap) {
       log({ level: "info", reward: "daily",
             msg: `AP 已满：现场构造 sweep 消耗 ${SWEEP_AP_TARGET} AP（修复重试第 ${attempt}/${MAX} 次）`,
             txId, stage: built.stage, world: built.world, equip: loadout.equipCount,
-            costume: loadout.costumeCount, rune: built.runeCount, runeMode, attempt, maxAttempts: MAX });
+            costume: loadout.costumeCount, rune: built.runeCount, runeSource: template.source, attempt, maxAttempts: MAX });
 
       const r = await confirmTx(txId, SWEEP_CONFIRM_TRIES);
       one.txStatus = r.txStatus;
@@ -717,7 +752,7 @@ async function spendApBySweep(ctx, ap) {
       if (post === "success") {
         info.status = "swept";
         info.confirmedBy = "tx_status";
-        info.msg = `sweep 成功（第 ${attempt} 次，stage ${stage}, ${runeMode}符文），AP 已消耗，立即领日常`;
+        info.msg = `sweep 成功（第 ${attempt} 次，stage ${stage}, ${built.runeCount}符文），AP 已消耗，立即领日常`;
         log({ level: "info", reward: "daily", msg: info.msg, txId, attempts: info.attempts, stage });
         return info;
       }
@@ -727,37 +762,30 @@ async function spendApBySweep(ctx, ap) {
       lastDiag = diag; one.diagnosis = diag;
       log({ level: "warn", reward: "daily",
             msg: `sweep 第 ${attempt}/${MAX} 次未成功：${r.txStatus} / ${diag.action} / ${diag.reason} —— 本轮立即修复`,
-            txId, stage, runeMode, names: diag.names, attempt });
+            txId, stage, names: diag.names, attempt });
 
       if (diag.action === "refresh_loadout") {
-        // 装备/符文 GUID 失效：本轮下一次尝试强制重读（本就每轮重读），并改空符文槽绕开失效符文。
+        // 装备/符文 GUID 失效：本轮下一次尝试强制重读（本就每轮重读）。
+        // 注意：绝不因此改空符文槽 —— 那会清空用户身上的符文（2026-11-26 根因）。
+        // 失效符文由 buildSweepActionLive 的 ownedRuneIds 过滤自动剔除。
         sameShapeFails = 0;
         one.willRefreshLoadout = true;
-        if (runeMode !== "none") { runeMode = "none"; one.willDropRunes = true; }
       } else if (diag.action === "lower_stage") {
-        // CP/关卡/材料不足：优先逐级降关卡（worldId 随之重算）。
+        // CP/关卡/材料不足：逐级降关卡（worldId 随之重算）。符文始终保留。
         if (SWEEP_CP_FALLBACK_STEP > 0 && stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
           const from = stage;
           stage -= SWEEP_CP_FALLBACK_STEP;
           sameShapeFails = 0;
           log({ level: "info", reward: "daily", msg: `sweep 修复：关卡降级 ${from}→${stage}（world ${worldOfStage(stage)}），本轮立即重试` });
-        } else if (runeMode !== "none") {
-          // 已到最低关：去掉符文降低 CP 门槛，作为下一个修复维度，继续本轮重试。
-          runeMode = "none";
-          sameShapeFails = 0;
-          log({ level: "info", reward: "daily", msg: `sweep 修复：已到最低关 ${stage}，改空符文槽降低 CP 门槛，本轮立即重试` });
         } else {
-          // 最低关 + 空符文仍失败：形态已穷尽，计入计数让通用升级逻辑处理。
+          // 已到最低关仍失败：形态已穷尽，计入计数让通用逻辑处理（不再有空符文维度）。
           sameShapeFails += 1;
         }
       } else {
-        // 未知/超时异常：同形态重试；连续多次不动则升级修复维度（先去符文，再降关卡）。
+        // 未知/超时异常：同形态重试；连续多次不动则降关卡（符文永不清空）。
         sameShapeFails += 1;
         if (sameShapeFails >= SWEEP_MAX_SAME_STAGE_RETRY) {
-          if (runeMode !== "none") {
-            runeMode = "none";
-            log({ level: "info", reward: "daily", msg: `sweep 修复：未知异常重试未果，改空符文槽，本轮立即重试` });
-          } else if (stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
+          if (stage - SWEEP_CP_FALLBACK_STEP >= SWEEP_MIN_STAGE) {
             stage -= SWEEP_CP_FALLBACK_STEP;
             log({ level: "info", reward: "daily", msg: `sweep 修复：未知异常重试未果，关卡降级 ${stage}（world ${worldOfStage(stage)}），本轮立即重试` });
           }
@@ -867,7 +895,7 @@ async function sendSweepAlert(info, ctx) {
     `|---|---|---|---|---|---|---|`,
     attemptRows || "| - | - | - | - | - | - | - |",
     ``,
-    `> 本轮已按"失败即诊断→修复（重读装备/空符文/降关卡）→立即重试"循环修复仍未成功（仅硬护栏触顶才停，未推给下轮）。装备/时装均为现场读取；若仍报 ItemDoesNotExist 请检查装备是否被锁定/刚变动。AP 未消耗，日常暂不领（AP 满时领=零收益），待下次唤醒立即重修，修成即刻领取。`,
+    `> 本轮已按"失败即诊断→修复（重读装备/降关卡，符文不清空）→立即重试"循环修复仍未成功（仅硬护栏触顶才停，未推给下轮）。装备/时装均为现场读取；符文恒用链上真实那套，绝不用空符文写回清空。AP 未消耗，日常暂不领（AP 满时领=零收益），待下次唤醒立即重修，修成即刻领取。`,
     ``,
   ].join("\n");
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
@@ -947,6 +975,44 @@ function selfTest() {
     const ok = cases.every(([s, want]) => sweepAllowsClaim(s) === want);
     console.log(`  sweep 成功才领日常(仅swept放行) = ${ok}  ${ok ? "OK" : "FAIL"}`);
     if (ok) pass++;
+  }
+  // 2026-11-26 根因回归：sweep 用空 runeInfos 会把用户符文清空（Lib9c 写回符文槽）。
+  // pickLatestAdventureRuneSlots 必须：跳过空符文/失败交易/非冒险action/别人交易，
+  // 只取最近一笔「SUCCESS + 本角色 + 冒险action + 非空符文」的 runeInfos。
+  total++;
+  try {
+    const self = Buffer.from(Address.fromHex(AVATARS[0].address).toBytes());
+    const other = Buffer.from(Address.fromHex(AVATARS[1].address).toBytes());
+    const mkAction = (typeId, av, runeInfos) => {
+      const v = new BencodexDictionary([
+        ["avatarAddress", av],
+        ["runeInfos", runeInfos.map(([s, r]) => [s, r])],
+      ]);
+      return { typeId, raw: Buffer.from(encode(new BencodexDictionary([["type_id", typeId], ["values", v]]))).toString("hex") };
+    };
+    const runes = [["0", "30001"], ["1", "10056"], ["3", "10055"], ["6", "10052"]];
+    const items = [
+      // 最新：空符文 sweep（被清空后的记录）——必须跳过
+      { blockIndex: 300, object: { txStatus: "SUCCESS", actions: [mkAction("hack_and_slash_sweep10", self, [])] } },
+      // 非冒险 action（Raid）——跳过
+      { blockIndex: 299, object: { txStatus: "SUCCESS", actions: [mkAction("raid", self, [["0", "99999"]])] } },
+      // 别人的交易——跳过
+      { blockIndex: 298, object: { txStatus: "SUCCESS", actions: [mkAction("hack_and_slash", other, [["0", "88888"]])] } },
+      // 失败交易——跳过
+      { blockIndex: 297, object: { txStatus: "FAILURE", actions: [mkAction("hack_and_slash", self, [["0", "77777"]])] } },
+      // 最近一笔非空冒险符文——应取这条
+      { blockIndex: 296, object: { txStatus: "SUCCESS", actions: [mkAction("hack_and_slash", self, runes)] } },
+      // 更早的非空——不应取
+      { blockIndex: 200, object: { txStatus: "SUCCESS", actions: [mkAction("hack_and_slash_sweep10", self, [["0", "66666"]])] } },
+    ];
+    const got = pickLatestAdventureRuneSlots(items, self);
+    const ok = got && got.source === "hack_and_slash@296" &&
+      JSON.stringify(got.runeSlots) === JSON.stringify(runes) &&
+      pickLatestAdventureRuneSlots(items.slice(0, 4), self) === null;  // 全是空/非冒险/别人/失败 → null
+    console.log(`  冒险符文槽提取(跳空/非冒险/别人/失败,取最近非空) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  } catch (e) {
+    console.log(`  冒险符文槽提取 FAIL ${e.message}`);
   }
   // 失败不"下轮再修"：未成功一律 repair 继续本轮修复；成功才收敛放行领日常。
   total++;
