@@ -49,6 +49,24 @@
   读不到返回 null → `spendApBySweep` 拒绝提交。所有失败修复维度**不得清空符文**。
 - **换符文后**：在游戏里装好符文并打一笔冒险战斗，脚本自动跟随最新符文。
 
+### 5b. 符文读取/修复必须"确保能 sweep、且绝不清空"（2026-11-28）
+
+- **问题**：此前 (1) Mimir 一次抖动/节点落后就返回"读不到符文"→ 拒绝 sweep → 日常停领；
+  (2) `ownedRuneIds` 过滤在某些读取不一致时会把非空符文**过滤成空**，Lib9c 写回后
+  清空全部符文且交易 SUCCESS（无异常可诊断）；(3) 符文"不符"异常被误判成
+  `refresh_loadout`（只重读装备），在同一套错误符文上无限重试，永远修不好。
+- **加固**（均落到代码）：
+  - `fetchSweepTemplate()`：Mimir 翻页 + **整轮重试 2 次** + **进程内最近一次成功
+    符文槽兜底**，杜绝一次抖动就停领；兜底也只来自真实非空符文，绝不用空。
+  - `safeRuneInfos()`：非空模板**永不**被过滤成空；拥有列表读不到/全不匹配时保留
+    模板原样（继承第 5 条），只剔除"确已不拥有"的失效符文。
+  - `spendApBySweep()` 构造后**最后一道护栏**：模板有符文但构造出的 runeInfos 为空 →
+    拒绝提交 + 告警（`blocked_empty_runes`），绝不写空符文上链。
+  - `diagnoseSweepFailure()`：`RuneListNotFound`/`SlotRuneType`/`DuplicatedRuneId`/
+    `RuneInfosIsEmpty` 等**符文不符**异常 → `refresh_runes`，强制重读链上符文模板
+    （跟上刚打的冒险战斗），不再空转；`refresh_loadout` 也顺带重读符文模板。
+- **自测**：61/61；链上实测三角色符文槽 bnb 8 / bnbyes 6 / tomoon 6，均非空正确。
+
 ---
 
 ## 二、通用交易纪律

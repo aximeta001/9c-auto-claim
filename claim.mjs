@@ -438,8 +438,14 @@ function sweepAllowsClaim(status) {
 function diagnoseSweepFailure(exceptionNames) {
   const names = (exceptionNames || []).filter(Boolean).map(String);
   const joined = names.join("|");
+  // 符文「不符」：符文 id 不在表/槽位类型不匹配/重复符文/槽被锁。这类异常是
+  // 「符文槽与当前装配不一致」，必须【重新读链上符文模板】才能修；只重读装备无效，
+  // 会陷入无限重试（用户："失败修复不了，符文不符怎么办"）。2026-11-28 新增。
+  if (/RuneListNotFound|SlotRuneType|IsUsableSlot|IsEquippableRune|DuplicatedRuneId|SlotIsLocked|SlotNotFound|RuneInfosIsEmpty|InvalidRune/i.test(joined)) {
+    return { action: "refresh_runes", reason: "符文槽与链上装配不符，需重新读取符文模板", names };
+  }
   // 装备/符文不在背包：换装后旧 GUID 失效，正是 2026-11-22 连败的根因。
-  if (/ItemDoesNotExist|Equipment.*NotFound|Rune.*NotFound|InvalidEquipment|InvalidRune/i.test(joined)) {
+  if (/ItemDoesNotExist|Equipment.*NotFound|Rune.*NotFound|InvalidEquipment/i.test(joined)) {
     return { action: "refresh_loadout", reason: "装备/符文 GUID 已失效（可能刚换装）", names };
   }
   // CP 不够：降关卡是唯一可靠解（读不到实时 CP，只能靠链上异常反馈逐级试）。
@@ -523,30 +529,65 @@ function pickLatestAdventureRuneSlots(items, selfAddrBytes) {
   return null;
 }
 
+// 进程内「最近一次成功读到」的符文模板。Mimir 偶发抖动/节点落后时兜底：
+// 用同一进程内上一次成功的真实符文槽，而不是拒绝 sweep 或退回空符文。
+// 只在「读不到任何新数据」时才用，一旦重新读到真实数据立刻覆盖。
+let lastGoodRuneTemplate = null;
+
 // 读「用户当前身上冒险模式符文槽」。GraphQL 读不到装配关系，故从链上最近一笔
 // 非空符文的冒险 action 反推（Lib9c 会把它写回符文槽，等价于当前实际装配）。
 // 找不到就返回 null —— 调用方必须拒绝 sweep，绝不用空符文覆盖清空用户符文。
 // 装备/时装绝不从这里取 —— 那是 2026-11-22 连败 30 笔的根因，改为现场读穿戴。
+// 2026-11-28 加固：Mimir 翻页 + 整轮重试 + 进程内缓存兜底，避免一次网络抖动
+// 就让日常 sweep 停摆（用户："要确保能够 sweep"）。
 async function fetchSweepTemplate() {
   // Mimir 每页 take 上限 200，用 skip 翻页覆盖历史（扫货买装备会把符文记录挤到后面）。
   // 新装的符文记录一定在最新一页最前，翻页也总是先命中最新的。
   const q = `query($a:Address!,$sk:Int!){ transactions(filter:{avatarAddress:$a},take:200,skip:$sk){
     items { blockIndex object { txStatus actions { typeId raw } } } } }`;
   const mine = Buffer.from(Address.fromHex(activeAddress()).toBytes());
-  try {
-    for (let page = 0; page < 3; page++) {
-      const d = await gql(CFG.mimir, q, { a: activeAddress(), sk: page * 200 });
-      const items = d.data?.transactions?.items || [];
-      if (!items.length) break;
-      const found = pickLatestAdventureRuneSlots(items, mine);
-      if (found) return found;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      for (let page = 0; page < 3; page++) {
+        const d = await gql(CFG.mimir, q, { a: activeAddress(), sk: page * 200 });
+        const items = d.data?.transactions?.items || [];
+        if (!items.length) break;
+        const found = pickLatestAdventureRuneSlots(items, mine);
+        if (found) {
+          lastGoodRuneTemplate = found;      // 记住最近一次真实成功读取
+          return found;
+        }
+      }
+    } catch (e) {
+      log({ level: "warn", msg: `拉取冒险符文槽第 ${attempt}/2 次失败`, detail: String(e.message) });
     }
-  } catch (e) {
-    log({ level: "warn", msg: "拉取冒险符文槽失败（将拒绝 sweep，绝不用空符文覆盖）", detail: String(e.message) });
+    if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
   }
-  // 读不到非空符文槽：返回 null，spendApBySweep 必须拒绝构造 sweep。
+  // 本轮完全读不到：用进程内最近一次成功的真实符文槽兜底，绝不退回空符文。
+  if (lastGoodRuneTemplate) {
+    log({ level: "warn", msg: "冒险符文槽本轮读取失败，使用进程内最近一次成功的真实符文槽兜底（非空，不清空符文）",
+          source: lastGoodRuneTemplate.source, runeCount: lastGoodRuneTemplate.runeSlots.length });
+    return { ...lastGoodRuneTemplate, source: `${lastGoodRuneTemplate.source}(cached)` };
+  }
+  // 从未成功读过任何非空符文槽：返回 null，spendApBySweep 必须拒绝构造 sweep。
   // 宁可本轮不领日常，也不能用空符文写回把用户的符文清空。
   return null;
+}
+
+// 符文槽安全收敛（2026-11-28）：ownedRuneIds 只用来剔除「确已不在身上」的失效符文，
+// 绝不允许把非空模板过滤成空 —— 空 runeInfos 会被 Lib9c UpdateSlot 全卸下写回，
+// 直接清空用户符文，且交易仍 SUCCESS（无异常可供失败诊断发现）。这是"符文不符清空"
+// 的根因。规则：
+//   · 模板为空 → 返回空（用户本就无符文，不构成清空）；
+//   · 拥有列表读不到/为空 → 信任模板原样（不能据不可靠读结果剔除符文）；
+//   · 剔除后非空 → 用剔除结果（失效符文不再上报 ItemDoesNotExist）；
+//   · 剔除后为空 → 视为读取不一致，保留模板原样，绝不提交空符文。
+function safeRuneInfos(runeSlots, ownedRuneIds) {
+  const raw = (runeSlots || []).map(([s, r]) => [String(s), String(r)]);
+  if (raw.length === 0) return [];
+  if (!ownedRuneIds || ownedRuneIds.size === 0) return raw;
+  const kept = raw.filter(([, rid]) => ownedRuneIds.has(Number(rid)));
+  return kept.length ? kept : raw;
 }
 
 // 从装备列表里挑某个槽位的 n 件（纯函数，供自测覆盖）：
@@ -628,10 +669,9 @@ async function resolveLiveLoadout() {
 function buildSweepActionLive(loadout, template, stageId) {
   const stage = Math.max(1, Math.trunc(Number(stageId)));
   const world = worldOfStage(stage);
-  // 符文槽：过滤掉「已不拥有」的符文（换符文/分解后 runeId 失效会报 ItemDoesNotExist）。
-  const runeInfos = (template.runeSlots || [])
-    .filter(([slot, rid]) => loadout.ownedRuneIds.size === 0 || loadout.ownedRuneIds.has(Number(rid)))
-    .map(([slot, rid]) => [String(slot), String(rid)]);
+  // 符文槽：剔除「确已不拥有」的失效符文，但绝不允许把非空模板过滤成空
+  // （空 runeInfos 会被 Lib9c 写回并清空全部符文，且交易 SUCCESS 无异常可诊断）。
+  const runeInfos = safeRuneInfos(template.runeSlots, loadout.ownedRuneIds);
   const values = new BencodexDictionary([
     ["actionPoint", String(SWEEP_AP_TARGET)],  // 一次用满 120 AP
     ["apStoneCount", "0"],                       // 不消耗 AP 药水
@@ -727,6 +767,16 @@ async function spendApBySweep(ctx, ap) {
       loadout = await resolveLiveLoadout();
       // 符文恒用链上真实那套（template.runeSlots），永不置空。
       const built = buildSweepActionLive(loadout, template, stage);
+      // 最后一道铁律护栏：模板有符文但构造出的 runeInfos 为空 = 会清空用户符文，
+      // 绝不提交。宁可本轮拒绝并告警，也不写空符文回链上。
+      if (template.runeSlots.length > 0 && built.runeCount === 0) {
+        info.status = "blocked_empty_runes";
+        info.stopReason = "safe_rune_guard";
+        info.msg = "构造出的符文槽为空（会清空你的符文），已拒绝提交；符文槽以链上真实装配为准";
+        log({ level: "error", reward: "daily", msg: info.msg,
+              templateSlots: template.runeSlots, ownedRuneIds: [...loadout.ownedRuneIds] });
+        break;
+      }
       one.stage = built.stage; one.world = built.world; one.runeSource = template.source;
       one.equipCount = loadout.equipCount; one.costumeCount = loadout.costumeCount;
       one.runeCount = built.runeCount;
@@ -764,10 +814,20 @@ async function spendApBySweep(ctx, ap) {
             msg: `sweep 第 ${attempt}/${MAX} 次未成功：${r.txStatus} / ${diag.action} / ${diag.reason} —— 本轮立即修复`,
             txId, stage, names: diag.names, attempt });
 
-      if (diag.action === "refresh_loadout") {
-        // 装备/符文 GUID 失效：本轮下一次尝试强制重读（本就每轮重读）。
+      if (diag.action === "refresh_runes") {
+        // 符文「不符」：清掉内存模板，强制下一轮重新读链上符文模板，以便跟上用户
+        // 刚在冒险战斗里写入的最新符文装配（Mimir 2 次重试，仍读不到才用进程内
+        // 最近一次真实非空符文兜底，绝不清空）。绝不清空符文槽、绝不降关卡「绕过」
+        // 符文问题 —— 那只会清空/用错符文。
+        template = null;
+        one.willRefreshRunes = true;
+        sameShapeFails = 0;
+      } else if (diag.action === "refresh_loadout") {
+        // 装备/符文 GUID 失效：本轮下一次尝试强制重读（装备本就每轮重读）。
+        // 同时清掉符文模板强制重读 —— 若失效的是被分解的符文，重读能跟上最新装配。
         // 注意：绝不因此改空符文槽 —— 那会清空用户身上的符文（2026-11-26 根因）。
-        // 失效符文由 buildSweepActionLive 的 ownedRuneIds 过滤自动剔除。
+        // 失效符文由 buildSweepActionLive 的 safeRuneInfos 过滤自动剔除。
+        template = null;
         sameShapeFails = 0;
         one.willRefreshLoadout = true;
       } else if (diag.action === "lower_stage") {
@@ -1013,6 +1073,43 @@ function selfTest() {
     if (ok) pass++;
   } catch (e) {
     console.log(`  冒险符文槽提取 FAIL ${e.message}`);
+  }
+  // 2026-11-28：safeRuneInfos 绝不能把非空模板过滤成空（空 runeInfos 会清空用户符文）。
+  total++;
+  {
+    const tpl = [["0", "30001"], ["1", "10056"], ["6", "10052"]];
+    const cases = [
+      // 拥有列表读不到/为空 → 信任模板原样
+      [tpl, new Set(), tpl],
+      [tpl, null, tpl],
+      // 部分失效 → 只剔除失效符文
+      [tpl, new Set([30001, 10056]), [["0", "30001"], ["1", "10056"]]],
+      // 全部"失效"（读取不一致）→ 保留模板，绝不用空符文清空
+      [tpl, new Set([99999]), tpl],
+      // 模板本就为空 → 空（无符文不构成清空）
+      [[], new Set([30001]), []],
+    ];
+    const ok = cases.every(([t, owned, want]) =>
+      JSON.stringify(safeRuneInfos(t, owned)) === JSON.stringify(want));
+    console.log(`  safeRuneInfos 非空模板绝不过滤成空(符文不符不清空) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
+  }
+  // 2026-11-28：符文"不符"类异常必须诊断为 refresh_runes（重读符文模板），
+  // 不能再误判成 refresh_loadout 只重读装备而在同一套错误符文上无限重试。
+  total++;
+  {
+    const cases = [
+      [["SlotRuneTypeException"], "refresh_runes"],
+      [["RuneListNotFoundException"], "refresh_runes"],
+      [["DuplicatedRuneIdException"], "refresh_runes"],
+      [["RuneInfosIsEmptyException"], "refresh_runes"],
+      [["ItemDoesNotExistException"], "refresh_loadout"],
+      [["NotEnoughCombatPointException"], "lower_stage"],
+      [[], "retry"],
+    ];
+    const ok = cases.every(([names, want]) => diagnoseSweepFailure(names).action === want);
+    console.log(`  符文不符异常→refresh_runes(重读符文而非空转) = ${ok}  ${ok ? "OK" : "FAIL"}`);
+    if (ok) pass++;
   }
   // 失败不"下轮再修"：未成功一律 repair 继续本轮修复；成功才收敛放行领日常。
   total++;
