@@ -143,6 +143,15 @@ const DRAUP = {
 // 零挂单，此阈值属于「蹲误挂」档位，正常行情下大概率长期不成交。要真正扫货需上调：
 //   --rune-group-max-unit-price-minor 20   → 0.20 NCG（四件合计约 984 单）
 // 命中即全买，不设持仓目标、不设花费封顶（按用户 2026-11-28 决定）。
+// 【第四目标，2026-11-29 新增】奥丁四件套：两件技能型（主力）+ 两件属性型
+//   10045 Odin Word Rune    RUNESTONE_ODIN_WORD      技能 +50% SPD（世界王+竞技场）
+//   10043 Odin Order Rune   RUNESTONE_ODIN_ORDER     技能 +50% ATK（冒险+竞技场）
+//   10044 Odin Creator Rune RUNESTONE_ODIN_CREATOR   属性 ATK/HP/HIT
+//   10046 Odin Mimir's Rune RUNESTONE_ODIN_MIMIR     属性 SPD/HIT/HP
+// 逐件阈值：技能型 0.5 NCG（50 minor），属性型 0.2 NCG（20 minor）。
+// targets 上的 maxUnitPriceMinor 缺省时回落到组默认值（旧四件仍是 5 minor = 0.05）。
+// 注：奥丁系列共 6 件（含 10031 虚弱 / 10032 智慧），另有世界树 4 件（10047–10050）；
+//     本次只买上述 4 件，其余 6 件不动。10031 是「降敌全属性」debuff，非增益，别混。
 const RUNE_GROUP = {
   enabled: !args.includes("--no-rune-group"),
   maxUnitPriceMinor: BigInt(Math.max(0, Math.trunc(numArg("--rune-group-max-unit-price-minor", 5)))),
@@ -151,8 +160,15 @@ const RUNE_GROUP = {
     { runeId: 10040, name: "Thor Strike Rune (WorldBoss)", ticker: "RUNESTONE_THOR_STUN2" },
     { runeId: 10041, name: "Loki Vampiric Rune (Adventure)", ticker: "RUNESTONE_LOKI_VAMPIRIC1" },
     { runeId: 10042, name: "Loki Vampiric Rune (WorldBoss)", ticker: "RUNESTONE_LOKI_VAMPIRIC2" },
+    // —— 奥丁四件（逐件阈值）——
+    { runeId: 10045, name: "Odin Word Rune", ticker: "RUNESTONE_ODIN_WORD", maxUnitPriceMinor: 50n },
+    { runeId: 10043, name: "Odin Order Rune", ticker: "RUNESTONE_ODIN_ORDER", maxUnitPriceMinor: 50n },
+    { runeId: 10044, name: "Odin Creator Rune", ticker: "RUNESTONE_ODIN_CREATOR", maxUnitPriceMinor: 20n },
+    { runeId: 10046, name: "Odin Mimir's Rune", ticker: "RUNESTONE_ODIN_MIMIR", maxUnitPriceMinor: 20n },
   ],
 };
+// 每件符文的实际单价红线（minor）：target 自带优先，否则用组默认
+const runeCap = (t) => BigInt(t.maxUnitPriceMinor ?? RUNE_GROUP.maxUnitPriceMinor);
 
 // 单价阈值：0.2 NCG / 件。NCG 有 2 位小数 => 0.2 NCG = 20 minor units。
 // 判定用整数：price(NCG)*100 <= pricePerItemMinor(20) * quantity
@@ -748,17 +764,19 @@ async function scanAndBuy(ctx, opts = {}) {
           const f3 = await fetchListings(t.ticker);
           l3 = f3.listings; raw3 = f3.rawCount; rej3 = f3.rejected;
         }
-        const c3 = selectCandidates(l3, RUNE_GROUP.maxUnitPriceMinor, t.ticker);
+        const cap = runeCap(t);
+        const capNcg = Number(cap) / 100;
+        const c3 = selectCandidates(l3, cap, t.ticker);
         runeGroupPicks.push(...c3.map((c) => ({ ...c, kind: "rune", runeId: t.runeId, runeName: t.name })));
         runeGroupInfo.push({
           ticker: t.ticker, runeId: t.runeId, name: t.name,
-          maxUnitPriceNcg: Number(RUNE_GROUP.maxUnitPriceMinor) / 100,
+          maxUnitPriceNcg: capNcg,
           rawCount: raw3, rejectedByTicker: rej3, candidateCount: c3.length,
           minUnitPrice: c3.length ? Math.min(...c3.map((c) => c.unitPrice)) : null,
         });
         if (raw3 > 0 && c3.length === 0) {
           // 有挂单但一条都不达标：把真实最低价打出来，方便判断阈值该不该调
-          log({ level: "info", msg: `${t.name} 有 ${raw3} 条挂单，但无一条 ≤ ${Number(RUNE_GROUP.maxUnitPriceMinor) / 100} NCG` });
+          log({ level: "info", msg: `${t.name} 有 ${raw3} 条挂单，但无一条 ≤ ${capNcg} NCG` });
         }
       } catch (e) {
         runeGroupInfo.push({
@@ -947,6 +965,7 @@ async function daemonMode() {
       enabled: RUNE_GROUP.enabled,
       maxUnitPriceNcg: Number(RUNE_GROUP.maxUnitPriceMinor) / 100,
       targets: RUNE_GROUP.targets.map((t) => `${t.runeId}:${t.name}`),
+      caps: RUNE_GROUP.targets.map((t) => `${t.runeId}:<=${Number(runeCap(t)) / 100}NCG`),
       lastRound: [],
     },
     config: {
@@ -1001,7 +1020,7 @@ async function daemonMode() {
               ? `${DRAUP.ticker}/<=${Number(DRAUP.maxUnitPriceMinor) / 100}NCG/总持仓${DRAUP.targetHeld}个`
               : "关闭",
             runeGroup: RUNE_GROUP.enabled
-              ? `${RUNE_GROUP.targets.length}件/<=${Number(RUNE_GROUP.maxUnitPriceMinor) / 100}NCG/不封顶`
+              ? `${RUNE_GROUP.targets.length}件/${RUNE_GROUP.targets.map((t) => `${t.runeId}<=${Number(runeCap(t)) / 100}`).join(",")}NCG/不封顶`
               : "关闭",
             pollSeconds: POLL_SEC, maxRunSeconds: MAX_RUN_MS / 1000 });
     }
@@ -1113,9 +1132,11 @@ async function onceMode() {
   out.runeGroup = {
     enabled: RUNE_GROUP.enabled,
     maxUnitPriceNcg: Number(RUNE_GROUP.maxUnitPriceMinor) / 100,
+    caps: RUNE_GROUP.targets.map((t) => `${t.runeId}:<=${Number(runeCap(t)) / 100}NCG`),
     spendCap: null,                       // 不设封顶（2026-11-28 决定）
     targets: r.runeGroup || RUNE_GROUP.targets.map((t) => ({
-      ticker: t.ticker, runeId: t.runeId, name: t.name, candidateCount: null,
+      ticker: t.ticker, runeId: t.runeId, name: t.name,
+      maxUnitPriceNcg: Number(runeCap(t)) / 100, candidateCount: null,
     })),
     hits: (r.runeGroup || []).reduce((a, g) => a + (g.candidateCount || 0), 0),
   };
@@ -1210,13 +1231,13 @@ function selfTest() {
     }
   }
 
-  // 3c) 符文四件套：四个 ticker 各自精确匹配、互不串味；0.05 NCG 阈值严格
+  // 3c) 符文组：8 个 ticker 各自精确匹配、互不串味；逐件阈值（旧四件 0.05 / 奥丁 0.5、0.2）
   {
     const TG = RUNE_GROUP.targets;
-    chk("四件套恰为 4 个目标", TG.length === 4, `len=${TG.length}`);
-    chk("四件套 ticker 无重复", new Set(TG.map((t) => t.ticker)).size === 4);
-    chk("四件套 runeId 无重复", new Set(TG.map((t) => t.runeId)).size === 4);
-    chk("四件套 ticker 全部以 RUNESTONE_ 开头", TG.every((t) => t.ticker.startsWith("RUNESTONE_")));
+    chk("符文组恰为 8 个目标", TG.length === 8, `len=${TG.length}`);
+    chk("符文组 ticker 无重复", new Set(TG.map((t) => t.ticker)).size === 8);
+    chk("符文组 runeId 无重复", new Set(TG.map((t) => t.runeId)).size === 8);
+    chk("符文组 ticker 全部以 RUNESTONE_ 开头", TG.every((t) => t.ticker.startsWith("RUNESTONE_")));
 
     const mkP = (ticker, price, qty, id) => ({
       ticker, exist: true, legacy: false, price, quantity: qty, productId: id,
@@ -1224,13 +1245,13 @@ function selfTest() {
       sellerAvatarAddress: "0x2222222222222222222222222222222222222222",
     });
 
-    // 每个目标：自己的 ticker 必须命中，其余三个必须拒绝（防空投串货）
+    // 每个目标：自己的 ticker 必须命中，其余 ticker 必须拒绝（防空投串货）
     for (const t of TG) {
       const self = isTargetListing(mkP(t.ticker, 1, 20, "s"), true, t.ticker, EMPTY_TICKERS);
       const others = TG.filter((x) => x.ticker !== t.ticker)
         .map((x) => isTargetListing(mkP(x.ticker, 1, 20, "o"), true, t.ticker, EMPTY_TICKERS));
-      chk(`四件套 ${t.runeId} 只认自己 ticker`, self === true && others.every((v) => v === false));
-      chk(`四件套 ${t.runeId} 名字相似串拒绝`,
+      chk(`符文组 ${t.runeId} 只认自己 ticker`, self === true && others.every((v) => v === false));
+      chk(`符文组 ${t.runeId} 名字相似串拒绝`,
         isTargetListing(mkP(t.ticker + "_OLD", 1, 20, "o"), true, t.ticker, EMPTY_TICKERS) === false);
     }
 
@@ -1238,15 +1259,17 @@ function selfTest() {
     const thor = TG.find((t) => t.runeId === 10040);
     chk("10040 指向 WorldBoss 变体(THOR_STUN2)", thor && thor.ticker === "RUNESTONE_THOR_STUN2");
 
-    // 0.05 NCG/件 = 5 minor：恰好命中、略超即拒
-    chk("四件套 0.05 恰好命中(1/20)", isCheapEnough(1, 20, 5n) === true);
-    chk("四件套 0.05 边界命中(5/100)", isCheapEnough(5, 100, 5n) === true);
-    chk("四件套 0.06(6/100) 略超不买", isCheapEnough(6, 100, 5n) === false);
-    chk("四件套 0.125(125/1000) 不买", isCheapEnough(125, 1000, 5n) === false);
-    chk("四件套 0.15(3/20) 不买", isCheapEnough(3, 20, 5n) === false);
-    chk("四件套 0.20(2/10) 不买", isCheapEnough(2, 10, 5n) === false);
+    // 旧四件仍走组默认 0.05 NCG/件 = 5 minor：恰好命中、略超即拒
+    const LEGACY = TG.filter((t) => t.runeId >= 10039 && t.runeId <= 10042);
+    chk("旧四件阈值仍为 0.05", LEGACY.length === 4 && LEGACY.every((t) => Number(runeCap(t)) === 5));
+    chk("旧四件 0.05 恰好命中(1/20)", isCheapEnough(1, 20, 5n) === true);
+    chk("旧四件 0.05 边界命中(5/100)", isCheapEnough(5, 100, 5n) === true);
+    chk("旧四件 0.06(6/100) 略超不买", isCheapEnough(6, 100, 5n) === false);
+    chk("旧四件 0.125(125/1000) 不买", isCheapEnough(125, 1000, 5n) === false);
+    chk("旧四件 0.15(3/20) 不买", isCheapEnough(3, 20, 5n) === false);
+    chk("旧四件 0.20(2/10) 不买", isCheapEnough(2, 10, 5n) === false);
 
-    // 真实行情回归（2026-11-28 实测最低价）：
+    // 旧四件真实行情回归（2026-11-28 实测最低价）：
     //   10039 0.125 / 10040 0.150 / 10041 0.200 / 10042 0.150，每个再配一条高价单
     //   0.05 阈值 → 四件全不中；0.20 阈值 → 四件各中 1 单（只吃低价那条）
     const liveSample = [
@@ -1255,13 +1278,47 @@ function selfTest() {
       mkP("RUNESTONE_LOKI_VAMPIRIC1", 2, 10, "c1"), mkP("RUNESTONE_LOKI_VAMPIRIC1", 30, 10, "c2"),
       mkP("RUNESTONE_LOKI_VAMPIRIC2", 3, 20, "d1"), mkP("RUNESTONE_LOKI_VAMPIRIC2", 25, 10, "d2"),
     ];
-    chk("真实行情@0.05 四件全不命中",
-      RUNE_GROUP.targets.every((t) => selectCandidates(liveSample, 5n, t.ticker).length === 0));
-    chk("真实行情@0.20 四件各中 1 单（只吃低价那条）",
-      RUNE_GROUP.targets.every((t) => {
+    chk("旧四件真实行情@0.05 全不命中",
+      LEGACY.every((t) => selectCandidates(liveSample, runeCap(t), t.ticker).length === 0));
+    chk("旧四件真实行情@0.20 各中 1 单（只吃低价那条）",
+      LEGACY.every((t) => {
         const c = selectCandidates(liveSample, 20n, t.ticker);
         return c.length === 1 && c[0].productId.endsWith("1");
       }));
+
+    // —— 奥丁四件：逐件阈值 + 真实行情回归（2026-11-29 实测）——
+    const odin = (id) => TG.find((t) => t.runeId === id);
+    chk("奥丁 10045/10043 阈值 0.5", Number(runeCap(odin(10045))) === 50 && Number(runeCap(odin(10043))) === 50);
+    chk("奥丁 10044/10046 阈值 0.2", Number(runeCap(odin(10044))) === 20 && Number(runeCap(odin(10046))) === 20);
+    chk("奥丁 ticker 对应无误",
+      odin(10045).ticker === "RUNESTONE_ODIN_WORD" && odin(10043).ticker === "RUNESTONE_ODIN_ORDER" &&
+      odin(10044).ticker === "RUNESTONE_ODIN_CREATOR" && odin(10046).ticker === "RUNESTONE_ODIN_MIMIR");
+    chk("0.5 边界命中(50/100)", isCheapEnough(50, 100, 50n) === true);
+    chk("0.51 略超不买(51/100)", isCheapEnough(51, 100, 50n) === false);
+    chk("0.2 边界命中(20/100)", isCheapEnough(20, 100, 20n) === true);
+    chk("0.21 略超不买(21/100)", isCheapEnough(21, 100, 20n) === false);
+    // ORDER 最低 0.9（80 单）→ 0.5 一单不中
+    // WORD  最低 0.5（82 单）→ 命中
+    // CREATOR 最低 0.5、另有 0.2 单 → 只吃 0.2
+    // MIMIR 最低 0.5（95 单）→ 0.2 一单不中
+    const odinSample = [
+      mkP("RUNESTONE_ODIN_ORDER", 90, 100, "o1"),
+      mkP("RUNESTONE_ODIN_WORD", 50, 100, "w1"), mkP("RUNESTONE_ODIN_WORD", 120, 100, "w2"),
+      mkP("RUNESTONE_ODIN_CREATOR", 50, 100, "c1"), mkP("RUNESTONE_ODIN_CREATOR", 20, 100, "c2"),
+      mkP("RUNESTONE_ODIN_MIMIR", 50, 100, "m1"),
+    ];
+    chk("奥丁 ORDER@0.5 不中（最低 0.9）",
+      selectCandidates(odinSample, runeCap(odin(10043)), "RUNESTONE_ODIN_ORDER").length === 0);
+    {
+      const cw = selectCandidates(odinSample, runeCap(odin(10045)), "RUNESTONE_ODIN_WORD");
+      chk("奥丁 WORD@0.5 恰好中 1 单", cw.length === 1 && cw[0].productId === "w1");
+      const cc = selectCandidates(odinSample, runeCap(odin(10044)), "RUNESTONE_ODIN_CREATOR");
+      chk("奥丁 CREATOR@0.2 只吃 0.2 那单", cc.length === 1 && cc[0].productId === "c2");
+      const cm = selectCandidates(odinSample, runeCap(odin(10046)), "RUNESTONE_ODIN_MIMIR");
+      chk("奥丁 MIMIR@0.2 不中（最低 0.5）", cm.length === 0);
+    }
+    chk("奥丁四件不与旧四件共用 ticker",
+      [10043, 10044, 10045, 10046].every((id) => !LEGACY.some((t) => t.ticker === odin(id).ticker)));
   }
 
   // 4) UUID → bytes_le：与链上真实交易 / 9CAPI mobileBuy 返回逐字节对齐

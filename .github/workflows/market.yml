@@ -1,4 +1,4 @@
-name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir + 符文四件套)
+name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir + 符文四件套 + 奥丁四件套)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 独立链：与 claim.yml 领奖链完全隔离、互不干扰（各自独立 concurrency 组）。
@@ -23,6 +23,15 @@ name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir + 符文四件
 #          "(Arena)"，实际是 WorldBoss（use_place=4 / ticker=THOR_STUN2），判定只认 ticker。
 #          实测 2026-11-28 四件最低价 0.125/0.150/0.200/0.150 NCG，0.05 以下零挂单，
 #          属「蹲误挂」档位；要真正扫货需 --rune-group-max-unit-price-minor 20（=0.20 NCG）。
+#        · 奥丁四件套（2026-11-29 新增，逐件阈值，不设持仓目标/封顶）：
+#            10045 Odin Word Rune    RUNESTONE_ODIN_WORD     技能 +50% SPD   <= 0.5 NCG
+#            10043 Odin Order Rune   RUNESTONE_ODIN_ORDER    技能 +50% ATK   <= 0.5 NCG
+#            10044 Odin Creator Rune RUNESTONE_ODIN_CREATOR  属性 ATK/HP/HIT <= 0.2 NCG
+#            10046 Odin Mimir's Rune RUNESTONE_ODIN_MIMIR    属性 SPD/HIT/HP <= 0.2 NCG
+#          阈值写在各 target 的 maxUnitPriceMinor 上（50/50/20/20 minor），
+#          旧四件不写则回落组默认 5 minor。10031 奥丁·虚弱是降敌 debuff，不在列。
+#          实测 2026-11-29：ORDER 最低 0.9（0 单达标）、WORD 最低 0.5（1 单）、
+#          CREATOR/MIMIR 最低 0.5（0 单 <= 0.2）——按用户决定不改价，耐心等挂单。
 #  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
 #        下一个常驻 job（GITHUB_TOKEN 是防递归规则的例外）。
 #  重燃：schedule 每 10 分钟错峰（与领奖链 4,14,24... 错开到 9,19,29...），
@@ -52,11 +61,11 @@ permissions:
   actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
 
 concurrency:
-  # 组名带 -v2：2026-11-28 加符文四件套时由 `9c-market-buy` 更名而来。
+  # 组名带 -v3：2026-11-29 加奥丁四件套时由 `9c-market-buy-v2` 更名而来。
   # 并发组在 run 启动瞬间锁定，改组名即可让新代码立刻在另一组起跑，不必等
   # 旧 job 跑满 5.5h 交棒，也不必取消正在值守的 job（PAT 无 actions:write）。
-  # 旧 job 结束时它 dispatch 的接力 run 读本文件，自动落入 v2 组串行接管。
-  group: 9c-market-buy-v2       # 独立组：绝不与 claim.yml 的 9c-auto-claim 共用
+  # 旧 job 结束时它 dispatch 的接力 run 读本文件，自动落入 v3 组串行接管。
+  group: 9c-market-buy-v3       # 独立组：绝不与 claim.yml 的 9c-auto-claim 共用
   cancel-in-progress: false      # 绝不能取消正在值守的 job
 
 jobs:

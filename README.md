@@ -8,7 +8,7 @@
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG）+ **Draupnir 符文**（≤40 NCG/个、总持仓 40 停）+ **符文四件套**（10039/10040/10041/10042，≤0.05 NCG/件、不封顶） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG）+ **Draupnir 符文**（≤40 NCG/个、总持仓 40 停）+ **符文四件套**（10039/10040/10041/10042，≤0.05 NCG/件、不封顶）+ **奥丁四件套**（10045/10043 ≤0.5、10044/10046 ≤0.2 NCG/件、不封顶） | 自接力常驻 |
 | **AB Sweep 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
 | **AB 爬楼链** | **`explore-boss.yml`** | **`explore-boss.mjs`** | Adventure Boss 自动挑战爬楼到目标层（门票全程 Golden Dust） | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
@@ -208,7 +208,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 文件 | 作用 |
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）+ Draupnir（≤40 NCG/个、只买 10/20 整堆、总持仓 40 停）+ 符文四件套（10039/10040/10041/10042，≤0.05 NCG/件、不设封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）+ Draupnir（≤40 NCG/个、只买 10/20 整堆、总持仓 40 停）+ 符文四件套（10039/10040/10041/10042，≤0.05 NCG/件、不设封顶）+ 奥丁四件套（10045/10043 技能型 ≤0.5、10044/10046 属性型 ≤0.2 NCG/件，逐件阈值）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
 | `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
 | `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
@@ -608,7 +608,52 @@ p[0] = [ productId(16B), [NCG currency, price×100], sellerAgent(20B), sellerAva
 | `--rune-group-max-unit-price-minor N` | `5` | 单价上限最小单位（5 = 0.05 NCG/件） |
 | `--no-rune-group` | 关闭 | 临时关闭四件套，只跑原有目标 |
 
-自测已扩到 **100/100**，四件套部分覆盖：4 个目标不重复、逐个 ticker 只认自己
-（其余三个互不串味）、名字相似串拒绝、10040 必须指向 `THOR_STUN2`、0.05 边界
-（1/20 与 5/100 命中，6/100 拒）、以及按 2026-11-28 真实行情做的回归
-（0.05 全不中 / 0.20 各中 1 单）。
+自测已扩到 **121/121**，符文组部分覆盖：8 个目标不重复、逐个 ticker 只认自己
+（其余互不串味）、名字相似串拒绝、10040 必须指向 `THOR_STUN2`、0.05 / 0.2 / 0.5
+三档边界、以及按 2026-11-28 与 2026-11-29 真实行情做的两组回归。
+
+### 7.10 奥丁四件套扫货（2026-11-29 新增）
+
+**目标**：奥丁系列里 2 件技能型（主力）+ 2 件属性型，逐件设阈值。
+
+| runeId | 名称 | ticker | 类型 | use_place | 单价红线 |
+|---|---|---|---|---|---|
+| `10045` | Odin Word Rune（奥丁·言） | `RUNESTONE_ODIN_WORD` | 技能 +50% SPD（6 回合） | 6 世界王+竞技场 | **≤ 0.5 NCG** |
+| `10043` | Odin Order Rune（奥丁·秩序） | `RUNESTONE_ODIN_ORDER` | 技能 +50% ATK（6 回合） | 3 冒险+竞技场 | **≤ 0.5 NCG** |
+| `10044` | Odin Creator Rune（奥丁·创造） | `RUNESTONE_ODIN_CREATOR` | 属性 ATK/HP/HIT | 7 全模式 | **≤ 0.2 NCG** |
+| `10046` | Odin Mimir's Rune（奥丁·密米尔） | `RUNESTONE_ODIN_MIMIR` | 属性 SPD/HIT/HP | 7 全模式 | **≤ 0.2 NCG** |
+
+> **只买这 4 件**：奥丁系列还有 `10031` 奥丁·虚弱（技能是「降敌全属性」的 debuff，
+> 不是增益）、`10032` 奥丁·智慧（G6 属性型）；世界树 4 件 `10047–10050` 也不在列。
+> 这 4 件正好是市场 `RUNESTONE_ODIN` 前缀下唯一有挂单的 4 个 ticker。
+
+**规则**：
+
+| 项 | 规则 |
+|---|---|
+| 单价红线 | **逐件**：`maxUnitPriceMinor` 写在 target 上，缺省回落组默认（旧四件仍 0.05） |
+| 判定方式 | 仍是整数比较 `price × 100 ≤ cap × quantity`，0.5 = 50 minor、0.2 = 20 minor |
+| 持仓 / 封顶 | 均无，命中即买（用户 2026-11-29 决定） |
+| 失败隔离 | 单 ticker 异常只跳过自己，不影响其它 7 件与 Stun / Draupnir / Valkyrie |
+
+**2026-11-29 实测行情**（Heimdall 链，脚本首次部署时的基准）：
+
+| 符文 | 在售单数 | 最低价 | 达标单数 |
+|---|---|---|---|
+| 奥丁·言 10045 | 82 | 0.500 | ≤0.5：1 单 |
+| 奥丁·秩序 10043 | 80 | 0.900 | ≤0.5：0 单 |
+| 奥丁·创造 10044 | 106 | 0.500 | ≤0.2：0 单（≤0.5 有 5 单） |
+| 奥丁·密米尔 10046 | 95 | 0.500 | ≤0.2：0 单（≤0.5 有 7 单） |
+
+> 部署时只有 **10045 有 1 单可成交**；10043 最低 0.9（高于红线 80%），
+> 10044 / 10046 最低都是 0.5（是红线的 2.5 倍）。其余三件属于「蹲挂单」，
+> 按用户指示**不改价、耐心等**。想要立即扫货需上调，例如
+> `--rune-group-max-unit-price-minor 50` 只对没有独立阈值的旧四件生效，
+> 奥丁四件要改各自 target 的 `maxUnitPriceMinor`。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| （无） | — | 奥丁四件随 `RUNE_GROUP` 一起启停，阈值写死在 target 上 |
+| `--no-rune-group` | 关闭 | 同时关掉旧四件 + 奥丁四件 |
