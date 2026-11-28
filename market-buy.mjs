@@ -316,6 +316,23 @@ function isTargetListing(p, strict = true, ticker = TARGET_TICKER, excludes = EX
 // 单价判定（纯整数）：NCG 有 2 位小数，price(NCG 整数)→minor = price*100。
 // unitPrice = price/quantity <= 阈值(minor/件)  <=>  price*100 <= unitPriceMinor*quantity
 // 全程 BigInt 整数运算，无浮点、无 Math.round，边界严格（0.2 命中、略超即拒）。
+// ---------------- 僵尸挂单拉黑（2026-11-29 首次遇到） ----------------
+// 9cAPI 的挂单索引会滞留「链上已不存在」的单：2026-11-29 实测 RUNESTONE_ODIN_WORD
+// 的 0.5 NCG 单在 fav 里连续 10 分钟正常返回 exist=true，但链上 BuyProduct 每次
+// 都抛 ProductNotFoundException（多半是卖家撤单/挂单过期，索引没刷新）。
+// 不处理的话，每轮都会对同一单重新提交，白烧手续费且日志噪声。
+// 规则：某笔 buy_product3 拿到 ProductNotFound* 异常 → 该 productId 拉黑 30 分钟，
+// 期间 selectCandidates 直接跳过；到期自动解禁（万一是临时状态也不会永久废掉）。
+const DEAD_PRODUCTS = new Map();                 // productId -> 解禁时间戳(ms)
+const DEAD_TTL_MS = 30 * 60 * 1000;
+function isDeadProduct(id) {
+  const until = DEAD_PRODUCTS.get(id);
+  if (!until) return false;
+  if (Date.now() > until) { DEAD_PRODUCTS.delete(id); return false; }
+  return true;
+}
+function markDeadProduct(id) { DEAD_PRODUCTS.set(id, Date.now() + DEAD_TTL_MS); }
+
 function isCheapEnough(priceNcg, quantity, unitPriceMinor = UNIT_PRICE_MINOR) {
   if (!Number.isInteger(priceNcg) || priceNcg < 0) return false;
   if (!Number.isInteger(quantity) || quantity <= 0) return false;
@@ -333,6 +350,7 @@ function selectCandidates(listings, unitPriceMinor = UNIT_PRICE_MINOR, ticker = 
   const out = [];
   for (const p of listings || []) {
     if (!isTargetListing(p, true, ticker, excludes)) continue;
+    if (isDeadProduct(p.productId)) continue;      // 链上已判死（ProductNotFound），本轮不再白烧手续费
     const price = Number(p.price);
     const qty = Number(p.quantity);
     const up = unitPriceOf(price, qty);
@@ -929,7 +947,13 @@ async function scanAndBuy(ctx, opts = {}) {
           log({ level: "info", msg: `购买成功（${group.kind}, ${batch.length} 单）`, txId, items: rec.items });
         } else {
           rec.status = "not_confirmed";
-          for (const c of batch) round.skipped.push({ productId: c.productId, reason: `tx_${r.txStatus}` });
+          const dead = (rec.exceptionNames || []).some((n) => /ProductNotFound/i.test(String(n)));
+          if (dead) {
+            for (const c of batch) markDeadProduct(c.productId);
+            log({ level: "warn", msg: `挂单在链上已不存在（ProductNotFound），拉黑 30 分钟不再重试`,
+                  txId, items: rec.items });
+          }
+          for (const c of batch) round.skipped.push({ productId: c.productId, reason: dead ? "product_not_found" : `tx_${r.txStatus}` });
           log({ level: "warn", msg: `购买未确认成功（${r.txStatus}），下轮重扫链上复核`,
                 txId, items: rec.items, exceptionNames: rec.exceptionNames });
         }
@@ -1319,6 +1343,24 @@ function selfTest() {
     }
     chk("奥丁四件不与旧四件共用 ticker",
       [10043, 10044, 10045, 10046].every((id) => !LEGACY.some((t) => t.ticker === odin(id).ticker)));
+  }
+
+  // 3d) 僵尸挂单拉黑：链上 ProductNotFound 后不再每轮重复提交
+  {
+    const dead = {
+      ticker: "RUNESTONE_ODIN_WORD", exist: true, legacy: false, price: 5, quantity: 10,
+      productId: "dead-0001",
+      sellerAgentAddress: "0x1111111111111111111111111111111111111111",
+      sellerAvatarAddress: "0x2222222222222222222222222222222222222222",
+    };
+    chk("拉黑前候选命中 1 单", selectCandidates([dead], 50n, "RUNESTONE_ODIN_WORD").length === 1);
+    markDeadProduct("dead-0001");
+    chk("拉黑后候选为空（不再重复提交）", selectCandidates([dead], 50n, "RUNESTONE_ODIN_WORD").length === 0);
+    chk("isDeadProduct 命中黑名单", isDeadProduct("dead-0001") === true);
+    DEAD_PRODUCTS.set("dead-0001", Date.now() - 1);
+    chk("TTL 到期自动解禁", isDeadProduct("dead-0001") === false);
+    chk("ProductNotFound 异常可识别",
+      /ProductNotFound/i.test("Nekoyume.Action.ProductNotFoundException") === true);
   }
 
   // 4) UUID → bytes_le：与链上真实交易 / 9CAPI mobileBuy 返回逐字节对齐

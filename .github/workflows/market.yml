@@ -61,11 +61,11 @@ permissions:
   actions: write      # 接力 step 调用 workflow_dispatch REST API 必需
 
 concurrency:
-  # 组名带 -v3：2026-11-29 加奥丁四件套时由 `9c-market-buy-v2` 更名而来。
+  # 组名带 -v4：2026-11-29 加僵尸挂单拉黑后由 `-v3` 更名而来（v3 见奥丁四件套）。
   # 并发组在 run 启动瞬间锁定，改组名即可让新代码立刻在另一组起跑，不必等
   # 旧 job 跑满 5.5h 交棒，也不必取消正在值守的 job（PAT 无 actions:write）。
-  # 旧 job 结束时它 dispatch 的接力 run 读本文件，自动落入 v3 组串行接管。
-  group: 9c-market-buy-v3       # 独立组：绝不与 claim.yml 的 9c-auto-claim 共用
+  # 旧 job 结束时它 dispatch 的接力 run 读本文件，自动落入 v4 组串行接管。
+  group: 9c-market-buy-v4       # 独立组：绝不与 claim.yml 的 9c-auto-claim 共用
   cancel-in-progress: false      # 绝不能取消正在值守的 job
 
 jobs:

@@ -651,6 +651,27 @@ p[0] = [ productId(16B), [NCG currency, price×100], sellerAgent(20B), sellerAva
 > `--rune-group-max-unit-price-minor 50` 只对没有独立阈值的旧四件生效，
 > 奥丁四件要改各自 target 的 `maxUnitPriceMinor`。
 
+**僵尸挂单与自动拉黑（2026-11-29 首次实测）**：
+
+9cAPI 的挂单索引会滞留**链上已不存在**的单。部署后脚本连续 5 轮对
+`RUNESTONE_ODIN_WORD` 的 0.5 NCG 单（`2c97c113-…`）提交 `buy_product3`，
+链上每次都返回：
+
+```
+Nekoyume.Action.ProductNotFoundException
+```
+
+而 `fav` 与 `products?productIds=` 两个接口始终报 `exist: true`（该单
+`registeredBlockIndex=11962885`，挂了约半小时）。多半是卖家撤单或挂单过期，
+9cAPI 索引没刷新。
+
+处理：脚本现在会识别 `ProductNotFound*`，把该 `productId` **拉黑 30 分钟**，
+期间 `selectCandidates` 直接跳过，到期自动解禁。这样不会每轮对同一僵尸单
+白烧手续费，也不会永久废掉某个 productId。
+
+> 因此「奥丁·言有 1 单 0.5 可成交」这句要修正：**那单买不到**，
+> 实际能成交的最低价是 0.85 NCG，高于 0.5 的红线。
+
 **参数**：
 
 | 参数 | 默认 | 说明 |
