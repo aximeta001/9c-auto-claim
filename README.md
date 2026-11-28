@@ -8,7 +8,7 @@
 | 链 | workflow | 脚本 | 作用 | 触发 |
 |---|---|---|---|---|
 | 领奖链 | `claim.yml` | `claim.mjs` | 自动领巡逻奖励 / 日常奖励（含 AP 满先 Sweep） | 自接力常驻 |
-| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG）+ **Draupnir 符文**（≤40 NCG/个、总持仓 40 停） | 自接力常驻 |
+| **扫货链** | **`market.yml`** | **`market-buy.mjs`** | 低价购买 **Stun Rune (Adventure)**（≤0.2 NCG/件）+ **Valkyrie 五部位装备**（lv≥3、≤2 NCG/件、封顶 500 NCG）+ **Draupnir 符文**（≤40 NCG/个、总持仓 40 停）+ **符文四件套**（10039/10040/10041/10042，≤0.05 NCG/件、不封顶） | 自接力常驻 |
 | **AB Sweep 链** | **`sweep-boss.yml`** | **`sweep-boss.mjs`** | Adventure Boss 一键连续 Sweep | **仅手工 `workflow_dispatch`** |
 | **AB 爬楼链** | **`explore-boss.yml`** | **`explore-boss.mjs`** | Adventure Boss 自动挑战爬楼到目标层（门票全程 Golden Dust） | **仅手工 `workflow_dispatch`** |
 | **无限塔链** | **`infinite-tower.yml`** | **`infinite-tower.mjs`** | 新赛季一上线立刻自动打第 1 层（启动个人补票时钟） | **自接力常驻（20 秒轮询）+ 手工** |
@@ -208,7 +208,7 @@ Sweep 的实现要点（都是为了「绝不因可选步骤而漏领」）：
 | 文件 | 作用 |
 |---|---|
 | `claim.mjs` | 领奖链主程序：一次性检查 + `--watch` 蹲守 + `--daemon` 自接力常驻，输出结构化 JSON |
-| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）+ Draupnir（≤40 NCG/个、只买 10/20 整堆、总持仓 40 停）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
+| `market-buy.mjs` | **扫货链主程序**：ticker 精确识别 Stun Rune (Adventure)（≤0.2 NCG/件）+ Valkyrie 五部位装备（itemId 段位 + lv≥3 + ≤2 NCG/件 + 500 NCG 封顶）+ Draupnir（≤40 NCG/个、只买 10/20 整堆、总持仓 40 停）+ 符文四件套（10039/10040/10041/10042，≤0.05 NCG/件、不设封顶）、FAV/NonFungible 两版 `buy_product3` 构造、链上终态确认、`--daemon` 自接力常驻 |
 | `infinite-tower.mjs` | **无限塔链主程序**：轮询 `infiniteTowerStatus` 判新赛季+第1层未通关、`infinite_tower_battle` 字节模板改赛季/楼层、跨节点终态复核、`--once`/`--watch`/`--dry-run`/`--self-test` |
 | `import-key.mjs` | 私钥导入：keystore JSON / hex / 助记词 → `.env`，并校验归属（各链共用） |
 | `package.json` / `package-lock.json` | 依赖锁定（`npm ci` 必需，缺 lock 文件会失败） |
@@ -448,7 +448,7 @@ values = {
 ### 7.5 命令速查与参数
 
 ```
-node market-buy.mjs --self-test                  # 离线自测（60/60，含 FAV/NonFungible 字节级比对，不联网）
+node market-buy.mjs --self-test                  # 离线自测（100/100，含 FAV/NonFungible 字节级比对与四件套回归，不联网）
 node market-buy.mjs --dry-run                   # 联网只读扫描一轮，绝不提交
 node market-buy.mjs                            # 真实扫描并购买命中的便宜单
 node market-buy.mjs --daemon                   # 自接力常驻 5.5h（线上 workflow 用这个）
@@ -569,3 +569,46 @@ p[0] = [ productId(16B), [NCG currency, price×100], sellerAgent(20B), sellerAva
 自测已扩到 **79/79**，Draupnir 部分覆盖：ticker 精确匹配、名字相似串拒绝、
 800/20 与 400/10 边界命中、801/20 与 401/10 拒绝、20 装一次买齐、10×2 凑 20、
 9+1 凑 10、无配对不买、need15 只买 10、need0 不买。
+
+### 7.9 符文四件套扫货（2026-11-28 新增）
+
+**目标**：雷神之击 ×2 + 洛基吸血 ×2，每组一件冒险、一件世界王，共 4 个 ticker。
+
+| runeId | 名称 | ticker | 模式 |
+|---|---|---|---|
+| `10039` | Thor Strike Rune (Adventure) | `RUNESTONE_THOR_STUN1` | 冒险 |
+| `10040` | Thor Strike Rune (WorldBoss) | `RUNESTONE_THOR_STUN2` | 世界王 |
+| `10041` | Loki Vampiric Rune (Adventure) | `RUNESTONE_LOKI_VAMPIRIC1` | 冒险 |
+| `10042` | Loki Vampiric Rune (WorldBoss) | `RUNESTONE_LOKI_VAMPIRIC2` | 世界王 |
+
+> **10040 的命名坑（表内笔误，别按名字改）**：`RuneSheet` 把 10040 写成
+> `Thor Strike Rune (Arena)`，但 `RuneListSheet` 的 `use_place=4`（WorldBoss）且 ticker
+> 是 `THOR_STUN2`。**Thor Strike 没有 Arena 版**，判定只认 ticker，名字不参与。
+> 另 `10051 Thor Mjolnir` 是「雷神之锤」，全市场仅 6 单、15+ NCG，与本组无关。
+
+**规则**：
+
+| 项 | 规则 |
+|---|---|
+| 单价红线 | **≤ 0.05 NCG/件**，判定 `price × 100 ≤ 5 × quantity`（整数比较） |
+| 持仓目标 | **无**，命中即买 |
+| 花费封顶 | **无**（用户 2026-11-28 决定，与 Valkyrie 的 500 NCG 预算相互独立） |
+| 失败隔离 | 单个 ticker 拉取异常只跳过它自己，不影响 Stun / Draupnir / Valkyrie |
+
+> **0.05 是「蹲误挂」档位，不是扫货档**：2026-11-28 实测四件最低价分别为
+> 0.125 / 0.150 / 0.200 / 0.150 NCG，**0.05 以下全市场零挂单**。此阈值下正常行情
+> 长期不成交，脚本每轮会为「有挂单但无一条达标」的 ticker 打一条 info 日志，
+> 便于判断要不要调价。真要扫货需上调：
+> `--rune-group-max-unit-price-minor 20` → 0.20 NCG（四件当时合计约 984 单可吃）。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--rune-group-max-unit-price-minor N` | `5` | 单价上限最小单位（5 = 0.05 NCG/件） |
+| `--no-rune-group` | 关闭 | 临时关闭四件套，只跑原有目标 |
+
+自测已扩到 **100/100**，四件套部分覆盖：4 个目标不重复、逐个 ticker 只认自己
+（其余三个互不串味）、名字相似串拒绝、10040 必须指向 `THOR_STUN2`、0.05 边界
+（1/20 与 5/100 命中，6/100 拒）、以及按 2026-11-28 真实行情做的回归
+（0.05 全不中 / 0.20 各中 1 单）。
