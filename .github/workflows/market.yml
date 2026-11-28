@@ -1,4 +1,4 @@
-name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir)
+name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir + 符文四件套)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 独立链：与 claim.yml 领奖链完全隔离、互不干扰（各自独立 concurrency 组）。
@@ -14,6 +14,15 @@ name: 9C 市场扫货 (Heimdall / Stun Rune + Valkyrie + Draupnir)
 #          零散两堆可凑 10（总价 <= 400）；按链上总持仓判定，达 40 个即停。
 #        · 命中即提交 buy_product3（FAV / NonFungible 两版），提交前链上复核、
 #          提交后只认链上终态；无命中/失败/异常一律下一轮重扫，绝不锁死、绝不误买。
+#        · 符文四件套（2026-11-28 新增，不设持仓目标、不设花费封顶）：
+#            10039 Thor Strike Rune (Adventure)   RUNESTONE_THOR_STUN1
+#            10040 Thor Strike Rune (WorldBoss)   RUNESTONE_THOR_STUN2
+#            10041 Loki Vampiric Rune (Adventure) RUNESTONE_LOKI_VAMPIRIC1
+#            10042 Loki Vampiric Rune (WorldBoss) RUNESTONE_LOKI_VAMPIRIC2
+#          单价 <= 0.05 NCG/件（5 minor）才买。注意 10040 在 RuneSheet 里被误写成
+#          "(Arena)"，实际是 WorldBoss（use_place=4 / ticker=THOR_STUN2），判定只认 ticker。
+#          实测 2026-11-28 四件最低价 0.125/0.150/0.200/0.150 NCG，0.05 以下零挂单，
+#          属「蹲误挂」档位；要真正扫货需 --rune-group-max-unit-price-minor 20（=0.20 NCG）。
 #  接力：预算耗尽后脚本正常退出，最后一个 step 用 workflow_dispatch 触发
 #        下一个常驻 job（GITHUB_TOKEN 是防递归规则的例外）。
 #  重燃：schedule 每 10 分钟错峰（与领奖链 4,14,24... 错开到 9,19,29...），
